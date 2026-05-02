@@ -1,0 +1,24 @@
+{
+  "buy_hold": {
+    "total_return": 0.0498891566000001,
+    "annual_return": 0.052271779249115635,
+    "sharpe_ratio": 1.7831602400772972,
+    "max_drawdown": 0.013880541852884537,
+    "win_rate": 1.0,
+    "profit_factor": 0.0,
+    "total_trades": 2,
+    "winning_trades": 2,
+    "losing_trades": 0
+  },
+  "ma_cross": {
+    "total_return": 0.01084794023999991,
+    "annual_return": 0.011355895106575531,
+    "sharpe_ratio": 0.6365025506329981,
+    "max_drawdown": 0.017762553517107597,
+    "win_rate": 0.3125,
+    "profit_factor": 1.3550480428241698,
+    "total_trades": 16,
+    "winning_trades": 5,
+    "losing_trades": 11
+  }
+}

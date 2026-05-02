@@ -1,0 +1,79 @@
+from enum import Enum
+
+
+class RecommendationAction(str, Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+    HOLD = "HOLD"
+
+
+class RecommendationStatus(str, Enum):
+    READY = "READY"
+    BLOCKED = "BLOCKED"
+    EXECUTED = "EXECUTED"
+
+
+class OrderSide(str, Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+
+class OrderType(str, Enum):
+    LIMIT = "LIMIT"
+    MARKET = "MARKET"
+
+
+class OrderStatus(str, Enum):
+    PENDING = "PENDING"
+    SUBMITTED = "SUBMITTED"
+    PARTIAL_FILLED = "PARTIAL_FILLED"
+    FILLED = "FILLED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+
+
+class OrderSource(str, Enum):
+    MANUAL = "MANUAL"
+    SIGNAL = "SIGNAL"
+    REBALANCE = "REBALANCE"
+
+
+class RiskFlag(str, Enum):
+    HIGH_VOLATILITY = "HIGH_VOLATILITY"
+    HIGH_PRICE_VOLATILITY = "HIGH_PRICE_VOLATILITY"
+    CONCENTRATION = "CONCENTRATION"
+    LIQUIDITY = "LIQUIDITY"
+    HALT = "HALT"
+    ST_STOCK = "ST_STOCK"
+    LIMIT_UP = "LIMIT_UP"
+    LIMIT_DOWN = "LIMIT_DOWN"
+
+
+class SignalType(str, Enum):
+    TECHNICAL = "TECHNICAL"
+    FUNDAMENTAL = "FUNDAMENTAL"
+    NEWS = "NEWS"
+    COMBINED = "COMBINED"
+
+
+class AuditAction(str, Enum):
+    ORDER_SUBMITTED = "ORDER_SUBMITTED"
+    ORDER_CANCELLED = "ORDER_CANCELLED"
+    ORDER_LIVE_SUBMITTED = "ORDER_LIVE_SUBMITTED"
+    RISK_RULE_CHANGED = "RISK_RULE_CHANGED"
+    RECOMMENDATION_GENERATED = "RECOMMENDATION_GENERATED"
+    POSITION_UPDATED = "POSITION_UPDATED"
+    FILL_RECEIVED = "FILL_RECEIVED"
+    USER_LOGIN = "USER_LOGIN"
+    LLM_PROMPT_UPDATED = "LLM_PROMPT_UPDATED"
+    MODEL_VERSION_SWITCHED = "MODEL_VERSION_SWITCHED"
+    NEWS_INGESTED = "NEWS_INGESTED"
+    SIGNAL_GENERATED = "SIGNAL_GENERATED"
+    WATCHLIST_CHANGED = "WATCHLIST_CHANGED"
+
+
+class UserRole(str, Enum):
+    ADMIN = "admin"
+    TRADER = "trader"
+    VIEWER = "viewer"
+

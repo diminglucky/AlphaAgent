@@ -1,0 +1,30 @@
+# Example Prometheus scrape config — copy/edit and place at /etc/prometheus/
+# Then `systemctl reload prometheus` (or restart the container).
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'quant-platform'
+    metrics_path: /api/v1/metrics/prom
+    static_configs:
+      - targets:
+          - quant-host:8000
+        labels:
+          env: prod
+          service: quant-api
+
+# (Optional) Alert rules — sample patterns. Wire to alertmanager separately.
+rule_files: []
+
+# Recommended alert ideas (add via alert_rules.yml):
+# - alert: QuantApiDown
+#   expr: up{job="quant-platform"} == 0
+#   for: 1m
+# - alert: TooManyBlockedOrders
+#   expr: increase(quant_risk_events_blocked[10m]) > 20
+#   for: 5m
+# - alert: AdvisorCacheStale
+#   expr: quant_advisor_cache_ready == 0
+#   for: 30m
