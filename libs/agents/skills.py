@@ -151,18 +151,26 @@ def get_default_registry() -> SkillRegistry:
     global _default_registry
     if _default_registry is None:
         _default_registry = SkillRegistry()
-        # Lazy import to avoid cycles at module-load time
         from libs.agents.skills_market import register_market_skills
         from libs.agents.skills_news import register_news_skills
         from libs.agents.skills_technical import register_technical_skills
-        from libs.agents.skills_portfolio import register_portfolio_skills
-        from libs.agents.skills_risk import register_risk_skills
-        from libs.agents.skills_execution import register_execution_skills
-
         register_market_skills(_default_registry)
         register_news_skills(_default_registry)
         register_technical_skills(_default_registry)
-        register_portfolio_skills(_default_registry)
-        register_risk_skills(_default_registry)
-        register_execution_skills(_default_registry)
+        # portfolio/risk/execution skills 依赖旧 Repository，按需加载
+        try:
+            from libs.agents.skills_portfolio import register_portfolio_skills
+            register_portfolio_skills(_default_registry)
+        except Exception:
+            pass
+        try:
+            from libs.agents.skills_risk import register_risk_skills
+            register_risk_skills(_default_registry)
+        except Exception:
+            pass
+        try:
+            from libs.agents.skills_execution import register_execution_skills
+            register_execution_skills(_default_registry)
+        except Exception:
+            pass
     return _default_registry

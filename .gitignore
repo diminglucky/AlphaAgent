@@ -8,3 +8,15 @@ build/
 *.egg-info/
 var/
 backups/
+
+# 包含 API Key 的运行时配置（敏感信息）
+data/llm_runtime.json
+
+# 前端 node_modules 和构建产物
+apps/web/node_modules/
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp

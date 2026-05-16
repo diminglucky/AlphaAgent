@@ -1,169 +1,113 @@
-<template>
-  <div>
-    <el-alert
-      title="你现在只需要两件事：找最值得买的股票，找最该卖的持仓。"
-      type="success"
-      :closable="false"
-      show-icon
-      style="margin-bottom:16px"
-    />
+ <template>
+  <div class="simple-page">
+    <div class="hero-card">
+      <div>
+        <div class="hero-title">今天怎么操作</div>
+        <div class="hero-subtitle">只回答两个问题：买哪只，卖哪只。</div>
+      </div>
+      <div class="hero-actions">
+        <el-button type="primary" size="large" @click="runBuy" :loading="buyLoading">今天买什么</el-button>
+        <el-button type="danger" size="large" @click="runSell" :loading="sellLoading">今天卖什么</el-button>
+      </div>
+    </div>
 
     <el-row :gutter="16">
       <el-col :span="12">
-        <el-card shadow="never" style="border-radius:10px; min-height:520px">
-          <template #header>
-            <div style="display:flex; align-items:center; justify-content:space-between">
-              <div>
-                <div style="font-size:18px; font-weight:700">买入</div>
-                <div style="font-size:12px; color:#999; margin-top:4px">从实时行情里找潜力最大的股票</div>
-              </div>
-              <el-button type="primary" @click="runBuy" :loading="buyLoading">找最值得买的股票</el-button>
+        <el-card shadow="never" class="decision-card buy-card">
+          <div class="decision-header">
+            <div>
+              <div class="decision-title">买入建议</div>
+              <div class="decision-subtitle">从实时行情里找潜力最大的股票</div>
             </div>
-          </template>
+            <el-tag type="danger">只看第一名</el-tag>
+          </div>
 
-          <el-empty v-if="!bestBuy" description="点击右上角按钮开始分析" :image-size="80" />
+          <el-empty v-if="!bestBuy" description="点击“今天买什么”" :image-size="72" />
 
-          <div v-else>
-            <el-card shadow="never" style="margin-bottom:14px; background:#f8fbff; border:1px solid #d9ecff">
-              <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px">
-                <div>
-                  <div style="font-size:22px; font-weight:700; color:#1d39c4">{{ bestBuy.name || '-' }}</div>
-                  <div style="font-size:14px; color:#666; margin-top:4px">{{ bestBuy.symbol }}</div>
-                </div>
-                <el-tag type="danger" size="large">首选买入</el-tag>
+          <div v-else class="decision-body">
+            <div class="decision-name">{{ bestBuy.name || '-' }}</div>
+            <div class="decision-symbol">{{ bestBuy.symbol }}</div>
+
+            <div class="metric-grid">
+              <div class="metric-card">
+                <div class="metric-label">现价</div>
+                <div class="metric-value">¥{{ fmtPrice(bestBuy.last_close) }}</div>
               </div>
-
-              <el-row :gutter="12" style="margin-top:16px">
-                <el-col :span="8">
-                  <div class="metric-card">
-                    <div class="metric-label">现价</div>
-                    <div class="metric-value">¥{{ fmtPrice(bestBuy.last_close) }}</div>
-                  </div>
-                </el-col>
-                <el-col :span="8">
-                  <div class="metric-card">
-                    <div class="metric-label">评分</div>
-                    <div class="metric-value" style="color:#f5222d">{{ fmtScore(bestBuy.score) }}</div>
-                  </div>
-                </el-col>
-                <el-col :span="8">
-                  <div class="metric-card">
-                    <div class="metric-label">建议数量</div>
-                    <div class="metric-value">{{ buyQuantity(bestBuy) }} 股</div>
-                  </div>
-                </el-col>
-              </el-row>
-
-              <div style="margin-top:16px">
-                <div style="font-size:13px; color:#999; margin-bottom:6px">买入理由</div>
-                <div style="font-size:14px; line-height:1.7; color:#333">{{ bestBuy.reason || '无' }}</div>
+              <div class="metric-card">
+                <div class="metric-label">评分</div>
+                <div class="metric-value metric-up">{{ fmtScore(bestBuy.score) }}</div>
               </div>
-
-              <div style="margin-top:16px">
-                <el-button type="primary" @click="quickBuy(bestBuy)">按建议买入</el-button>
-                <el-button @click="$router.push('/analysis?symbol=' + bestBuy.symbol)">查看详情</el-button>
+              <div class="metric-card">
+                <div class="metric-label">建议数量</div>
+                <div class="metric-value">{{ buyQuantity(bestBuy) }} 股</div>
               </div>
-            </el-card>
+            </div>
 
-            <el-collapse v-if="buyList.length > 1" style="margin-top:12px">
-              <el-collapse-item title="查看其他备选股票" name="buy_more">
-                <el-table :data="buyList.slice(1, 5)" size="small" stripe>
-                  <el-table-column prop="name" label="名称" width="110" />
-                  <el-table-column prop="symbol" label="代码" width="120" />
-                  <el-table-column label="现价" width="90">
-                    <template #default="{ row }">¥{{ fmtPrice(row.last_close) }}</template>
-                  </el-table-column>
-                  <el-table-column label="评分" width="90">
-                    <template #default="{ row }">{{ fmtScore(row.score) }}</template>
-                  </el-table-column>
-                  <el-table-column prop="reason" label="理由" show-overflow-tooltip />
-                </el-table>
-              </el-collapse-item>
-            </el-collapse>
+            <div class="reason-box">
+              <div class="reason-label">买入理由</div>
+              <div class="reason-text">{{ bestBuy.reason || '无' }}</div>
+            </div>
+
+            <div class="action-row">
+              <el-button type="primary" @click="quickBuy(bestBuy)">按建议买入</el-button>
+              <el-button @click="$router.push('/analysis?symbol=' + bestBuy.symbol)">查看详情</el-button>
+            </div>
           </div>
         </el-card>
       </el-col>
 
       <el-col :span="12">
-        <el-card shadow="never" style="border-radius:10px; min-height:520px">
-          <template #header>
-            <div style="display:flex; align-items:center; justify-content:space-between">
-              <div>
-                <div style="font-size:18px; font-weight:700">卖出</div>
-                <div style="font-size:12px; color:#999; margin-top:4px">从当前持仓里找风险最大的股票</div>
-              </div>
-              <el-button type="danger" @click="runSell" :loading="sellLoading">找最该卖的股票</el-button>
+        <el-card shadow="never" class="decision-card sell-card">
+          <div class="decision-header">
+            <div>
+              <div class="decision-title">卖出建议</div>
+              <div class="decision-subtitle">从当前持仓里找风险最大的股票</div>
             </div>
-          </template>
+            <el-tag type="warning">只看第一名</el-tag>
+          </div>
 
-          <el-empty v-if="!bestSell && !sellChecked" description="点击右上角按钮开始分析" :image-size="80" />
-          <el-empty v-else-if="!bestSell && sellChecked" description="当前没有明显高风险持仓" :image-size="80" />
+          <el-empty v-if="!bestSell && !sellChecked" description="点击“今天卖什么”" :image-size="72" />
+          <el-empty v-else-if="!bestSell && sellChecked" description="当前没有明显高风险持仓" :image-size="72" />
 
-          <div v-else>
-            <el-card shadow="never" style="margin-bottom:14px; background:#fffaf8; border:1px solid #ffe7d1">
-              <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px">
-                <div>
-                  <div style="font-size:22px; font-weight:700; color:#cf1322">{{ bestSell.name || '-' }}</div>
-                  <div style="font-size:14px; color:#666; margin-top:4px">{{ bestSell.symbol }}</div>
+          <div v-else class="decision-body">
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:12px">
+              <div>
+                <div class="decision-name">{{ bestSell.name || '-' }}</div>
+                <div class="decision-symbol">{{ bestSell.symbol }}</div>
+              </div>
+              <el-tag :type="sellTag(bestSell.urgency)">{{ sellLabel(bestSell.urgency) }}</el-tag>
+            </div>
+
+            <div class="metric-grid">
+              <div class="metric-card">
+                <div class="metric-label">现价</div>
+                <div class="metric-value">¥{{ fmtPrice(bestSell.last_price) }}</div>
+              </div>
+              <div class="metric-card">
+                <div class="metric-label">盈亏</div>
+                <div class="metric-value" :style="{ color: (bestSell.pct_pnl || 0) >= 0 ? '#f5222d' : '#52c41a' }">
+                  {{ ((bestSell.pct_pnl || 0) * 100).toFixed(2) }}%
                 </div>
-                <el-tag :type="sellTag(bestSell.urgency)">{{ sellLabel(bestSell.urgency) }}</el-tag>
               </div>
-
-              <el-row :gutter="12" style="margin-top:16px">
-                <el-col :span="8">
-                  <div class="metric-card">
-                    <div class="metric-label">现价</div>
-                    <div class="metric-value">¥{{ fmtPrice(bestSell.last_price) }}</div>
-                  </div>
-                </el-col>
-                <el-col :span="8">
-                  <div class="metric-card">
-                    <div class="metric-label">盈亏</div>
-                    <div class="metric-value" :style="{ color: (bestSell.pct_pnl || 0) >= 0 ? '#f5222d' : '#52c41a' }">
-                      {{ ((bestSell.pct_pnl || 0) * 100).toFixed(2) }}%
-                    </div>
-                  </div>
-                </el-col>
-                <el-col :span="8">
-                  <div class="metric-card">
-                    <div class="metric-label">可卖数量</div>
-                    <div class="metric-value">{{ bestSell.available_quantity || 0 }} 股</div>
-                  </div>
-                </el-col>
-              </el-row>
-
-              <div style="margin-top:16px">
-                <div style="font-size:13px; color:#999; margin-bottom:6px">卖出理由</div>
-                <div style="font-size:14px; line-height:1.7; color:#333">{{ bestSell.message || '无' }}</div>
+              <div class="metric-card">
+                <div class="metric-label">可卖数量</div>
+                <div class="metric-value">{{ bestSell.available_quantity || 0 }} 股</div>
               </div>
+            </div>
 
-              <div style="margin-top:8px">
-                <el-tag effect="plain">{{ ruleLabel(bestSell.rule) }}</el-tag>
-              </div>
+            <div class="reason-box">
+              <div class="reason-label">卖出理由</div>
+              <div class="reason-text">{{ bestSell.message || '无' }}</div>
+            </div>
 
-              <div style="margin-top:16px">
-                <el-button type="danger" @click="quickSell(bestSell)" :disabled="!bestSell.available_quantity">按建议卖出</el-button>
-                <el-button @click="$router.push('/portfolio')">查看持仓</el-button>
-              </div>
-            </el-card>
+            <div style="margin-top:10px">
+              <el-tag effect="plain">{{ ruleLabel(bestSell.rule) }}</el-tag>
+            </div>
 
-            <el-collapse v-if="sellList.length > 1" style="margin-top:12px">
-              <el-collapse-item title="查看其他风险持仓" name="sell_more">
-                <el-table :data="sellList.slice(1, 5)" size="small" stripe>
-                  <el-table-column prop="name" label="名称" width="110" />
-                  <el-table-column prop="symbol" label="代码" width="120" />
-                  <el-table-column label="紧急程度" width="110">
-                    <template #default="{ row }">
-                      <el-tag :type="sellTag(row.urgency)" size="small">{{ sellLabel(row.urgency) }}</el-tag>
-                    </template>
-                  </el-table-column>
-                  <el-table-column label="盈亏" width="90">
-                    <template #default="{ row }">{{ ((row.pct_pnl || 0) * 100).toFixed(2) }}%</template>
-                  </el-table-column>
-                  <el-table-column prop="message" label="理由" show-overflow-tooltip />
-                </el-table>
-              </el-collapse-item>
-            </el-collapse>
+            <div class="action-row">
+              <el-button type="danger" @click="quickSell(bestSell)" :disabled="!bestSell.available_quantity">按建议卖出</el-button>
+              <el-button @click="$router.push('/portfolio')">查看持仓</el-button>
+            </div>
           </div>
         </el-card>
       </el-col>
@@ -341,6 +285,96 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+.simple-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.hero-card {
+  background: linear-gradient(135deg, #ffffff 0%, #f7faff 100%);
+  border: 1px solid #e6f4ff;
+  border-radius: 14px;
+  padding: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.hero-title {
+  font-size: 28px;
+  font-weight: 800;
+  color: #111827;
+}
+
+.hero-subtitle {
+  margin-top: 6px;
+  font-size: 14px;
+  color: #6b7280;
+}
+
+.hero-actions {
+  display: flex;
+  gap: 12px;
+}
+
+.decision-card {
+  border-radius: 14px;
+  min-height: 420px;
+}
+
+.buy-card {
+  border: 1px solid #dbeafe;
+}
+
+.sell-card {
+  border: 1px solid #fde7d9;
+}
+
+.decision-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.decision-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: #111827;
+}
+
+.decision-subtitle {
+  margin-top: 4px;
+  font-size: 13px;
+  color: #6b7280;
+}
+
+.decision-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.decision-name {
+  font-size: 28px;
+  font-weight: 800;
+  color: #111827;
+}
+
+.decision-symbol {
+  font-size: 14px;
+  color: #6b7280;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
 .metric-card {
   background: #fff;
   border: 1px solid #f0f0f0;
@@ -358,5 +392,32 @@ onMounted(async () => {
   font-size: 20px;
   font-weight: 700;
   color: #262626;
+}
+
+.metric-up {
+  color: #f5222d;
+}
+
+.reason-box {
+  background: #fafafa;
+  border-radius: 10px;
+  padding: 14px;
+}
+
+.reason-label {
+  font-size: 12px;
+  color: #9ca3af;
+  margin-bottom: 6px;
+}
+
+.reason-text {
+  font-size: 14px;
+  line-height: 1.8;
+  color: #374151;
+}
+
+.action-row {
+  display: flex;
+  gap: 10px;
 }
 </style>

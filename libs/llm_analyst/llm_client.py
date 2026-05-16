@@ -181,6 +181,7 @@ class LLMClient:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": self._cfg.temperature,
+            "max_tokens": 8000,  # 仪表盘 JSON 字段较多，需要更大上限
         }
 
         resp = httpx.post(url, headers=headers, json=payload, timeout=self._cfg.timeout)

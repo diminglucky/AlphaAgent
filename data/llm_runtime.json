@@ -1,8 +1,0 @@
-{
-  "provider": "deepseek",
-  "model": "deepseek-chat",
-  "api_key": "sk-06597d54673c45bd90974ac651aa86c3",
-  "base_url": "https://api.deepseek.com/v1",
-  "temperature": 0.2,
-  "timeout": 30
-}

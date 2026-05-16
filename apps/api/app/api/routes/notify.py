@@ -1,54 +1,27 @@
-"""Notification channel status & manual test (Design Doc §5.6)."""
-
-from __future__ import annotations
-
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
-
-from apps.api.app.core.auth import AuthenticatedUser, require_admin
-from apps.api.app.services.notify_service import _load_config, get_notifier
+"""飞书通知测试路由"""
+from fastapi import APIRouter
+from pydantic import BaseModel
+from apps.api.app.services import feishu_service
 
 router = APIRouter(prefix="/notify", tags=["notify"])
 
 
-class TestNotifyRequest(BaseModel):
-    title: str = Field("[Quant] notification test")
-    body: str = Field("This is a test message from the quant platform.")
-    level: str = Field("info")
-
-
-@router.get("/status")
-def notify_status(user: AuthenticatedUser = Depends(require_admin)) -> dict:
-    """Show which channels are configured (no secrets exposed)."""
-    cfg = _load_config()
-    return {
-        "webhook": {
-            "enabled": bool(cfg.webhook_url),
-            "format": cfg.webhook_format,
-            "url_set": bool(cfg.webhook_url),
-        },
-        "email": {
-            "enabled": bool(cfg.email_smtp_host and cfg.email_to),
-            "smtp_host": cfg.email_smtp_host or None,
-            "smtp_port": cfg.email_smtp_port,
-            "user": cfg.email_user or None,
-            "to": cfg.email_to or None,
-            "use_tls": cfg.email_use_tls,
-            "password_set": bool(cfg.email_password),
-        },
-    }
+class TestReq(BaseModel):
+    title: str = "测试消息"
+    content: str = "飞书机器人配置成功！"
 
 
 @router.post("/test")
-def notify_test(
-    req: TestNotifyRequest,
-    user: AuthenticatedUser = Depends(require_admin),
-) -> dict:
-    """Send a test notification through every configured channel."""
-    results = get_notifier().send(req.title, req.body, req.level)
+def test_notify(req: TestReq):
+    ok = feishu_service.send_feishu(req.title, req.content, color="blue")
+    return {"ok": ok, "message": "发送成功" if ok else "发送失败（请检查 QUANT_FEISHU_WEBHOOK_URL 配置）"}
+
+
+@router.get("/status")
+def notify_status():
+    from apps.api.app.core.config import get_settings
+    settings = get_settings()
     return {
-        "title": req.title,
-        "results": results,
-        "n_channels_attempted": len(results),
-        "n_succeeded": sum(1 for ok in results.values() if ok),
+        "feishu_configured": bool(settings.feishu_webhook_url),
+        "llm_configured": bool(settings.llm_api_key),
     }

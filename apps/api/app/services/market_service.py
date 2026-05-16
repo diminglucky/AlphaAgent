@@ -1,202 +1,549 @@
-"""Market data service with provider abstraction."""
+"""市场数据服务
 
+两层缓存策略：
+- 精准缓存（watchlist_cache）：只缓存自选股+持仓，每 3 秒刷新，用新浪单股接口
+- 全市场缓存（market_cache）：全量 5000+ 只，每 30 秒刷新，用于涨幅榜/统计
+"""
 from __future__ import annotations
 
-from datetime import date
+import logging
+import threading
+import time
+from datetime import datetime
 from typing import Optional
 
-from apps.api.app.core.config import get_settings
-from apps.api.app.services.sample_data import DAILY_BARS, INSTRUMENTS, REALTIME_QUOTES
-from libs.market_data.cache import _TTLCache
-from libs.market_data.providers import (
-    AkshareMarketDataProvider,
-    ProviderStatus,
-    is_akshare_installed,
-)
-from libs.quant_core.models import Instrument, MarketBar, RealtimeQuote
+log = logging.getLogger("quant.market")
+
+# ---------------------------------------------------------------------------
+# 精准缓存 — 自选股 + 持仓，3 秒刷新
+# ---------------------------------------------------------------------------
+_precise_cache: dict[str, dict] = {}   # symbol(600519.SH) -> quote
+_precise_lock = threading.Lock()
+_precise_symbols: set[str] = set()     # 需要精准跟踪的 symbols
+_precise_thread: Optional[threading.Thread] = None
+_PRECISE_TTL = 3  # 秒
+
+# ---------------------------------------------------------------------------
+# 全市场缓存 — 30 秒刷新
+# ---------------------------------------------------------------------------
+_market_cache: dict[str, dict] = {}   # code(6位) -> quote
+_market_lock = threading.Lock()
+_market_thread: Optional[threading.Thread] = None
+_MARKET_TTL = 30  # 秒
 
 
-class MockMarketDataProvider:
-    """Mock provider — extended with 30+ stock universe + synthetic bars.
-
-    For demo & scanner use without AKShare: uses `libs/market_data/universe.py`
-    when a symbol isn't in the original sample DAILY_BARS, generating
-    deterministic 60-day OHLC sequences with varied trend/volatility profiles.
-    """
-    provider_name = "mock"
-
-    def list_instruments(self) -> list[Instrument]:
-        # Combine legacy seed + extended universe (deduped)
-        from libs.market_data.universe import UNIVERSE
-        seen = {i.symbol for i in INSTRUMENTS}
-        extra = [
-            Instrument(
-                symbol=u.symbol, exchange=u.symbol.split(".")[1],
-                name=u.name, industry=u.industry,
-                list_date=date(2010, 1, 1), delist_date=None,
-                status="listed", is_st=u.is_st,
-            )
-            for u in UNIVERSE if u.symbol not in seen
-        ]
-        return INSTRUMENTS + extra
-
-    # ≥300 trading days unlocks 1y in-sample + 1q OOS walk-forward folds.
-    _SYNTH_DAYS = 320
-
-    def get_bars(
-        self,
-        symbol: str,
-        freq: str = "1d",
-        start: Optional[date] = None,
-        end: Optional[date] = None,
-    ) -> list[MarketBar]:
-        if freq not in {"1d", "1m"}:
-            raise ValueError(f"Unsupported frequency: {freq}")
-
-        from libs.market_data.universe import UNIVERSE, generate_bars
-        stock = next((u for u in UNIVERSE if u.symbol == symbol), None)
-
-        # Strategy: synthesize ≥320 days for any symbol in UNIVERSE, then
-        # OVERLAY the hand-crafted DAILY_BARS values for matching dates so
-        # demos still see "real-looking" recent prices while backtests/
-        # walk-forward get sufficient history.
-        bars: list[MarketBar] = []
-        if stock is not None:
-            raw = generate_bars(stock, days=self._SYNTH_DAYS)
-            bars = [
-                MarketBar(
-                    symbol=symbol, trade_date=d, open=o, high=h, low=l, close=c,
-                    volume=v, amount=a, turnover_rate=t,
-                    adj_type="qfq", data_source="mock",
-                )
-                for (d, o, h, l, c, v, a, t) in raw
-            ]
-        legacy = DAILY_BARS.get(symbol, [])
-        if legacy:
-            by_date = {b.trade_date: b for b in bars}
-            for b in legacy:
-                by_date[b.trade_date] = b   # legacy wins where overlapping
-            bars = sorted(by_date.values(), key=lambda x: x.trade_date)
-        if not bars:
-            raise ValueError(f"Unknown symbol: {symbol}")
-
-        if start is not None:
-            bars = [item for item in bars if item.trade_date >= start]
-        if end is not None:
-            bars = [item for item in bars if item.trade_date <= end]
-
-        return bars
-
-    def get_realtime_quotes(self, symbols: list[str]) -> list[RealtimeQuote]:
-        from libs.market_data.universe import UNIVERSE
-        from datetime import datetime as _dt
-        quotes: list[RealtimeQuote] = []
-        universe_map = {u.symbol: u for u in UNIVERSE}
-
-        for symbol in symbols:
-            quote = REALTIME_QUOTES.get(symbol)
-            if quote is not None:
-                quotes.append(quote)
-                continue
-            # Synthesize quote from latest bar
-            try:
-                bars = self.get_bars(symbol, freq="1d")
-            except ValueError:
-                continue
-            if not bars:
-                continue
-            last = bars[-1]
-            stock = universe_map.get(symbol)
-            limit_factor = 0.05 if (stock and stock.is_st) else 0.10
-            quotes.append(RealtimeQuote(
-                symbol=symbol, quote_time=_dt.now(),
-                last_price=last.close,
-                bid1=round(last.close * 0.999, 2),
-                ask1=round(last.close * 1.001, 2),
-                volume=last.volume, turnover=last.amount,
-                pct_change=round(((last.close - last.open) / last.open) * 100, 2) if last.open else 0,
-                limit_up=round(last.close * (1 + limit_factor), 2),
-                limit_down=round(last.close * (1 - limit_factor), 2),
-            ))
-
-        return quotes
+def _ak():
+    try:
+        import akshare as ak
+        return ak
+    except ImportError:
+        raise RuntimeError("请安装 akshare: pip install akshare")
 
 
-class MarketService:
-    def __init__(self) -> None:
-        self.settings = get_settings()
-        self.mock_provider = MockMarketDataProvider()
-        self.provider = self._build_provider()
-        self.allow_runtime_fallback = self.settings.market_data_provider.lower() == "auto"
-        # TTL caches: bars are slow (akshare hits the network), quotes refresh fast
-        self._bars_cache = _TTLCache(max_size=128, ttl=300.0)     # 5 min
-        self._quotes_cache = _TTLCache(max_size=64, ttl=3.0)      # 3 sec
+def _to_code(symbol: str) -> str:
+    """600519.SH → 600519"""
+    return symbol.split(".")[0]
 
-    def _build_provider(self) -> MockMarketDataProvider | AkshareMarketDataProvider:
-        provider_name = self.settings.market_data_provider.lower()
 
-        if provider_name == "auto":
-            if is_akshare_installed():
-                return AkshareMarketDataProvider()
-            return self.mock_provider
+def _normalize_code(raw: str) -> str:
+    """sh600519 → 600519"""
+    raw = str(raw).strip().lower()
+    for prefix in ("sh", "sz", "bj"):
+        if raw.startswith(prefix):
+            return raw[2:]
+    return raw
 
-        if provider_name == "akshare":
-            if not is_akshare_installed():
-                raise RuntimeError(
-                    "QUANT_MARKET_DATA_PROVIDER is set to akshare but akshare is not installed."
-                )
-            return AkshareMarketDataProvider()
 
-        return self.mock_provider
+def _row_to_quote(row, symbol: str, now: str) -> dict:
+    """新浪 spot DataFrame 行 → quote dict"""
+    price = float(row.get("最新价") or 0)
+    prev_close = float(row.get("昨收") or price)
+    change = round(price - prev_close, 2)
+    change_pct = round(change / prev_close * 100, 2) if prev_close else 0
+    return {
+        "symbol": symbol,
+        "name": str(row.get("名称", "")),
+        "price": round(price, 2),
+        "change": change,
+        "change_pct": change_pct,
+        "volume": int(float(row.get("成交量") or 0)),
+        "turnover": float(row.get("成交额") or 0),
+        "high": float(row.get("最高") or 0),
+        "low": float(row.get("最低") or 0),
+        "open": float(row.get("今开") or 0),
+        "prev_close": round(prev_close, 2),
+        "limit_up": round(prev_close * 1.1, 2),
+        "limit_down": round(prev_close * 0.9, 2),
+        "amplitude": 0,
+        "turnover_rate": float(row.get("换手率") or 0) if "换手率" in row.index else 0,
+        "pe_ratio": 0,
+        "pb_ratio": 0,
+        "market_cap": 0,
+        "timestamp": now,
+    }
 
-    def _execute_with_fallback(self, action: str, *args: object, **kwargs: object) -> object:
-        method = getattr(self.provider, action)
-        try:
-            return method(*args, **kwargs)
-        except Exception:
-            if not self.allow_runtime_fallback or self.provider.provider_name == "mock":
-                raise
-            fallback_method = getattr(self.mock_provider, action)
-            return fallback_method(*args, **kwargs)
 
-    def get_provider_status(self) -> ProviderStatus:
-        return ProviderStatus(
-            selected_provider=self.settings.market_data_provider,
-            active_provider=self.provider.provider_name,
-            akshare_installed=is_akshare_installed(),
-        )
+# ---------------------------------------------------------------------------
+# 精准行情刷新（自选股专用，3秒）
+# ---------------------------------------------------------------------------
 
-    def list_instruments(self) -> list[Instrument]:
-        return self._execute_with_fallback("list_instruments")
+def register_symbols(symbols: list[str]):
+    """注册需要精准跟踪的 symbols（自选股 + 持仓）"""
+    with _precise_lock:
+        _precise_symbols.update(symbols)
 
-    def get_bars(
-        self,
-        symbol: str,
-        freq: str = "1d",
-        start: Optional[date] = None,
-        end: Optional[date] = None,
-    ) -> list[MarketBar]:
-        key = (symbol, freq, start, end)
-        hit, value = self._bars_cache.get(key)
-        if hit:
-            return value
-        value = self._execute_with_fallback(
-            "get_bars", symbol=symbol, freq=freq, start=start, end=end,
-        )
-        self._bars_cache.set(key, value)
-        return value
 
-    def get_realtime_quotes(self, symbols: list[str]) -> list[RealtimeQuote]:
-        key = tuple(sorted(symbols))
-        hit, value = self._quotes_cache.get(key)
-        if hit:
-            return value
-        value = self._execute_with_fallback("get_realtime_quotes", symbols)
-        self._quotes_cache.set(key, value)
-        return value
+def _fetch_precise(symbols: list[str]) -> dict[str, dict]:
+    """用新浪接口批量拉取指定股票的实时行情"""
+    if not symbols:
+        return {}
+    ak = _ak()
+    # 新浪接口：传入 sh600519,sz000001 格式
+    sina_codes = []
+    code_to_symbol = {}
+    for sym in symbols:
+        code = _to_code(sym)
+        exchange = "sh" if code.startswith(("6", "9")) else "sz"
+        sina_code = f"{exchange}{code}"
+        sina_codes.append(sina_code)
+        code_to_symbol[code] = sym
 
-    def cache_stats(self) -> dict:
-        return {
-            "bars": self._bars_cache.stats(),
-            "quotes": self._quotes_cache.stats(),
+    try:
+        # 用新浪实时接口，支持批量
+        import httpx
+        # 新浪实时行情 API（免费，稳定）
+        url = "https://hq.sinajs.cn/list=" + ",".join(sina_codes)
+        headers = {
+            "Referer": "https://finance.sina.com.cn",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
         }
+        resp = httpx.get(url, headers=headers, timeout=5)
+        resp.raise_for_status()
+
+        result = {}
+        now = datetime.now().isoformat()
+        for line in resp.text.strip().split("\n"):
+            if not line or "=" not in line:
+                continue
+            # var hq_str_sh600519="贵州茅台,1332.73,1342.17,..."
+            key_part, val_part = line.split("=", 1)
+            sina_code = key_part.strip().replace("var hq_str_", "")
+            code = _normalize_code(sina_code)
+            symbol = code_to_symbol.get(code)
+            if not symbol:
+                continue
+
+            val = val_part.strip().strip('"').strip(';')
+            if not val or val == "0":
+                continue
+            fields = val.split(",")
+            if len(fields) < 10:
+                continue
+
+            try:
+                name = fields[0]
+                open_ = float(fields[1] or 0)
+                prev_close = float(fields[2] or 0)
+                price = float(fields[3] or 0)
+                high = float(fields[4] or 0)
+                low = float(fields[5] or 0)
+                volume = int(float(fields[8] or 0))
+                turnover = float(fields[9] or 0)
+                change = round(price - prev_close, 2)
+                change_pct = round(change / prev_close * 100, 2) if prev_close else 0
+
+                result[symbol] = {
+                    "symbol": symbol,
+                    "name": name,
+                    "price": round(price, 2),
+                    "change": change,
+                    "change_pct": change_pct,
+                    "volume": volume,
+                    "turnover": turnover,
+                    "high": round(high, 2),
+                    "low": round(low, 2),
+                    "open": round(open_, 2),
+                    "prev_close": round(prev_close, 2),
+                    "limit_up": round(prev_close * 1.1, 2),
+                    "limit_down": round(prev_close * 0.9, 2),
+                    "amplitude": round((high - low) / prev_close * 100, 2) if prev_close else 0,
+                    "turnover_rate": 0,
+                    "pe_ratio": 0,
+                    "pb_ratio": 0,
+                    "market_cap": 0,
+                    "timestamp": now,
+                }
+            except (ValueError, IndexError):
+                continue
+
+        return result
+    except Exception as e:
+        log.warning("_fetch_precise failed: %s", e)
+        return {}
+
+
+def _precise_refresh_loop():
+    """精准行情后台线程：每 3 秒刷新自选股行情"""
+    global _precise_cache
+    while True:
+        with _precise_lock:
+            symbols = list(_precise_symbols)
+
+        if symbols:
+            try:
+                data = _fetch_precise(symbols)
+                if data:
+                    with _precise_lock:
+                        _precise_cache.update(data)
+                    log.debug("精准行情刷新: %d 只", len(data))
+            except Exception as e:
+                log.warning("精准行情刷新失败: %s", e)
+
+        time.sleep(_PRECISE_TTL)
+
+
+# ---------------------------------------------------------------------------
+# 全市场行情刷新（30秒，用于涨幅榜）
+# ---------------------------------------------------------------------------
+
+def _fetch_market_all() -> dict[str, dict]:
+    """拉取全市场行情（新浪接口）"""
+    ak = _ak()
+    df = ak.stock_zh_a_spot()
+    if df is None or df.empty:
+        return {}
+    result = {}
+    now = datetime.now().isoformat()
+    for _, row in df.iterrows():
+        raw_code = str(row.get("代码", "")).strip()
+        code = _normalize_code(raw_code)
+        if not code:
+            continue
+        price = float(row.get("最新价") or 0)
+        prev_close = float(row.get("昨收") or price)
+        change = round(price - prev_close, 2)
+        change_pct = round(change / prev_close * 100, 2) if prev_close else 0
+        exchange = "SH" if code.startswith(("6", "9")) else "SZ"
+        result[code] = {
+            "symbol": f"{code}.{exchange}",
+            "name": str(row.get("名称", "")),
+            "price": round(price, 2),
+            "change": change,
+            "change_pct": change_pct,
+            "volume": int(float(row.get("成交量") or 0)),
+            "turnover": float(row.get("成交额") or 0),
+            "high": float(row.get("最高") or 0),
+            "low": float(row.get("最低") or 0),
+            "open": float(row.get("今开") or 0),
+            "prev_close": round(prev_close, 2),
+            "limit_up": round(prev_close * 1.1, 2),
+            "limit_down": round(prev_close * 0.9, 2),
+            "amplitude": 0,
+            "turnover_rate": float(row.get("换手率") or 0) if "换手率" in df.columns else 0,
+            "pe_ratio": 0,
+            "pb_ratio": 0,
+            "market_cap": 0,
+            "timestamp": now,
+        }
+    return result
+
+
+def _market_refresh_loop():
+    """全市场行情后台线程：启动立即加载，之后每 30 秒刷新"""
+    global _market_cache
+    # 启动时立即加载一次
+    try:
+        log.info("首次加载全市场行情缓存...")
+        data = _fetch_market_all()
+        if data:
+            with _market_lock:
+                _market_cache = data
+            log.info("全市场缓存首次加载完成，共 %d 只", len(data))
+    except Exception as e:
+        log.warning("全市场缓存首次加载失败: %s", e)
+
+    while True:
+        time.sleep(_MARKET_TTL)
+        try:
+            log.info("刷新全市场行情缓存...")
+            data = _fetch_market_all()
+            if data:
+                with _market_lock:
+                    _market_cache = data
+                log.info("全市场缓存刷新完成，共 %d 只", len(data))
+        except Exception as e:
+            log.warning("全市场缓存刷新失败: %s", e)
+
+
+def ensure_cache_running():
+    """启动两个后台缓存线程"""
+    global _precise_thread, _market_thread
+
+    if _precise_thread is None or not _precise_thread.is_alive():
+        _precise_thread = threading.Thread(
+            target=_precise_refresh_loop, daemon=True, name="precise-quote"
+        )
+        _precise_thread.start()
+        log.info("精准行情线程已启动（3秒刷新）")
+
+    if _market_thread is None or not _market_thread.is_alive():
+        _market_thread = threading.Thread(
+            target=_market_refresh_loop, daemon=True, name="market-quote"
+        )
+        _market_thread.start()
+        log.info("全市场行情线程已启动（30秒刷新）")
+
+
+def _cache_ready() -> bool:
+    return bool(_market_cache) or bool(_precise_cache)
+
+
+# ---------------------------------------------------------------------------
+# 公开接口
+# ---------------------------------------------------------------------------
+
+def get_realtime_quotes(symbols: list[str]) -> list[dict]:
+    """获取批量行情：优先精准缓存，回退全市场缓存"""
+    if not symbols:
+        return []
+    # 确保这些 symbol 被精准跟踪
+    register_symbols(symbols)
+
+    result = []
+    with _precise_lock:
+        precise = dict(_precise_cache)
+    with _market_lock:
+        market = dict(_market_cache)
+
+    for symbol in symbols:
+        # 优先精准缓存
+        if symbol in precise:
+            result.append(precise[symbol])
+            continue
+        # 回退全市场缓存
+        code = _to_code(symbol)
+        if code in market:
+            item = dict(market[code])
+            item["symbol"] = symbol
+            result.append(item)
+
+    return result
+
+
+def get_single_quote(symbol: str) -> Optional[dict]:
+    """获取单股行情"""
+    register_symbols([symbol])
+
+    with _precise_lock:
+        q = _precise_cache.get(symbol)
+    if q:
+        return q
+
+    # 回退全市场缓存
+    code = _to_code(symbol)
+    with _market_lock:
+        q = _market_cache.get(code)
+    if q:
+        item = dict(q)
+        item["symbol"] = symbol
+        return item
+
+    # 两个缓存都没有，直接拉一次
+    log.info("缓存未命中，直接拉取 %s", symbol)
+    data = _fetch_precise([symbol])
+    if data and symbol in data:
+        with _precise_lock:
+            _precise_cache[symbol] = data[symbol]
+        return data[symbol]
+    return None
+
+
+def get_hot_stocks(top_n: int = 50) -> list[dict]:
+    """涨幅榜（从全市场缓存），top_n 最大 5000"""
+    with _market_lock:
+        all_q = list(_market_cache.values())
+    if not all_q:
+        return []
+    sorted_q = sorted(all_q, key=lambda x: x.get("change_pct", 0), reverse=True)
+    return [
+        {
+            "symbol": q["symbol"], "name": q["name"],
+            "price": q["price"], "change": q.get("change", 0),
+            "change_pct": q["change_pct"], "volume": q["volume"],
+            "turnover": q.get("turnover", 0),
+            "turnover_rate": q.get("turnover_rate", 0),
+            "open": q.get("open", 0), "high": q.get("high", 0), "low": q.get("low", 0),
+            "prev_close": q.get("prev_close", 0),
+        }
+        for q in sorted_q[:min(top_n, len(sorted_q))]
+    ]
+
+
+def get_all_quotes_snapshot() -> list[dict]:
+    """全市场快照（总览页统计用）"""
+    with _market_lock:
+        return list(_market_cache.values())
+
+
+# ---------------------------------------------------------------------------
+# K线（腾讯接口）
+# ---------------------------------------------------------------------------
+
+def get_kline(symbol: str, period: str = "daily", count: int = 120) -> list[dict]:
+    """获取K线，腾讯接口（稳定）+ 今日实时K线"""
+    ak = _ak()
+    code = _to_code(symbol)
+    exchange = "sh" if code.startswith(("6", "9")) else "sz"
+    tx_symbol = f"{exchange}{code}"
+
+    bars = []
+    for attempt in range(3):
+        try:
+            df = ak.stock_zh_a_hist_tx(symbol=tx_symbol, adjust="qfq")
+            if df is None or df.empty:
+                break
+
+            fetch_count = count * 5 if period != "daily" else count + 20
+            df = df.tail(fetch_count)
+
+            if period == "weekly":
+                df = _resample_kline(df, "W")
+            elif period == "monthly":
+                df = _resample_kline(df, "ME")
+
+            prev_close = None
+            for _, row in df.tail(count).iterrows():
+                close = float(row.get("close") or 0)
+                open_ = float(row.get("open") or 0)
+                change_pct = round((close - prev_close) / prev_close * 100, 2) if prev_close and prev_close > 0 else 0
+                prev_close = close
+                bars.append({
+                    "date": str(row.get("date", "")),
+                    "open": round(open_, 2),
+                    "high": round(float(row.get("high") or 0), 2),
+                    "low": round(float(row.get("low") or 0), 2),
+                    "close": round(close, 2),
+                    "volume": int(float(row.get("amount") or 0)),
+                    "amount": float(row.get("amount") or 0),
+                    "change_pct": change_pct,
+                    "turnover_rate": 0,
+                    "is_today": False,
+                })
+            break
+        except Exception as e:
+            log.warning("get_kline attempt %d for %s: %s", attempt + 1, symbol, e)
+            if attempt < 2:
+                time.sleep(2)
+
+    # 拼接今日实时K线（仅日K）
+    if period == "daily":
+        today_bar = _get_today_bar(symbol, bars)
+        if today_bar:
+            today_str = today_bar["date"]
+            # 如果最后一根已经是今天，替换；否则追加
+            if bars and bars[-1]["date"] == today_str:
+                bars[-1] = today_bar
+            else:
+                bars.append(today_bar)
+
+    return bars
+
+
+def _get_today_bar(symbol: str, history_bars: list[dict]) -> Optional[dict]:
+    """从精准缓存构造今日实时K线"""
+    from datetime import date as _date
+    today_str = _date.today().strftime("%Y-%m-%d")
+
+    q = get_single_quote(symbol)
+    if not q or q.get("price", 0) <= 0:
+        return None
+
+    price = q["price"]
+    open_ = q.get("open", price)
+    high = q.get("high", price)
+    low = q.get("low", price)
+    prev_close = q.get("prev_close", price)
+    change_pct = round((price - prev_close) / prev_close * 100, 2) if prev_close else 0
+
+    if open_ <= 0:
+        open_ = prev_close
+
+    # 用成交量（股数）和历史数据保持一致
+    # 新浪接口返回的 volume 是成交量（股），amount/turnover 是成交额（元）
+    volume = int(q.get("volume", 0))   # 股数，和腾讯历史数据单位一致
+
+    return {
+        "date": today_str,
+        "open": round(open_, 2),
+        "high": round(max(high, open_, price), 2),
+        "low": round(min(low, open_, price) if low > 0 else min(open_, price), 2),
+        "close": round(price, 2),
+        "volume": volume,
+        "amount": float(q.get("turnover", 0)),
+        "change_pct": change_pct,
+        "turnover_rate": q.get("turnover_rate", 0),
+        "is_today": True,
+    }
+
+
+def _resample_kline(df, freq: str):
+    try:
+        import pandas as pd
+        df = df.copy()
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date")
+        resampled = df.resample(freq).agg({
+            "open": "first", "high": "max",
+            "low": "min", "close": "last", "amount": "sum",
+        }).dropna().reset_index()
+        resampled["date"] = resampled["date"].dt.strftime("%Y-%m-%d")
+        return resampled
+    except Exception as e:
+        log.warning("resample failed: %s", e)
+        return df.reset_index() if df.index.name == "date" else df
+
+
+# ---------------------------------------------------------------------------
+# 搜索 & 新闻
+# ---------------------------------------------------------------------------
+
+def search_stocks(keyword: str) -> list[dict]:
+    ak = _ak()
+    try:
+        df = ak.stock_info_a_code_name()
+        keyword = keyword.strip().upper()
+        result = []
+        for _, row in df.iterrows():
+            code = str(row.get("code", "")).strip()
+            name = str(row.get("name", "")).strip()
+            if keyword in code or keyword in name.upper():
+                exchange = "SH" if code.startswith(("6", "9")) else "SZ"
+                result.append({"symbol": f"{code}.{exchange}", "name": name, "code": code})
+                if len(result) >= 20:
+                    break
+        return result
+    except Exception as e:
+        log.warning("search_stocks failed: %s", e)
+        return []
+
+
+def get_stock_news(symbol: str, count: int = 10) -> list[dict]:
+    ak = _ak()
+    code = _to_code(symbol)
+    try:
+        df = ak.stock_news_em(symbol=code)
+        if df is None or df.empty:
+            return []
+        news = []
+        for _, row in df.head(count).iterrows():
+            news.append({
+                "title": str(row.get("新闻标题", "")),
+                "content": str(row.get("新闻内容", ""))[:500],
+                "source": str(row.get("文章来源", "")),
+                "time": str(row.get("发布时间", "")),
+                "url": str(row.get("新闻链接", "")),
+            })
+        return news
+    except Exception as e:
+        log.warning("get_stock_news %s failed: %s", symbol, e)
+        return []

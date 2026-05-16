@@ -1,87 +1,89 @@
-"""Watchlist (自选股) CRUD endpoints."""
-
-from __future__ import annotations
-
-from dataclasses import asdict
-from typing import Optional
-
+"""自选股路由"""
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from apps.api.app.api.routes.live_orders import get_current_user
-from apps.api.app.core.auth import AuthenticatedUser
-from apps.api.app.core.config import get_settings
 from apps.api.app.db.session import get_db
-from apps.api.app.services.watchlist_service import WatchlistService
+from apps.api.app.db.models import WatchlistORM
+from apps.api.app.services import market_service
 
 router = APIRouter(prefix="/watchlist", tags=["watchlist"])
 
 
-class WatchlistAddRequest(BaseModel):
+class AddSymbolReq(BaseModel):
     symbol: str
-    note: Optional[str] = ""
-    sort_order: Optional[int] = 0
+    name: str = ""
+    note: str = ""
 
 
-class WatchlistReorderRequest(BaseModel):
-    symbols: list[str]
+@router.get("/")
+def list_watchlist(db: Session = Depends(get_db)):
+    items = db.query(WatchlistORM).order_by(WatchlistORM.sort_order, WatchlistORM.id).all()
+    return [
+        {
+            "id": item.id,
+            "symbol": item.symbol,
+            "name": item.name,
+            "note": item.note,
+            "sort_order": item.sort_order,
+        }
+        for item in items
+    ]
 
 
-def _account(user: AuthenticatedUser) -> str:
-    """Use the user's role-based id when auth is enabled, otherwise fall
-    back to the default account from settings."""
-    if user and getattr(user, "user_id", None):
-        return user.user_id
-    return get_settings().default_account_id
+@router.post("/")
+def add_symbol(req: AddSymbolReq, db: Session = Depends(get_db)):
+    existing = db.query(WatchlistORM).filter(WatchlistORM.symbol == req.symbol).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"{req.symbol} 已在自选股中")
 
+    # 自动获取股票名称
+    name = req.name
+    if not name:
+        q = market_service.get_single_quote(req.symbol)
+        name = q.get("name", req.symbol) if q else req.symbol
 
-@router.get("/", summary="列出自选股")
-def list_watchlist(
-    db: Session = Depends(get_db),
-    user: AuthenticatedUser = Depends(get_current_user),
-):
-    svc = WatchlistService(db)
-    items = svc.list_items(_account(user))
-    return {"items": [asdict(i) for i in items], "count": len(items)}
-
-
-@router.post("/", summary="添加自选股", status_code=201)
-def add_watchlist(
-    req: WatchlistAddRequest,
-    db: Session = Depends(get_db),
-    user: AuthenticatedUser = Depends(get_current_user),
-):
-    svc = WatchlistService(db)
-    try:
-        item = svc.add(_account(user), req.symbol, req.note or "", req.sort_order or 0)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+    max_order = db.query(WatchlistORM).count()
+    item = WatchlistORM(symbol=req.symbol, name=name, note=req.note, sort_order=max_order)
+    db.add(item)
     db.commit()
-    return asdict(item)
+    db.refresh(item)
+    return {"id": item.id, "symbol": item.symbol, "name": item.name}
 
 
-@router.delete("/{symbol}", summary="移除自选股")
-def remove_watchlist(
-    symbol: str,
-    db: Session = Depends(get_db),
-    user: AuthenticatedUser = Depends(get_current_user),
-):
-    svc = WatchlistService(db)
-    removed = svc.remove(_account(user), symbol)
-    if not removed:
-        raise HTTPException(404, f"自选股中不存在: {symbol}")
+@router.delete("/{symbol}")
+def remove_symbol(symbol: str, db: Session = Depends(get_db)):
+    item = db.query(WatchlistORM).filter(WatchlistORM.symbol == symbol).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="股票不在自选股中")
+    db.delete(item)
     db.commit()
-    return {"removed": True, "symbol": symbol.upper()}
+    return {"ok": True}
 
 
-@router.put("/reorder", summary="重新排序自选股")
-def reorder_watchlist(
-    req: WatchlistReorderRequest,
-    db: Session = Depends(get_db),
-    user: AuthenticatedUser = Depends(get_current_user),
-):
-    svc = WatchlistService(db)
-    n = svc.reorder(_account(user), req.symbols)
-    db.commit()
-    return {"updated": n}
+@router.get("/with-quotes")
+def list_with_quotes(db: Session = Depends(get_db)):
+    """自选股列表 + 实时行情"""
+    items = db.query(WatchlistORM).order_by(WatchlistORM.sort_order, WatchlistORM.id).all()
+    if not items:
+        return []
+    symbols = [item.symbol for item in items]
+    quotes = market_service.get_realtime_quotes(symbols)
+    quote_map = {q["symbol"]: q for q in quotes}
+
+    result = []
+    for item in items:
+        q = quote_map.get(item.symbol, {})
+        result.append({
+            "id": item.id,
+            "symbol": item.symbol,
+            "name": item.name or q.get("name", item.symbol),
+            "note": item.note,
+            "price": q.get("price", 0),
+            "change_pct": q.get("change_pct", 0),
+            "change": q.get("change", 0),
+            "volume": q.get("volume", 0),
+            "turnover_rate": q.get("turnover_rate", 0),
+            "pe_ratio": q.get("pe_ratio", 0),
+        })
+    return result

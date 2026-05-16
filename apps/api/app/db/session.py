@@ -1,56 +1,42 @@
-from __future__ import annotations
-
 from contextlib import contextmanager
-from functools import lru_cache
-from pathlib import Path
-from urllib.parse import urlparse
-
-from sqlalchemy import Engine, create_engine
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
 
 from apps.api.app.core.config import get_settings
+from apps.api.app.db.base import Base
+
+_engine = None
+_SessionLocal = None
 
 
-def _ensure_sqlite_parent_dir(database_url: str) -> None:
-    if not database_url.startswith("sqlite:///"):
-        return
-
-    path_value = database_url.replace("sqlite:///", "", 1)
-    if path_value == ":memory:":
-        return
-
-    path = Path(path_value)
-    if not path.is_absolute():
-        path = Path.cwd() / path
-    path.parent.mkdir(parents=True, exist_ok=True)
+def get_engine():
+    global _engine
+    if _engine is None:
+        settings = get_settings()
+        _engine = create_engine(
+            settings.database_url,
+            connect_args={"check_same_thread": False} if "sqlite" in settings.database_url else {},
+            echo=False,
+        )
+    return _engine
 
 
-@lru_cache(maxsize=1)
-def get_engine() -> Engine:
-    settings = get_settings()
-    database_url = settings.database_url
-    _ensure_sqlite_parent_dir(database_url)
-
-    connect_args: dict[str, object] = {}
-    if database_url.startswith("sqlite"):
-        connect_args["check_same_thread"] = False
-
-    return create_engine(
-        database_url,
-        echo=settings.database_echo,
-        future=True,
-        connect_args=connect_args,
-    )
+def get_session_factory():
+    global _SessionLocal
+    if _SessionLocal is None:
+        _SessionLocal = sessionmaker(bind=get_engine(), autocommit=False, autoflush=True)
+    return _SessionLocal
 
 
-@lru_cache(maxsize=1)
-def get_session_factory() -> sessionmaker[Session]:
-    return sessionmaker(bind=get_engine(), autoflush=False, autocommit=False, future=True)
+def init_db():
+    """建表（首次启动）"""
+    Base.metadata.create_all(bind=get_engine())
 
 
 @contextmanager
 def session_scope() -> Session:
-    session = get_session_factory()()
+    factory = get_session_factory()
+    session: Session = factory()
     try:
         yield session
         session.commit()
@@ -61,19 +47,15 @@ def session_scope() -> Session:
         session.close()
 
 
-def get_db() -> Session:
-    session = get_session_factory()()
+def get_db():
+    """FastAPI Depends 用"""
+    factory = get_session_factory()
+    db = factory()
     try:
-        yield session
-        session.commit()
+        yield db
+        db.commit()
     except Exception:
-        session.rollback()
+        db.rollback()
         raise
     finally:
-        session.close()
-
-
-def reset_db_caches() -> None:
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-
+        db.close()
