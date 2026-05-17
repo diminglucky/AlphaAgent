@@ -1,8 +1,22 @@
-"""潜力股扫描器 — 6 大维度 + 11 种经典策略
+"""潜力股扫描器 — 三层漏斗 + AI 终审
 
 参考 myhhub/stock（12.6k stars）的成熟策略，融合 WorldQuant Alpha 思路。
 
-## 6 大维度（综合评分，最高 100 分）
+## 三层漏斗架构
+
+**Tier 1（快·技术海选 30s-3min）**：5500 只 → 候选池 → Tier-1 (~30 只)
+- 6 维度技术评分 + 11 种经典策略 + 交易计划
+
+**Tier 2（中·基本面+资金面过滤 10-30s）**：Tier-1 → Tier-2 (~10-15 只)
+- 一票否决：ST / 流通市值<30亿 / 上市<60天 / 龙虎榜异动卖出
+- 基本面调整分：PE/盘子/主力资金净流入/龙虎榜机构
+
+**Tier 3（慢·LLM 终审 1-3min）**：Tier-2 → 最终列表 (~5-8 只)
+- 每只调用 SuperAnalystAgent 多工具综合分析
+- 仅 LLM 给 BUY 且 confidence ≥ 65 的入选
+- LLM 完整分析结果直接显示在卡片，无需再点单股分析
+
+## 6 大维度（技术评分，最高 100 分）
 
 1. 趋势维度（20分）：均线排列、MA金叉、价格位置
 2. 动量维度（15分）：RSI、MACD、KDJ
@@ -34,6 +48,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from apps.api.app.services import market_service
+from apps.api.app.services import fundamental_service
 
 log = logging.getLogger("quant.scanner")
 
@@ -944,16 +959,26 @@ def scan_potential_stocks(
     use_cache: bool = True,
     filter_params: Optional[dict] = None,
     required_strategies: Optional[list[str]] = None,
+    enable_fundamental: bool = True,
+    enable_llm: bool = True,
+    llm_top_n: int = 12,
+    progress_callback=None,
 ) -> dict:
-    """扫描全市场，找出有上涨潜力的股票。
+    """三层漏斗扫描：技术海选 → 基本面过滤 → LLM 终审。
 
     Args:
-        required_strategies: 必须命中的策略名列表（如 ["放量上涨", "均线多头"]），
-                            为空时使用综合评分
+        top_n: 最终输出数量
+        min_score: Tier-1 最低技术分
+        candidate_pool: Tier-1 深度分析候选池大小
+        enable_fundamental: 是否启用 Tier-2 基本面过滤
+        enable_llm: 是否启用 Tier-3 LLM 终审
+        llm_top_n: 进入 Tier-3 的最大数量（每只一次 LLM 调用，控制耗时）
+        progress_callback: 进度回调（可选）
+        required_strategies: 必须命中的策略名列表
     """
     global _scan_cache, _scan_ts
 
-    cache_key = f"top{top_n}_min{min_score}_pool{candidate_pool}_req{required_strategies}"
+    cache_key = f"top{top_n}_min{min_score}_pool{candidate_pool}_req{required_strategies}_f{enable_fundamental}_l{enable_llm}"
     if use_cache and _scan_cache.get(cache_key) and (time.monotonic() - _scan_ts < _CACHE_TTL):
         result = dict(_scan_cache[cache_key])
         result["cached"] = True
@@ -967,7 +992,12 @@ def scan_potential_stocks(
 
     market_status = _compute_market_status(all_quotes)
 
-    # 第一阶段
+    # ============================================================
+    # Tier 1：技术海选
+    # ============================================================
+    if progress_callback:
+        progress_callback("tier1_start", {"total": len(all_quotes)})
+
     params = filter_params or {}
     candidates = _filter_candidates(all_quotes, **params)
 
@@ -979,10 +1009,9 @@ def scan_potential_stocks(
     candidates.sort(key=_candidate_score, reverse=True)
     pool = candidates[:candidate_pool]
 
-    log.info("scanner: 全市场 %d 只 → 候选 %d 只 → 深度分析 %d 只",
+    log.info("scanner T1: 全市场 %d → 候选 %d → 深度分析 %d",
              len(all_quotes), len(candidates), len(pool))
 
-    # 第二阶段：并行分析
     def _analyze_one(quote: dict) -> Optional[dict]:
         try:
             symbol = quote["symbol"]
@@ -991,7 +1020,6 @@ def scan_potential_stocks(
                 return None
             score, dim_scores, signals, tags, strategies, indicators = _score_signals(bars, quote)
 
-            # 必须命中策略过滤
             if required_strategies:
                 hit_names = {s["name"] for s in strategies}
                 if not any(req in hit_names for req in required_strategies):
@@ -1012,6 +1040,7 @@ def scan_potential_stocks(
                 "change_pct": quote.get("change_pct", 0),
                 "turnover": quote.get("turnover", 0),
                 "score": score,
+                "tier1_score": score,
                 "dim_scores": dim_scores,
                 "signals": signals,
                 "tags": tags,
@@ -1020,38 +1049,170 @@ def scan_potential_stocks(
                 "trade_plan": trade_plan,
             }
         except Exception as e:
-            log.debug("scan %s failed: %s", quote.get("symbol"), e)
+            log.debug("T1 scan %s failed: %s", quote.get("symbol"), e)
             return None
 
-    results: list[dict] = []
-    with ThreadPoolExecutor(max_workers=30, thread_name_prefix="scanner") as pool_executor:
-        futures = [pool_executor.submit(_analyze_one, q) for q in pool]
+    tier1_results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=30, thread_name_prefix="scanner-t1") as ex:
+        futures = [ex.submit(_analyze_one, q) for q in pool]
         for fut in as_completed(futures):
             try:
                 r = fut.result(timeout=30)
                 if r:
-                    results.append(r)
+                    tier1_results.append(r)
             except Exception:
                 pass
 
-    # 按「明日交易吸引力」排序：综合评分 + 风险收益比加权
-    def _attractiveness(r):
-        score = r.get("score", 0)
-        rr = (r.get("trade_plan") or {}).get("risk_reward", 0) or 0
-        # 风险收益比超过 2 加分明显
-        return score + min(rr * 5, 15)
+    tier1_results.sort(key=lambda x: x["score"], reverse=True)
+    # 取前 top_n*2 作为 Tier-2 输入（给 Tier-2/3 留淘汰空间）
+    tier1_top = tier1_results[: max(top_n * 2, 30)]
 
-    results.sort(key=_attractiveness, reverse=True)
-    results = results[:top_n]
+    log.info("scanner T1 完成：%d 只通过技术评分", len(tier1_top))
+    if progress_callback:
+        progress_callback("tier1_done", {"count": len(tier1_top)})
+
+    # ============================================================
+    # Tier 2：基本面 + 资金面 过滤
+    # ============================================================
+    tier2_results = tier1_top
+    if enable_fundamental and tier1_top:
+        if progress_callback:
+            progress_callback("tier2_start", {"count": len(tier1_top)})
+
+        def _fund_one(r: dict) -> Optional[dict]:
+            try:
+                ev = fundamental_service.evaluate_fundamental(r["symbol"], r.get("name", ""))
+                if ev["hard_blocks"]:
+                    log.debug("T2 淘汰 %s: %s", r["symbol"], ev["hard_blocks"])
+                    return None
+                # 调整分：tier1 score + 基本面 net_score
+                adjusted = max(0, min(100, r["score"] + ev["net_score"]))
+                r2 = dict(r)
+                r2["score"] = adjusted
+                r2["tier2_score"] = adjusted
+                r2["fundamental"] = {
+                    "info": ev["info"],
+                    "flow": ev["flow"],
+                    "lhb": ev["lhb"],
+                    "bonus": ev["bonus"],
+                    "penalty": ev["penalty"],
+                    "net_score": ev["net_score"],
+                }
+                return r2
+            except Exception as e:
+                log.debug("T2 fund %s failed: %s", r.get("symbol"), e)
+                # 评估失败时不淘汰，只是没有基本面加分
+                return r
+
+        with ThreadPoolExecutor(max_workers=10, thread_name_prefix="scanner-t2") as ex:
+            futures = [ex.submit(_fund_one, r) for r in tier1_top]
+            tier2_results = []
+            for fut in as_completed(futures):
+                try:
+                    r = fut.result(timeout=30)
+                    if r:
+                        tier2_results.append(r)
+                except Exception:
+                    pass
+
+        tier2_results.sort(key=lambda x: x["score"], reverse=True)
+        log.info("scanner T2 完成：%d → %d", len(tier1_top), len(tier2_results))
+        if progress_callback:
+            progress_callback("tier2_done", {"count": len(tier2_results)})
+
+    # ============================================================
+    # Tier 3：LLM 终审（只对 Tier-2 顶部做 LLM 分析）
+    # ============================================================
+    final_results = tier2_results
+    if enable_llm and tier2_results:
+        llm_candidates = tier2_results[:llm_top_n]
+        if progress_callback:
+            progress_callback("tier3_start", {"count": len(llm_candidates)})
+
+        def _llm_one(r: dict) -> Optional[dict]:
+            try:
+                # 调用 SuperAnalystAgent 做完整的多维度分析
+                from libs.agents.super_analyst import SuperAnalystAgent
+                agent = SuperAnalystAgent()
+                run = agent.run(
+                    f"深度分析 {r['symbol']} {r.get('name', '')}",
+                    context={"symbol": r["symbol"]},
+                )
+                ai = run.final_answer or {}
+
+                action = (ai.get("action") or "").upper()
+                confidence = int(ai.get("confidence") or 0)
+
+                # 在 Tier-3 仅保留：BUY 且 confidence ≥ 60
+                # （留点空间，前端按颜色区分强烈推荐 vs 建议关注）
+                if action not in ("BUY", "HOLD") or confidence < 55:
+                    log.info("T3 淘汰 %s: action=%s conf=%d", r["symbol"], action, confidence)
+                    return None
+
+                r3 = dict(r)
+                r3["ai_analysis"] = {
+                    "action": action,
+                    "confidence": confidence,
+                    "risk_level": ai.get("risk_level"),
+                    "time_horizon": ai.get("time_horizon"),
+                    "core_conclusion": ai.get("core_conclusion", {}),
+                    "summary": ai.get("summary", "")[:400],
+                    "key_points": ai.get("key_points", [])[:5],
+                    "catalysts": ai.get("catalysts", [])[:3],
+                    "risk_factors": ai.get("risk_factors", [])[:3],
+                    "buy_price_low": ai.get("buy_price_low"),
+                    "buy_price_high": ai.get("buy_price_high"),
+                    "stop_loss": ai.get("stop_loss"),
+                    "take_profit": ai.get("take_profit"),
+                }
+                # 综合分：Tier2 分数 × 0.6 + LLM 置信度 × 0.4
+                r3["score"] = round(r["score"] * 0.6 + confidence * 0.4)
+                r3["tier3_score"] = r3["score"]
+                return r3
+            except Exception as e:
+                log.warning("T3 LLM %s failed: %s", r.get("symbol"), e)
+                # LLM 失败的不丢弃，但 score 不调整，标注未审
+                r3 = dict(r)
+                r3["ai_analysis"] = {"error": str(e)}
+                return r3
+
+        # 并行调用 LLM（限制并发避免触发限流）
+        final_results = []
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="scanner-t3") as ex:
+            futures = {ex.submit(_llm_one, r): r for r in llm_candidates}
+            for fut in as_completed(futures):
+                try:
+                    r = fut.result(timeout=180)  # 3 分钟单股超时
+                    if r:
+                        final_results.append(r)
+                        if progress_callback:
+                            progress_callback("tier3_progress", {
+                                "completed": len(final_results),
+                                "total": len(llm_candidates),
+                                "symbol": r["symbol"],
+                            })
+                except Exception:
+                    pass
+
+        final_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+        log.info("scanner T3 完成：LLM 复审 %d → AI 推荐 %d", len(llm_candidates), len(final_results))
+        if progress_callback:
+            progress_callback("tier3_done", {"count": len(final_results)})
+
+    final_results = final_results[:top_n]
 
     elapsed = round((time.monotonic() - t0) * 1000, 1)
-    log.info("scanner: 扫描完成，输出 %d 只潜力股，耗时 %.0fms", len(results), elapsed)
+    log.info("scanner: 三层漏斗完成，输出 %d 只 AI 推荐潜力股，耗时 %.0fms",
+             len(final_results), elapsed)
 
     output = {
         "scanned": len(all_quotes),
         "candidates": len(candidates),
         "analyzed": len(pool),
-        "results": results,
+        "tier1_count": len(tier1_top),
+        "tier2_count": len(tier2_results) if enable_fundamental else None,
+        "tier3_count": len(final_results) if enable_llm else None,
+        "results": final_results,
         "market_status": market_status,
         "elapsed_ms": elapsed,
         "cached": False,
@@ -1060,6 +1221,9 @@ def scan_potential_stocks(
             "min_score": min_score,
             "candidate_pool": candidate_pool,
             "required_strategies": required_strategies,
+            "enable_fundamental": enable_fundamental,
+            "enable_llm": enable_llm,
+            "llm_top_n": llm_top_n,
         },
     }
 

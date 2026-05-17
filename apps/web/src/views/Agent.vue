@@ -66,13 +66,30 @@
               {{ actionLabel(currentAnalysis.action) }}
             </div>
             <div class="confidence-wrap">
-              <span class="conf-label">置信度</span>
+              <span class="conf-label">
+                把握度
+                <el-tooltip placement="top" effect="dark">
+                  <template #content>
+                    <div style="max-width:240px;line-height:1.5">
+                      AI 对本次判断的把握程度（0-100）。<br>
+                      80+ 强烈推荐<br>
+                      65-79 比较有把握<br>
+                      50-64 一般，建议小仓试探<br>
+                      &lt;50 信号偏弱，谨慎为上
+                    </div>
+                  </template>
+                  <span class="conf-help">?</span>
+                </el-tooltip>
+              </span>
               <el-progress
                 :percentage="currentAnalysis.confidence || 0"
                 :color="confidenceColor(currentAnalysis.confidence)"
                 :stroke-width="10"
                 style="width: 200px"
               />
+              <span class="conf-tag" :class="confidenceClass(currentAnalysis.confidence)">
+                {{ confidenceLabel(currentAnalysis.confidence) }}
+              </span>
             </div>
             <div class="meta-row">
               <el-tag :color="riskColor(currentAnalysis.risk_level)" effect="dark" size="small" style="border:none">
@@ -638,7 +655,7 @@
               :stroke-width="5"
               :show-text="false"
             />
-            <span class="sc-conf-text">{{ r.confidence }}%</span>
+            <span class="sc-conf-text">{{ r.confidence }}% · {{ confidenceLabel(r.confidence) }}</span>
           </div>
           <div class="sc-buy" v-if="r.buy_price_low">
             买入 ¥{{ r.buy_price_low?.toFixed(2) }}–{{ r.buy_price_high?.toFixed(2) }}
@@ -676,10 +693,26 @@
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="置信度" width="80">
+          <el-table-column label="把握度" width="120">
+            <template #header>
+              <span>把握度</span>
+              <el-tooltip placement="top" effect="dark">
+                <template #content>
+                  <div style="max-width:220px;line-height:1.5">
+                    AI 对本次判断的把握程度<br>
+                    80+ 强烈推荐 / 65-79 比较有把握<br>
+                    50-64 一般 / &lt;50 信号偏弱
+                  </div>
+                </template>
+                <span class="conf-help" style="margin-left:4px">?</span>
+              </el-tooltip>
+            </template>
             <template #default="{ row }">
               <span :style="{ color: confidenceColor(row.result?.confidence) }">
                 {{ row.result?.confidence }}%
+              </span>
+              <span class="conf-tag" :class="confidenceClass(row.result?.confidence)" style="margin-left:6px">
+                {{ confidenceLabel(row.result?.confidence) }}
               </span>
             </template>
           </el-table-column>
@@ -745,7 +778,7 @@
 
 <script setup>
 defineOptions({ name: 'Agent' })
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onActivated, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { api } from '../api.js'
@@ -979,9 +1012,26 @@ function actionTagType(action) {
 }
 
 function confidenceColor(v) {
-  if (v >= 70) return '#67c23a'
-  if (v >= 50) return '#e6a23c'
+  if (v >= 80) return '#f56c6c'
+  if (v >= 65) return '#e6a23c'
+  if (v >= 50) return '#67c23a'
   return '#909399'
+}
+
+function confidenceLabel(v) {
+  if (v == null) return ''
+  if (v >= 80) return '强烈推荐'
+  if (v >= 65) return '比较有把握'
+  if (v >= 50) return '一般'
+  return '信号偏弱'
+}
+
+function confidenceClass(v) {
+  if (v == null) return ''
+  if (v >= 80) return 'conf-strong'
+  if (v >= 65) return 'conf-good'
+  if (v >= 50) return 'conf-mid'
+  return 'conf-weak'
 }
 
 function riskColor(level) {
@@ -1053,17 +1103,37 @@ function getIndicator(ind, keys) {
 }
 
 // ─── 初始化 ──────────────────────────────────────────
+async function _bootFromRoute() {
+  // 当从其它页面（潜力扫描详情、行情页）跳转过来带 symbol 时自动触发分析
+  const sym = route.query.symbol
+  if (!sym) return
+  // 如果当前已经显示这只股票的结果，且不是新的请求，跳过
+  if (currentAnalysis.value?.symbol === sym && !route.query.t) return
+
+  currentSymbol.value = sym
+  currentName.value = route.query.name || sym
+  searchKeyword.value = currentName.value
+  await analyzeCurrentSymbol()
+}
+
 onMounted(async () => {
-  if (route.query.symbol) {
-    currentSymbol.value = route.query.symbol
-    currentName.value = route.query.name || route.query.symbol
-    searchKeyword.value = currentName.value
-    await analyzeCurrentSymbol()
-  }
+  await _bootFromRoute()
   try {
     cachedAnalyses.value = await api.analysisCache()
   } catch {}
 })
+
+// keep-alive 缓存的页面 onMounted 只触发一次，必须用 onActivated 接收后续跳转
+onActivated(() => {
+  _bootFromRoute()
+})
+
+// 同一页面重复点击「Agent 分析」按钮跳转时（query 不变 vue-router 不会重渲染），
+// 监听 query.symbol+t 变化触发新分析
+watch(
+  () => [route.query.symbol, route.query.t],
+  () => _bootFromRoute()
+)
 </script>
 
 
@@ -1223,7 +1293,38 @@ onMounted(async () => {
   gap: 10px;
 }
 
-.conf-label { font-size: 12px; color: #909399; white-space: nowrap; }
+.conf-label {
+  font-size: 12px;
+  color: #909399;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.conf-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #2a2a4a;
+  color: #909399;
+  font-size: 10px;
+  cursor: help;
+}
+
+.conf-tag {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  white-space: nowrap;
+}
+.conf-tag.conf-strong { background: rgba(245, 108, 108, 0.18); color: #f56c6c; }
+.conf-tag.conf-good   { background: rgba(230, 162, 60, 0.18); color: #e6a23c; }
+.conf-tag.conf-mid    { background: rgba(103, 194, 58, 0.16); color: #67c23a; }
+.conf-tag.conf-weak   { background: rgba(144, 147, 153, 0.18); color: #909399; }
 
 .meta-row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
 

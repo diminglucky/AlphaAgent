@@ -444,7 +444,7 @@ async function removeFromWatchlist(symbol) {
 }
 
 function goAnalyze() {
-  router.push({ path: '/agent', query: { symbol: currentSymbol.value, name: currentName.value } })
+  router.push({ path: '/agent', query: { symbol: currentSymbol.value, name: currentName.value, t: Date.now() } })
 }
 
 async function createAlert() {

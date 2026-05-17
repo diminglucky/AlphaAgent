@@ -5,10 +5,10 @@
       <div class="header-left">
         <h2 class="page-title">
           <span class="title-icon">🔥</span>
-          潜力股扫描器
+          AI 潜力股扫描器
         </h2>
         <span class="page-subtitle">
-          全市场扫描 · 给出明日具体的「买入区间 / 止损 / 目标价 / 仓位」交易计划
+          技术海选 → 基本面+资金面过滤 → AI 终审，输出明日具体可买的标的
         </span>
       </div>
       <div class="header-actions">
@@ -90,15 +90,15 @@
             <span class="param-label">返回数量</span>
             <el-input-number
               v-model="params.top_n"
-              :min="10"
-              :max="100"
-              :step="10"
+              :min="5"
+              :max="50"
+              :step="5"
               size="small"
               controls-position="right"
             />
           </div>
           <div class="param-item">
-            <span class="param-label">最低分数</span>
+            <span class="param-label">最低技术分</span>
             <el-input-number
               v-model="params.min_score"
               :min="0"
@@ -113,14 +113,34 @@
             <el-input-number
               v-model="params.candidate_pool"
               :min="50"
-              :max="500"
-              :step="50"
+              :max="300"
+              :step="20"
               size="small"
               controls-position="right"
             />
           </div>
+          <div class="param-item">
+            <span class="param-label">AI 终审数量</span>
+            <el-input-number
+              v-model="params.llm_top_n"
+              :min="3"
+              :max="20"
+              :step="1"
+              size="small"
+              controls-position="right"
+              :disabled="!params.enable_llm"
+            />
+          </div>
+          <div class="param-item">
+            <el-switch v-model="params.enable_fundamental" size="small" />
+            <span class="param-label" style="margin-left:6px">基本面过滤</span>
+          </div>
+          <div class="param-item">
+            <el-switch v-model="params.enable_llm" size="small" />
+            <span class="param-label" style="margin-left:6px">AI 终审</span>
+          </div>
           <div class="param-hint">
-            首次扫描约 2-3 分钟，结果缓存 5 分钟
+            完整三层（推荐）约 3-5 分钟；关掉 AI 终审约 1-2 分钟
           </div>
         </div>
       </el-collapse-item>
@@ -200,17 +220,22 @@
       </div>
       <div class="arrow">→</div>
       <div class="summary-item">
-        <div class="summary-label">一阶段候选</div>
-        <div class="summary-value">{{ result.candidates?.toLocaleString() }}</div>
+        <div class="summary-label">技术海选</div>
+        <div class="summary-value">{{ result.tier1_count ?? result.analyzed }}</div>
       </div>
-      <div class="arrow">→</div>
-      <div class="summary-item">
-        <div class="summary-label">深度分析</div>
-        <div class="summary-value">{{ result.analyzed }}</div>
+      <div v-if="result.tier2_count != null" class="arrow">→</div>
+      <div v-if="result.tier2_count != null" class="summary-item">
+        <div class="summary-label">基本面过滤</div>
+        <div class="summary-value">{{ result.tier2_count }}</div>
+      </div>
+      <div v-if="result.tier3_count != null" class="arrow">→</div>
+      <div v-if="result.tier3_count != null" class="summary-item">
+        <div class="summary-label">AI 终审</div>
+        <div class="summary-value">{{ result.tier3_count }}</div>
       </div>
       <div class="arrow">→</div>
       <div class="summary-item highlight">
-        <div class="summary-label">潜力股</div>
+        <div class="summary-label">推荐</div>
         <div class="summary-value">{{ result.results?.length || 0 }}</div>
       </div>
       <div class="summary-time">
@@ -298,6 +323,41 @@
               </el-tag>
             </div>
           </div>
+        </div>
+
+        <!-- AI 终审结论（如果 LLM 终审过）-->
+        <div v-if="stock.ai_analysis && stock.ai_analysis.action" class="ai-verdict" :class="`ai-${(stock.ai_analysis.action || '').toLowerCase()}`">
+          <div class="ai-header">
+            <span class="ai-icon">🤖</span>
+            <span class="ai-title">AI 终审</span>
+            <el-tag size="small" :type="aiActionTagType(stock.ai_analysis.action)" effect="dark">
+              {{ aiActionLabel(stock.ai_analysis.action) }}
+            </el-tag>
+            <span class="ai-conf" :style="{ color: confColor(stock.ai_analysis.confidence) }">
+              把握度 {{ stock.ai_analysis.confidence }}%
+            </span>
+          </div>
+          <div v-if="stock.ai_analysis.core_conclusion?.one_sentence" class="ai-quote">
+            "{{ stock.ai_analysis.core_conclusion.one_sentence }}"
+          </div>
+        </div>
+
+        <!-- 基本面 + 资金面 关键指标 -->
+        <div v-if="stock.fundamental?.info" class="fund-row">
+          <span v-if="stock.fundamental.info.pe != null" class="fund-cell">
+            PE <b :class="peClass(stock.fundamental.info.pe)">{{ stock.fundamental.info.pe?.toFixed(1) }}</b>
+          </span>
+          <span v-if="stock.fundamental.info.float_mv" class="fund-cell">
+            流通 <b>{{ (stock.fundamental.info.float_mv/1e8).toFixed(0) }}亿</b>
+          </span>
+          <span v-if="stock.fundamental.flow?.today_net != null" class="fund-cell">
+            主力 <b :class="stock.fundamental.flow.today_net>=0?'up':'down'">
+              {{ stock.fundamental.flow.today_net>=0?'+':'' }}{{ (stock.fundamental.flow.today_net/1e8).toFixed(2) }}亿
+            </b>
+          </span>
+          <span v-if="stock.fundamental.flow?.turnover_rate != null" class="fund-cell">
+            换手 <b>{{ stock.fundamental.flow.turnover_rate?.toFixed(1) }}%</b>
+          </span>
         </div>
 
         <!-- 明日交易计划（核心） -->
@@ -622,9 +682,12 @@ const estimateSec = ref(180)
 let _scanTimer = null
 
 const params = reactive({
-  top_n: 30,
+  top_n: 20,
   min_score: 50,
-  candidate_pool: 120,
+  candidate_pool: 100,
+  enable_fundamental: true,
+  enable_llm: true,
+  llm_top_n: 10,
 })
 
 // 维度满分配置
@@ -734,8 +797,11 @@ onUnmounted(() => {
 async function runScan(forceRefresh = false) {
   scanning.value = true
   elapsedSec.value = 0
-  // 估算耗时：120 候选约 4-5 分钟，按候选池规模线性估算
-  estimateSec.value = Math.max(60, Math.round(params.candidate_pool * 2.3))
+  // 三层漏斗预估：T1 (~candidate_pool*1.0s) + T2 (~30s 基本面) + T3 (~llm_top_n*15s LLM)
+  const t1 = params.candidate_pool * 1.0
+  const t2 = params.enable_fundamental ? 30 : 0
+  const t3 = params.enable_llm ? params.llm_top_n * 15 : 0
+  estimateSec.value = Math.max(60, Math.round(t1 + t2 + t3))
   if (_scanTimer) clearInterval(_scanTimer)
   _scanTimer = setInterval(() => { elapsedSec.value += 1 }, 1000)
   try {
@@ -755,7 +821,7 @@ async function runScan(forceRefresh = false) {
     if (!data.results?.length) {
       ElMessage.warning('未找到符合条件的潜力股')
     } else {
-      ElMessage.success(`扫描完成，找到 ${data.results.length} 只潜力股`)
+      ElMessage.success(`扫描完成，找到 ${data.results.length} 只 AI 推荐潜力股`)
     }
   } catch (e) {
     ElMessage.error('扫描失败: ' + e.message)
@@ -785,7 +851,10 @@ function openDetail(stock) {
 }
 
 function goAnalyze(stock) {
-  router.push({ path: '/agent', query: { symbol: stock.symbol, name: stock.name } })
+  router.push({
+    path: '/agent',
+    query: { symbol: stock.symbol, name: stock.name, t: Date.now() },
+  })
 }
 
 function goKline(stock) {
@@ -943,6 +1012,30 @@ function ratingTagType(r) {
   if (r === '强烈推荐') return 'danger'
   if (r === '推荐') return 'warning'
   if (r === '观察') return 'info'
+  return ''
+}
+
+function aiActionLabel(a) {
+  return { BUY: '建议买入', HOLD: '继续持有', WATCH: '观察', SELL: '建议卖出' }[a] || a
+}
+
+function aiActionTagType(a) {
+  return { BUY: 'danger', HOLD: 'warning', WATCH: 'info', SELL: 'success' }[a] || 'info'
+}
+
+function confColor(v) {
+  if (v == null) return '#909399'
+  if (v >= 80) return '#f56c6c'
+  if (v >= 65) return '#e6a23c'
+  if (v >= 50) return '#67c23a'
+  return '#909399'
+}
+
+function peClass(pe) {
+  if (pe == null) return ''
+  if (pe < 0) return 'down'
+  if (pe > 100) return 'down'
+  if (pe <= 30) return 'up'
   return ''
 }
 
@@ -1594,6 +1687,56 @@ function indicatorGroups(ind) {
 }
 
 .stock-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* AI 终审块 */
+.ai-verdict {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(64, 158, 255, 0.10), rgba(103, 197, 214, 0.04));
+  border: 1px solid rgba(64, 158, 255, 0.30);
+}
+.ai-verdict.ai-buy  { border-color: rgba(245, 108, 108, 0.45); background: linear-gradient(135deg, rgba(245, 108, 108, 0.12), rgba(245, 179, 66, 0.06)); }
+.ai-verdict.ai-hold { border-color: rgba(230, 162, 60, 0.40); background: linear-gradient(135deg, rgba(230, 162, 60, 0.10), rgba(230, 162, 60, 0.04)); }
+.ai-verdict.ai-sell { border-color: rgba(103, 194, 58, 0.40); background: linear-gradient(135deg, rgba(103, 194, 58, 0.10), rgba(103, 194, 58, 0.04)); }
+.ai-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.ai-icon { font-size: 14px; }
+.ai-title { font-size: 12px; color: #c0c4cc; font-weight: 600; }
+.ai-conf { font-size: 12px; font-weight: 700; margin-left: auto; font-family: monospace; }
+.ai-quote {
+  font-size: 12px;
+  color: #c0c4cc;
+  line-height: 1.5;
+  font-style: italic;
+}
+
+/* 基本面 + 资金面一行 */
+.fund-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 6px 10px;
+  background: #16162a;
+  border-radius: 6px;
+  font-size: 11px;
+  color: #909399;
+}
+.fund-cell { white-space: nowrap; }
+.fund-cell b {
+  font-family: monospace;
+  font-size: 12px;
+  color: #c0c4cc;
+  margin-left: 3px;
+}
+.fund-cell b.up { color: #f56c6c; }
+.fund-cell b.down { color: #67c23a; }
 
 /* 明日交易计划（卡片紧凑版） */
 .trade-plan {

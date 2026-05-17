@@ -519,7 +519,7 @@ const drawerKlineOption = computed(() => {
 })
 
 function goAnalyze(item) {
-  router.push({ path: '/agent', query: { symbol: item.symbol, name: item.name } })
+  router.push({ path: '/agent', query: { symbol: item.symbol, name: item.name, t: Date.now() } })
   drawerVisible.value = false
 }
 
