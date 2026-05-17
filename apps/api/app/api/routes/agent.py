@@ -77,13 +77,16 @@ async def analyze_stock(symbol: str, db: Session = Depends(get_db)):
     with ThreadPoolExecutor(max_workers=1) as pool:
         result = await loop.run_in_executor(pool, _run)
 
-    # 缓存结果
+    # 缓存结果（更新 updated_at，且若是新创建会写入 created_at）
+    from datetime import datetime, timezone
+    now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
     cache = db.query(AnalysisCacheORM).filter(AnalysisCacheORM.symbol == symbol).first()
     if cache:
         cache.result = result
         cache.name = name
+        cache.updated_at = now_dt
     else:
-        cache = AnalysisCacheORM(symbol=symbol, name=name, result=result)
+        cache = AnalysisCacheORM(symbol=symbol, name=name, result=result, updated_at=now_dt)
         db.add(cache)
 
     # BUY 信号 → 飞书提醒
@@ -111,11 +114,19 @@ def scan_watchlist(db: Session = Depends(get_db)):
             results.append(result)
 
             # 缓存
+            from datetime import datetime as _dt, timezone as _tz
+            _now = _dt.now(_tz.utc).replace(tzinfo=None)
             cache = db.query(AnalysisCacheORM).filter(AnalysisCacheORM.symbol == item.symbol).first()
             if cache:
                 cache.result = result
+                cache.updated_at = _now
             else:
-                db.add(AnalysisCacheORM(symbol=item.symbol, name=item.name or item.symbol, result=result))
+                db.add(AnalysisCacheORM(
+                    symbol=item.symbol,
+                    name=item.name or item.symbol,
+                    result=result,
+                    updated_at=_now,
+                ))
 
             if result.get("action") == "BUY":
                 try:
@@ -136,14 +147,23 @@ def scan_watchlist(db: Session = Depends(get_db)):
 
 
 @router.get("/cache")
-def get_cached_analyses(db: Session = Depends(get_db)):
-    caches = db.query(AnalysisCacheORM).order_by(AnalysisCacheORM.id.desc()).all()
+def get_cached_analyses(
+    db: Session = Depends(get_db),
+    max_age_hours: int = 24,
+):
+    """返回所有分析缓存。max_age_hours 控制返回的缓存最大年龄（默认 24 小时）。"""
+    from datetime import datetime, timezone, timedelta
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=max_age_hours)
+    caches = db.query(AnalysisCacheORM).filter(
+        AnalysisCacheORM.updated_at >= cutoff
+    ).order_by(AnalysisCacheORM.updated_at.desc()).all()
     return [
         {
             "symbol": c.symbol,
             "name": c.name,
             "result": c.result,
-            "updated_at": c.created_at.isoformat(),
+            "updated_at": c.updated_at.isoformat(),
+            "age_hours": round((datetime.now(timezone.utc).replace(tzinfo=None) - c.updated_at).total_seconds() / 3600, 1),
         }
         for c in caches
     ]
@@ -154,9 +174,27 @@ def get_cached_analysis(symbol: str, db: Session = Depends(get_db)):
     cache = db.query(AnalysisCacheORM).filter(AnalysisCacheORM.symbol == symbol).first()
     if not cache:
         return {"symbol": symbol, "result": None}
+    from datetime import datetime, timezone
+    age_hours = (datetime.now(timezone.utc).replace(tzinfo=None) - cache.updated_at).total_seconds() / 3600
     return {
         "symbol": symbol,
         "name": cache.name,
         "result": cache.result,
-        "updated_at": cache.created_at.isoformat(),
+        "updated_at": cache.updated_at.isoformat(),
+        "age_hours": round(age_hours, 1),
+        "is_stale": age_hours > 6,  # 超过 6 小时视为过期，前端可提示用户重新分析
     }
+
+
+@router.delete("/cache")
+def clear_analysis_cache(
+    db: Session = Depends(get_db),
+    symbol: str | None = None,
+):
+    """清除分析缓存：传 symbol 清除单只，不传清除全部"""
+    if symbol:
+        db.query(AnalysisCacheORM).filter(AnalysisCacheORM.symbol == symbol).delete()
+    else:
+        db.query(AnalysisCacheORM).delete()
+    db.commit()
+    return {"ok": True}

@@ -244,6 +244,7 @@
 </template>
 
 <script setup>
+defineOptions({ name: 'Market' })
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'

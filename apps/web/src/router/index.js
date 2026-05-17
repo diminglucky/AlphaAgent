@@ -13,6 +13,11 @@ const routes = [
     meta: { title: '行情' },
   },
   {
+    path: '/scanner',
+    component: () => import('../views/Scanner.vue'),
+    meta: { title: '潜力扫描' },
+  },
+  {
     path: '/agent',
     component: () => import('../views/Agent.vue'),
     meta: { title: 'Agent 分析' },

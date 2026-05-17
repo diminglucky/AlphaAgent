@@ -60,9 +60,12 @@ def _row_to_quote(row, symbol: str, now: str) -> dict:
     prev_close = float(row.get("昨收") or price)
     change = round(price - prev_close, 2)
     change_pct = round(change / prev_close * 100, 2) if prev_close else 0
+    code = symbol.split(".")[0]
+    name = str(row.get("名称", ""))
+    limit_pct = _limit_pct(code, name)
     return {
         "symbol": symbol,
-        "name": str(row.get("名称", "")),
+        "name": name,
         "price": round(price, 2),
         "change": change,
         "change_pct": change_pct,
@@ -72,8 +75,9 @@ def _row_to_quote(row, symbol: str, now: str) -> dict:
         "low": float(row.get("最低") or 0),
         "open": float(row.get("今开") or 0),
         "prev_close": round(prev_close, 2),
-        "limit_up": round(prev_close * 1.1, 2),
-        "limit_down": round(prev_close * 0.9, 2),
+        "limit_up": round(prev_close * (1 + limit_pct), 2),
+        "limit_down": round(prev_close * (1 - limit_pct), 2),
+        "limit_pct": limit_pct,
         "amplitude": 0,
         "turnover_rate": float(row.get("换手率") or 0) if "换手率" in row.index else 0,
         "pe_ratio": 0,
@@ -83,14 +87,54 @@ def _row_to_quote(row, symbol: str, now: str) -> dict:
     }
 
 
+def _limit_pct(code: str, name: str) -> float:
+    """返回当日涨跌停幅度（小数形式）。
+    - ST / *ST: 5%
+    - 创业板（30）/ 科创板（688）/ 北交所（83/87/88/92）: 20% （北交所 30%）
+    - 其他主板: 10%
+    """
+    if not code:
+        return 0.10
+    if name and ("ST" in name or "*ST" in name):
+        return 0.05
+    # 北交所 30%
+    if code.startswith(("83", "87", "88", "92")):
+        return 0.30
+    # 创业板 / 科创板 20%
+    if code.startswith(("30", "688")):
+        return 0.20
+    return 0.10
+
+
 # ---------------------------------------------------------------------------
 # 精准行情刷新（自选股专用，3秒）
 # ---------------------------------------------------------------------------
 
-def register_symbols(symbols: list[str]):
-    """注册需要精准跟踪的 symbols（自选股 + 持仓）"""
+# 精准跟踪集合上限：超过则按 LRU 丢弃临时注册的 symbol，
+# 避免新浪 URL 过长（800 字符以上会被拒绝）
+_PRECISE_MAX_SIZE = 80
+
+
+def register_symbols(symbols: list[str], persistent: bool = True):
+    """注册需要精准跟踪的 symbols。
+
+    persistent=True：自选股 + 持仓，永久保留
+    persistent=False：临时查询（如扫描器单次拉取），不进入精准集合
+    """
+    if not persistent:
+        return  # 不入精准集合，调用方应自己 _fetch_precise 单次拉取
     with _precise_lock:
         _precise_symbols.update(symbols)
+        # 控制大小，避免新浪 URL 过长
+        if len(_precise_symbols) > _PRECISE_MAX_SIZE:
+            # 简单 LRU：保留 _precise_cache 里有数据的（已被使用过的）
+            keep = set(_precise_cache.keys()) & _precise_symbols
+            for s in symbols:
+                keep.add(s)  # 新加入的优先保留
+            if len(keep) > _PRECISE_MAX_SIZE:
+                keep = set(list(keep)[:_PRECISE_MAX_SIZE])
+            _precise_symbols.clear()
+            _precise_symbols.update(keep)
 
 
 def _fetch_precise(symbols: list[str]) -> dict[str, dict]:
@@ -151,6 +195,7 @@ def _fetch_precise(symbols: list[str]) -> dict[str, dict]:
                 turnover = float(fields[9] or 0)
                 change = round(price - prev_close, 2)
                 change_pct = round(change / prev_close * 100, 2) if prev_close else 0
+                limit_pct = _limit_pct(code, name)
 
                 result[symbol] = {
                     "symbol": symbol,
@@ -164,8 +209,9 @@ def _fetch_precise(symbols: list[str]) -> dict[str, dict]:
                     "low": round(low, 2),
                     "open": round(open_, 2),
                     "prev_close": round(prev_close, 2),
-                    "limit_up": round(prev_close * 1.1, 2),
-                    "limit_down": round(prev_close * 0.9, 2),
+                    "limit_up": round(prev_close * (1 + limit_pct), 2),
+                    "limit_down": round(prev_close * (1 - limit_pct), 2),
+                    "limit_pct": limit_pct,
                     "amplitude": round((high - low) / prev_close * 100, 2) if prev_close else 0,
                     "turnover_rate": 0,
                     "pe_ratio": 0,
@@ -224,9 +270,11 @@ def _fetch_market_all() -> dict[str, dict]:
         change = round(price - prev_close, 2)
         change_pct = round(change / prev_close * 100, 2) if prev_close else 0
         exchange = "SH" if code.startswith(("6", "9")) else "SZ"
+        name = str(row.get("名称", ""))
+        limit_pct = _limit_pct(code, name)
         result[code] = {
             "symbol": f"{code}.{exchange}",
-            "name": str(row.get("名称", "")),
+            "name": name,
             "price": round(price, 2),
             "change": change,
             "change_pct": change_pct,
@@ -236,8 +284,9 @@ def _fetch_market_all() -> dict[str, dict]:
             "low": float(row.get("最低") or 0),
             "open": float(row.get("今开") or 0),
             "prev_close": round(prev_close, 2),
-            "limit_up": round(prev_close * 1.1, 2),
-            "limit_down": round(prev_close * 0.9, 2),
+            "limit_up": round(prev_close * (1 + limit_pct), 2),
+            "limit_down": round(prev_close * (1 - limit_pct), 2),
+            "limit_pct": limit_pct,
             "amplitude": 0,
             "turnover_rate": float(row.get("换手率") or 0) if "换手率" in df.columns else 0,
             "pe_ratio": 0,
@@ -331,8 +380,9 @@ def get_realtime_quotes(symbols: list[str]) -> list[dict]:
 
 
 def get_single_quote(symbol: str) -> Optional[dict]:
-    """获取单股行情"""
-    register_symbols([symbol])
+    """获取单股行情。临时查询不会进入精准跟踪集合。"""
+    # 临时查询：不进精准集合，避免大量扫描后 URL 过长
+    register_symbols([symbol], persistent=False)
 
     with _precise_lock:
         q = _precise_cache.get(symbol)
@@ -415,6 +465,12 @@ def get_kline(symbol: str, period: str = "daily", count: int = 120) -> list[dict
             for _, row in df.tail(count).iterrows():
                 close = float(row.get("close") or 0)
                 open_ = float(row.get("open") or 0)
+                # 腾讯 stock_zh_a_hist_tx 的 amount 实为成交量（手），1 手 = 100 股
+                # 单位换算：手 → 股
+                tx_amount_lots = float(row.get("amount") or 0)
+                volume_shares = int(tx_amount_lots * 100)  # 股数
+                # 估算成交额 = 收盘价 × 股数
+                turnover_yuan = round(close * volume_shares, 2) if close else 0
                 change_pct = round((close - prev_close) / prev_close * 100, 2) if prev_close and prev_close > 0 else 0
                 prev_close = close
                 bars.append({
@@ -423,8 +479,8 @@ def get_kline(symbol: str, period: str = "daily", count: int = 120) -> list[dict
                     "high": round(float(row.get("high") or 0), 2),
                     "low": round(float(row.get("low") or 0), 2),
                     "close": round(close, 2),
-                    "volume": int(float(row.get("amount") or 0)),
-                    "amount": float(row.get("amount") or 0),
+                    "volume": volume_shares,
+                    "amount": turnover_yuan,
                     "change_pct": change_pct,
                     "turnover_rate": 0,
                     "is_today": False,
@@ -492,10 +548,12 @@ def _resample_kline(df, freq: str):
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"])
         df = df.set_index("date")
-        resampled = df.resample(freq).agg({
-            "open": "first", "high": "max",
-            "low": "min", "close": "last", "amount": "sum",
-        }).dropna().reset_index()
+        agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
+        if "amount" in df.columns:
+            agg["amount"] = "sum"
+        if "volume" in df.columns:
+            agg["volume"] = "sum"
+        resampled = df.resample(freq).agg(agg).dropna().reset_index()
         resampled["date"] = resampled["date"].dt.strftime("%Y-%m-%d")
         return resampled
     except Exception as e:

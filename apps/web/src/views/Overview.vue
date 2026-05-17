@@ -313,7 +313,8 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+defineOptions({ name: 'Overview' })
+import { ref, computed, onMounted, onUnmounted, onActivated, onDeactivated, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { Refresh, Loading, Search } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
@@ -558,13 +559,25 @@ function fmtAmt(v) {
   return v.toFixed(0)
 }
 
-// 定时刷新（30秒）
+// 定时刷新（30秒）— keep-alive 友好：deactivate 暂停 / activate 恢复
 let timer = null
+function _startTimer() {
+  if (timer) return
+  timer = setInterval(loadAll, 30000)
+}
+function _stopTimer() {
+  if (timer) { clearInterval(timer); timer = null }
+}
 onMounted(() => {
   loadAll()
-  timer = setInterval(loadAll, 30000)
+  _startTimer()
 })
-onUnmounted(() => clearInterval(timer))
+onActivated(() => {
+  loadAll()
+  _startTimer()
+})
+onDeactivated(_stopTimer)
+onUnmounted(_stopTimer)
 </script>
 
 <style scoped>

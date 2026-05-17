@@ -11,6 +11,10 @@ backups/
 
 # 包含 API Key 的运行时配置（敏感信息）
 data/llm_runtime.json
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
 
 # 前端 node_modules 和构建产物
 apps/web/node_modules/

@@ -142,6 +142,7 @@
 </template>
 
 <script setup>
+defineOptions({ name: 'Positions' })
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api.js'

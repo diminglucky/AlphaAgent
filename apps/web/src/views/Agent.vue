@@ -434,7 +434,7 @@
       </div>
 
       <!-- ⑪ 技术指标折叠 -->
-      <el-collapse v-if="currentAnalysis.indicators" class="indicators-collapse">
+      <el-collapse v-if="hasAnyIndicator(currentAnalysis.indicators)" class="indicators-collapse">
         <el-collapse-item name="indicators">
           <template #title>
             <span class="collapse-title">📊 技术指标详情</span>
@@ -442,25 +442,40 @@
           <div class="indicators-panel">
             <!-- 均线 -->
             <div class="ind-group" v-if="hasAnyKey(currentAnalysis.indicators, ['ma5','ma10','ma20','ma60'])">
-              <div class="ind-group-title">均线</div>
+              <div class="ind-group-title">均线系统</div>
               <div class="ind-tags">
-                <span v-for="key in ['ma5','ma10','ma20','ma60']" :key="key">
-                  <el-tag v-if="currentAnalysis.indicators[key] != null" size="small" class="ind-tag" effect="dark" type="info">
-                    {{ key.toUpperCase() }} {{ numFmt(currentAnalysis.indicators[key]) }}
-                  </el-tag>
-                </span>
-              </div>
-            </div>
-            <!-- RSI -->
-            <div class="ind-group" v-if="currentAnalysis.indicators.rsi14 != null">
-              <div class="ind-group-title">RSI</div>
-              <div class="ind-tags">
-                <el-tag size="small" class="ind-tag" effect="dark"
-                  :type="rsiTagType(currentAnalysis.indicators.rsi14)">
-                  RSI14 {{ numFmt(currentAnalysis.indicators.rsi14) }}
+                <el-tag v-for="key in ['ma5','ma10','ma20','ma60']" :key="key"
+                  v-show="currentAnalysis.indicators[key] != null"
+                  size="small" class="ind-tag" effect="dark" type="info">
+                  {{ key.toUpperCase() }} {{ numFmt(currentAnalysis.indicators[key]) }}
                 </el-tag>
               </div>
             </div>
+
+            <!-- EMA -->
+            <div class="ind-group" v-if="hasAnyKey(currentAnalysis.indicators, ['ema12','ema26'])">
+              <div class="ind-group-title">EMA</div>
+              <div class="ind-tags">
+                <el-tag v-if="currentAnalysis.indicators.ema12 != null" size="small" class="ind-tag" effect="dark" type="info">
+                  EMA12 {{ numFmt(currentAnalysis.indicators.ema12) }}
+                </el-tag>
+                <el-tag v-if="currentAnalysis.indicators.ema26 != null" size="small" class="ind-tag" effect="dark" type="info">
+                  EMA26 {{ numFmt(currentAnalysis.indicators.ema26) }}
+                </el-tag>
+              </div>
+            </div>
+
+            <!-- RSI -->
+            <div class="ind-group" v-if="getIndicator(currentAnalysis.indicators, ['rsi14', 'rsi_14d']) != null">
+              <div class="ind-group-title">RSI</div>
+              <div class="ind-tags">
+                <el-tag size="small" class="ind-tag" effect="dark"
+                  :type="rsiTagType(getIndicator(currentAnalysis.indicators, ['rsi14','rsi_14d']))">
+                  RSI14 {{ numFmt(getIndicator(currentAnalysis.indicators, ['rsi14','rsi_14d'])) }}
+                </el-tag>
+              </div>
+            </div>
+
             <!-- MACD -->
             <div class="ind-group" v-if="hasAnyKey(currentAnalysis.indicators, ['macd_dif','macd_dea','macd_hist'])">
               <div class="ind-group-title">MACD</div>
@@ -479,6 +494,7 @@
                 </el-tag>
               </div>
             </div>
+
             <!-- KDJ -->
             <div class="ind-group" v-if="hasAnyKey(currentAnalysis.indicators, ['kdj_k','kdj_d','kdj_j'])">
               <div class="ind-group-title">KDJ</div>
@@ -495,61 +511,81 @@
                 </el-tag>
               </div>
             </div>
+
             <!-- 布林带 -->
-            <div class="ind-group" v-if="hasAnyKey(currentAnalysis.indicators, ['boll_upper','boll_mid','boll_lower'])">
+            <div class="ind-group" v-if="hasAnyKey(currentAnalysis.indicators, ['bb_upper','bb_mid','bb_lower'])">
               <div class="ind-group-title">布林带</div>
               <div class="ind-tags">
-                <el-tag v-if="currentAnalysis.indicators.boll_upper != null" size="small" class="ind-tag" effect="dark" type="danger">
-                  上轨 {{ numFmt(currentAnalysis.indicators.boll_upper) }}
+                <el-tag v-if="currentAnalysis.indicators.bb_upper != null" size="small" class="ind-tag" effect="dark" type="danger">
+                  上轨 {{ numFmt(currentAnalysis.indicators.bb_upper) }}
                 </el-tag>
-                <el-tag v-if="currentAnalysis.indicators.boll_mid != null" size="small" class="ind-tag" effect="dark" type="info">
-                  中轨 {{ numFmt(currentAnalysis.indicators.boll_mid) }}
+                <el-tag v-if="currentAnalysis.indicators.bb_mid != null" size="small" class="ind-tag" effect="dark" type="info">
+                  中轨 {{ numFmt(currentAnalysis.indicators.bb_mid) }}
                 </el-tag>
-                <el-tag v-if="currentAnalysis.indicators.boll_lower != null" size="small" class="ind-tag" effect="dark" type="success">
-                  下轨 {{ numFmt(currentAnalysis.indicators.boll_lower) }}
+                <el-tag v-if="currentAnalysis.indicators.bb_lower != null" size="small" class="ind-tag" effect="dark" type="success">
+                  下轨 {{ numFmt(currentAnalysis.indicators.bb_lower) }}
                 </el-tag>
               </div>
             </div>
+
             <!-- 涨跌幅 -->
-            <div class="ind-group" v-if="hasAnyKey(currentAnalysis.indicators, ['change_1d','change_5d','change_10d','change_20d','change_60d'])">
+            <div class="ind-group" v-if="hasAnyKey(currentAnalysis.indicators, ['ret_1d','ret_5d','ret_10d','ret_20d','ret_60d'])">
               <div class="ind-group-title">各周期涨跌幅</div>
               <div class="ind-tags">
-                <span v-for="[key, label] in [['change_1d','1日'],['change_5d','5日'],['change_10d','10日'],['change_20d','20日'],['change_60d','60日']]" :key="key">
-                  <el-tag v-if="currentAnalysis.indicators[key] != null" size="small" class="ind-tag" effect="dark"
-                    :type="signTagType(currentAnalysis.indicators[key])">
-                    {{ label }} {{ pctFmt(currentAnalysis.indicators[key]) }}
-                  </el-tag>
-                </span>
+                <el-tag v-for="[key, label] in [['ret_1d','1日'],['ret_5d','5日'],['ret_10d','10日'],['ret_20d','20日'],['ret_60d','60日']]" :key="key"
+                  v-show="currentAnalysis.indicators[key] != null"
+                  size="small" class="ind-tag" effect="dark"
+                  :type="signTagType(currentAnalysis.indicators[key])">
+                  {{ label }} {{ currentAnalysis.indicators[key] >= 0 ? '+' : '' }}{{ numFmt(currentAnalysis.indicators[key]) }}%
+                </el-tag>
               </div>
             </div>
-            <!-- 区间位置 -->
-            <div class="ind-group" v-if="hasAnyKey(currentAnalysis.indicators, ['range_20d_high','range_20d_low','range_60d_high','range_60d_low'])">
-              <div class="ind-group-title">区间位置</div>
+
+            <!-- 波动率 & 量比 -->
+            <div class="ind-group" v-if="hasAnyKey(currentAnalysis.indicators, ['vol_20d','vol_ratio','volume_ratio_5d','volatility_20d'])">
+              <div class="ind-group-title">波动率 / 量能</div>
               <div class="ind-tags">
-                <template v-if="currentAnalysis.indicators.range_20d_high != null">
-                  <el-tag size="small" class="ind-tag" effect="dark" type="info">
-                    20日高 {{ numFmt(currentAnalysis.indicators.range_20d_high) }}
-                  </el-tag>
-                  <el-tag size="small" class="ind-tag" effect="dark" type="info">
-                    20日低 {{ numFmt(currentAnalysis.indicators.range_20d_low) }}
-                  </el-tag>
-                  <el-tag v-if="currentAnalysis.indicators.position_20d != null" size="small" class="ind-tag" effect="dark"
-                    :type="posTagType(currentAnalysis.indicators.position_20d)">
-                    20日位置 {{ pctFmt(currentAnalysis.indicators.position_20d) }}
-                  </el-tag>
-                </template>
-                <template v-if="currentAnalysis.indicators.range_60d_high != null">
-                  <el-tag size="small" class="ind-tag" effect="dark" type="info">
-                    60日高 {{ numFmt(currentAnalysis.indicators.range_60d_high) }}
-                  </el-tag>
-                  <el-tag size="small" class="ind-tag" effect="dark" type="info">
-                    60日低 {{ numFmt(currentAnalysis.indicators.range_60d_low) }}
-                  </el-tag>
-                  <el-tag v-if="currentAnalysis.indicators.position_60d != null" size="small" class="ind-tag" effect="dark"
-                    :type="posTagType(currentAnalysis.indicators.position_60d)">
-                    60日位置 {{ pctFmt(currentAnalysis.indicators.position_60d) }}
-                  </el-tag>
-                </template>
+                <el-tag v-if="currentAnalysis.indicators.vol_20d != null" size="small" class="ind-tag" effect="dark" type="info">
+                  20日波动率 {{ numFmt(currentAnalysis.indicators.vol_20d) }}%
+                </el-tag>
+                <el-tag v-else-if="currentAnalysis.indicators.volatility_20d != null" size="small" class="ind-tag" effect="dark" type="info">
+                  20日波动率 {{ numFmt(currentAnalysis.indicators.volatility_20d * 100) }}%
+                </el-tag>
+                <el-tag v-if="currentAnalysis.indicators.vol_ratio != null" size="small" class="ind-tag" effect="dark"
+                  :type="currentAnalysis.indicators.vol_ratio > 1.5 ? 'danger' : currentAnalysis.indicators.vol_ratio < 0.7 ? 'success' : 'info'">
+                  量比 {{ numFmt(currentAnalysis.indicators.vol_ratio) }}×
+                </el-tag>
+                <el-tag v-else-if="currentAnalysis.indicators.volume_ratio_5d != null" size="small" class="ind-tag" effect="dark"
+                  :type="currentAnalysis.indicators.volume_ratio_5d > 1.5 ? 'danger' : 'info'">
+                  量比 {{ numFmt(currentAnalysis.indicators.volume_ratio_5d) }}×
+                </el-tag>
+              </div>
+            </div>
+
+            <!-- 区间位置 -->
+            <div class="ind-group" v-if="hasAnyKey(currentAnalysis.indicators, ['high_20','low_20','high_60','low_60','pos_in_20d','pos_in_60d'])">
+              <div class="ind-group-title">价格区间位置</div>
+              <div class="ind-tags">
+                <el-tag v-if="currentAnalysis.indicators.high_20 != null" size="small" class="ind-tag" effect="dark" type="danger">
+                  20日高 {{ numFmt(currentAnalysis.indicators.high_20) }}
+                </el-tag>
+                <el-tag v-if="currentAnalysis.indicators.low_20 != null" size="small" class="ind-tag" effect="dark" type="success">
+                  20日低 {{ numFmt(currentAnalysis.indicators.low_20) }}
+                </el-tag>
+                <el-tag v-if="currentAnalysis.indicators.pos_in_20d != null" size="small" class="ind-tag" effect="dark"
+                  :type="currentAnalysis.indicators.pos_in_20d > 70 ? 'danger' : currentAnalysis.indicators.pos_in_20d < 30 ? 'success' : 'warning'">
+                  20日位置 {{ numFmt(currentAnalysis.indicators.pos_in_20d) }}%
+                </el-tag>
+                <el-tag v-if="currentAnalysis.indicators.high_60 != null" size="small" class="ind-tag" effect="dark" type="danger">
+                  60日高 {{ numFmt(currentAnalysis.indicators.high_60) }}
+                </el-tag>
+                <el-tag v-if="currentAnalysis.indicators.low_60 != null" size="small" class="ind-tag" effect="dark" type="success">
+                  60日低 {{ numFmt(currentAnalysis.indicators.low_60) }}
+                </el-tag>
+                <el-tag v-if="currentAnalysis.indicators.pos_in_60d != null" size="small" class="ind-tag" effect="dark"
+                  :type="currentAnalysis.indicators.pos_in_60d > 70 ? 'danger' : currentAnalysis.indicators.pos_in_60d < 30 ? 'success' : 'warning'">
+                  60日位置 {{ numFmt(currentAnalysis.indicators.pos_in_60d) }}%
+                </el-tag>
               </div>
             </div>
           </div>
@@ -708,6 +744,7 @@
 
 
 <script setup>
+defineOptions({ name: 'Agent' })
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
@@ -852,13 +889,6 @@ async function analyzeCurrentSymbol() {
   currentAnalysis.value = null
   scanResults.value = []
 
-  const progressMsg = ElMessage({
-    message: 'Agent 正在分析（拉取行情、计算指标、识别形态、抓取新闻、综合推理）...',
-    type: 'info',
-    duration: 0,
-    showClose: false,
-  })
-
   try {
     const result = await api.analyze(currentSymbol.value)
     currentAnalysis.value = result
@@ -871,7 +901,6 @@ async function analyzeCurrentSymbol() {
     }
   } finally {
     analyzing.value = false
-    progressMsg?.close?.()
   }
 }
 
@@ -1008,6 +1037,19 @@ function pctFmt(v) {
 
 function hasAnyKey(obj, keys) {
   return obj && keys.some(k => obj[k] != null)
+}
+
+function hasAnyIndicator(ind) {
+  if (!ind || typeof ind !== 'object') return false
+  return Object.values(ind).some(v => v != null)
+}
+
+function getIndicator(ind, keys) {
+  if (!ind) return null
+  for (const k of keys) {
+    if (ind[k] != null) return ind[k]
+  }
+  return null
 }
 
 // ─── 初始化 ──────────────────────────────────────────

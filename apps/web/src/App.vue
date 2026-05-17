@@ -20,6 +20,9 @@
         <el-menu-item index="/market">
           <el-icon><TrendCharts /></el-icon> 行情
         </el-menu-item>
+        <el-menu-item index="/scanner">
+          <el-icon><Aim /></el-icon> 潜力扫描
+        </el-menu-item>
         <el-menu-item index="/agent">
           <el-icon><MagicStick /></el-icon> Agent分析
         </el-menu-item>
@@ -48,7 +51,11 @@
     </el-header>
 
     <el-main class="app-main">
-      <router-view />
+      <router-view v-slot="{ Component }">
+        <keep-alive :include="['Overview', 'Market', 'Scanner', 'Agent', 'Alerts', 'Positions', 'Settings']">
+          <component :is="Component" />
+        </keep-alive>
+      </router-view>
     </el-main>
   </el-container>
 </template>
@@ -56,7 +63,7 @@
 <script setup>
 import { computed, ref, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
-import { TrendCharts, MagicStick, Bell, Wallet, Setting, DataAnalysis } from '@element-plus/icons-vue'
+import { TrendCharts, MagicStick, Bell, Wallet, Setting, DataAnalysis, Aim } from '@element-plus/icons-vue'
 import { ElNotification } from 'element-plus'
 import { openStream } from './api.js'
 import { quotesMap, wsConnected, unreadAlerts, lastQuoteTime, initStreams } from './store.js'

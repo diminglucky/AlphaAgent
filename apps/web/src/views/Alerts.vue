@@ -128,6 +128,7 @@
 </template>
 
 <script setup>
+defineOptions({ name: 'Alerts' })
 import { ref, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Delete, Check, Close } from '@element-plus/icons-vue'

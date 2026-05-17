@@ -13,13 +13,15 @@ export const unreadAlerts = ref(0)
 export const recentAlerts = ref([])
 
 let _started = false
+let _quotesUnsub = null
+let _alertsUnsub = null
 
 export function initStreams() {
   if (_started) return
   _started = true
 
   // 行情流
-  openStream('quotes', (msg) => {
+  _quotesUnsub = openStream('quotes', (msg) => {
     if (msg.type !== 'quotes') return
     wsConnected.value = true
     const now = new Date()
@@ -30,14 +32,14 @@ export function initStreams() {
   })
 
   // 提醒流
-  openStream('alerts', (msg) => {
+  _alertsUnsub = openStream('alerts', (msg) => {
     if (msg.type !== 'alerts') return
     for (const a of msg.data || []) {
       unreadAlerts.value++
       recentAlerts.value.unshift(a)
       if (recentAlerts.value.length > 50) recentAlerts.value.pop()
 
-      const isStop = a.reason?.includes('止损') || (a.pnl_pct != null && a.pnl_pct < -5)
+      const isStop = a.reason?.includes('止损') || a.kind === 'stop_loss' || (a.pnl_pct != null && a.pnl_pct < -5)
       ElNotification({
         title: isStop ? '⚠️ 止损提醒' : '📢 价格提醒',
         message: a.reason || `${a.name || a.symbol} 触发提醒`,

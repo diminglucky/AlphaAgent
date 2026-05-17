@@ -55,6 +55,16 @@ export const api = {
   llmConfigSet: (data) => http.post('/llm/config', data),
   llmConfigReset: () => http.delete('/llm/config'),
   llmTest: (level = 'quick') => http.post('/llm/test', null, { params: { level }, timeout: 120000 }),
+
+  // 大盘扫描器（潜力股）
+  scannerScan: (data = {}) => http.post('/scanner/scan', {
+    top_n: 30, min_score: 50, candidate_pool: 120, use_cache: true,
+    required_strategies: null,
+    ...data,
+  }, { timeout: 600000 }),
+  scannerStrategies: () => http.get('/scanner/strategies'),
+  scannerStatus: () => http.get('/scanner/status'),
+  scannerClearCache: () => http.delete('/scanner/cache'),
 }
 
 // WebSocket 工具

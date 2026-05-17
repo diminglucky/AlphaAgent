@@ -52,6 +52,8 @@ class PositionORM(Base):
     avg_cost: Mapped[float] = mapped_column(Float, nullable=False)
     stop_loss_pct: Mapped[float] = mapped_column(Float, nullable=False, default=0.08)
     take_profit_pct: Mapped[float] = mapped_column(Float, nullable=False, default=0.20)
+    last_alert_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_alert_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_now)
 
@@ -66,3 +68,4 @@ class AnalysisCacheORM(Base):
     name: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     result: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_now)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import httpx
@@ -10,24 +11,38 @@ from apps.api.app.core.config import get_settings
 
 log = logging.getLogger("quant.feishu")
 
+# 飞书发送专用线程池：fire-and-forget，避免阻塞 quote_loop
+_feishu_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="feishu")
+
+
+def _do_send(payload: dict, title: str, webhook_url: str) -> bool:
+    try:
+        resp = httpx.post(webhook_url, json=payload, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") == 0 or data.get("StatusCode") == 0:
+            log.info("飞书消息发送成功: %s", title)
+            return True
+        log.warning("飞书消息发送失败: %s", data)
+        return False
+    except Exception as e:
+        log.warning("飞书发送异常: %s", e)
+        return False
+
 
 def send_feishu(title: str, content: str, color: str = "blue") -> bool:
     """
-    发送飞书卡片消息。
-    color: blue(信息) | green(买入) | red(卖出/止损) | orange(警告)
+    发送飞书卡片消息（异步 fire-and-forget）。
+    返回值仅表示「已提交到发送队列」，实际网络请求在后台线程执行。
     """
     settings = get_settings()
     if not settings.feishu_webhook_url:
         log.debug("飞书 webhook 未配置，跳过发送")
         return False
 
-    # 颜色映射
     color_map = {
-        "blue": "blue",
-        "green": "green",
-        "red": "red",
-        "orange": "orange",
-        "yellow": "yellow",
+        "blue": "blue", "green": "green", "red": "red",
+        "orange": "orange", "yellow": "yellow",
     }
     header_color = color_map.get(color, "blue")
 
@@ -40,40 +55,21 @@ def send_feishu(title: str, content: str, color: str = "blue") -> bool:
                 "template": header_color,
             },
             "elements": [
-                {
-                    "tag": "div",
-                    "text": {"tag": "lark_md", "content": content},
-                },
+                {"tag": "div", "text": {"tag": "lark_md", "content": content}},
                 {
                     "tag": "note",
-                    "elements": [
-                        {
-                            "tag": "plain_text",
-                            "content": f"A股智能助手 · {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                        }
-                    ],
+                    "elements": [{
+                        "tag": "plain_text",
+                        "content": f"A股智能助手 · {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    }],
                 },
             ],
         },
     }
 
-    try:
-        resp = httpx.post(
-            settings.feishu_webhook_url,
-            json=payload,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") == 0 or data.get("StatusCode") == 0:
-            log.info("飞书消息发送成功: %s", title)
-            return True
-        else:
-            log.warning("飞书消息发送失败: %s", data)
-            return False
-    except Exception as e:
-        log.warning("飞书发送异常: %s", e)
-        return False
+    # fire-and-forget 提交到后台线程
+    _feishu_pool.submit(_do_send, payload, title, settings.feishu_webhook_url)
+    return True
 
 
 def send_buy_alert(symbol: str, name: str, price: float, buy_low: float, buy_high: float,

@@ -4,8 +4,8 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from apps.api.app.db.session import get_db
-from apps.api.app.db.models import PositionORM
-from apps.api.app.services import market_service
+from apps.api.app.db.models import AlertORM, PositionORM
+from apps.api.app.services import alert_service, market_service
 
 router = APIRouter(prefix="/positions", tags=["positions"])
 
@@ -61,12 +61,13 @@ def list_positions(db: Session = Depends(get_db)):
 @router.post("/")
 def upsert_position(req: UpsertPositionReq, db: Session = Depends(get_db)):
     """新增或更新持仓"""
-    pos = db.query(PositionORM).filter(PositionORM.symbol == req.symbol).first()
+    symbol = _normalize_symbol(req.symbol)
+    pos = db.query(PositionORM).filter(PositionORM.symbol == symbol).first()
 
     name = req.name
     if not name:
-        q = market_service.get_single_quote(req.symbol)
-        name = q.get("name", req.symbol) if q else req.symbol
+        q = market_service.get_single_quote(symbol)
+        name = q.get("name", symbol) if q else symbol
 
     if pos:
         pos.quantity = req.quantity
@@ -74,9 +75,12 @@ def upsert_position(req: UpsertPositionReq, db: Session = Depends(get_db)):
         pos.name = name
         pos.stop_loss_pct = req.stop_loss_pct
         pos.take_profit_pct = req.take_profit_pct
+        # 调整成本/止损线后清理上次告警标记
+        pos.last_alert_at = None
+        pos.last_alert_kind = None
     else:
         pos = PositionORM(
-            symbol=req.symbol,
+            symbol=symbol,
             name=name,
             quantity=req.quantity,
             avg_cost=req.avg_cost,
@@ -87,14 +91,33 @@ def upsert_position(req: UpsertPositionReq, db: Session = Depends(get_db)):
 
     db.commit()
     db.refresh(pos)
+    # 调整持仓后清理之前的告警状态，让新成本基线立即生效
+    alert_service.reset_position_alert_state(symbol)
     return {"id": pos.id, "symbol": pos.symbol, "name": pos.name}
 
 
 @router.delete("/{symbol}")
 def delete_position(symbol: str, db: Session = Depends(get_db)):
+    symbol = _normalize_symbol(symbol)
     pos = db.query(PositionORM).filter(PositionORM.symbol == symbol).first()
     if not pos:
         raise HTTPException(status_code=404, detail="持仓不存在")
     db.delete(pos)
+    # 清理对应的 agent_buy / agent_sell / stop_loss 等关联提醒
+    db.query(AlertORM).filter(
+        AlertORM.symbol == symbol,
+        AlertORM.alert_type.in_(("agent_buy", "agent_sell", "stop_loss", "take_profit")),
+    ).delete(synchronize_session=False)
     db.commit()
+    # 清理告警去重状态
+    alert_service.reset_position_alert_state(symbol)
     return {"ok": True}
+
+
+def _normalize_symbol(symbol: str) -> str:
+    """统一格式：600519.SH（数字部分.交易所大写）"""
+    s = (symbol or "").strip()
+    if "." in s:
+        code, suffix = s.split(".", 1)
+        return f"{code.lstrip('0123456789').zfill(6) if not code.isdigit() else code}.{suffix.upper()}"
+    return s

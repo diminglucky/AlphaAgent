@@ -230,6 +230,7 @@
 </template>
 
 <script setup>
+defineOptions({ name: 'Settings' })
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'

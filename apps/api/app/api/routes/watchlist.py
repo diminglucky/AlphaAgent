@@ -10,6 +10,15 @@ from apps.api.app.services import market_service
 router = APIRouter(prefix="/watchlist", tags=["watchlist"])
 
 
+def _normalize_symbol(symbol: str) -> str:
+    """统一格式：CODE.EXCHANGE（数字代码 + 大写后缀）"""
+    s = (symbol or "").strip()
+    if "." in s:
+        code, suffix = s.split(".", 1)
+        return f"{code}.{suffix.upper()}"
+    return s.upper()
+
+
 class AddSymbolReq(BaseModel):
     symbol: str
     name: str = ""
@@ -33,18 +42,19 @@ def list_watchlist(db: Session = Depends(get_db)):
 
 @router.post("/")
 def add_symbol(req: AddSymbolReq, db: Session = Depends(get_db)):
-    existing = db.query(WatchlistORM).filter(WatchlistORM.symbol == req.symbol).first()
+    symbol = _normalize_symbol(req.symbol)
+    existing = db.query(WatchlistORM).filter(WatchlistORM.symbol == symbol).first()
     if existing:
-        raise HTTPException(status_code=400, detail=f"{req.symbol} 已在自选股中")
+        raise HTTPException(status_code=400, detail=f"{symbol} 已在自选股中")
 
     # 自动获取股票名称
     name = req.name
     if not name:
-        q = market_service.get_single_quote(req.symbol)
-        name = q.get("name", req.symbol) if q else req.symbol
+        q = market_service.get_single_quote(symbol)
+        name = q.get("name", symbol) if q else symbol
 
     max_order = db.query(WatchlistORM).count()
-    item = WatchlistORM(symbol=req.symbol, name=name, note=req.note, sort_order=max_order)
+    item = WatchlistORM(symbol=symbol, name=name, note=req.note, sort_order=max_order)
     db.add(item)
     db.commit()
     db.refresh(item)
@@ -53,6 +63,7 @@ def add_symbol(req: AddSymbolReq, db: Session = Depends(get_db)):
 
 @router.delete("/{symbol}")
 def remove_symbol(symbol: str, db: Session = Depends(get_db)):
+    symbol = _normalize_symbol(symbol)
     item = db.query(WatchlistORM).filter(WatchlistORM.symbol == symbol).first()
     if not item:
         raise HTTPException(status_code=404, detail="股票不在自选股中")
