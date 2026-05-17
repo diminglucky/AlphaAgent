@@ -1,0 +1,580 @@
+# 📋 项目交接文档
+
+> 项目：A 股智能助手  
+> 仓库：`git@github.com:diminglucky/liangHuaJiaoYi.git`  
+> 当前 HEAD：`aa650f8`
+
+本文档记录项目结构、设计决策、已修复问题、运维注意事项和后续路线。新接手的开发者读完这份文档应该能在 30 分钟内上手。
+
+---
+
+## 一、项目背景
+
+### 1.1 起源
+项目最初是一个复杂的量化交易框架（19 张表 + 18 个服务），后**精简重构**为聚焦个人投资辅助的轻量平台，核心定位：
+
+> 让一个普通散户能从全市场 5500 只股票里，每天找到 5-8 只**真正可买入**的潜力股，并配套买入区间/止损/目标价/仓位计划。
+
+### 1.2 核心矛盾解决
+之前的版本存在最大的设计矛盾：**「潜力扫描」给某只股票推荐 BUY，但点进 Agent 单股分析却给 SELL/WATCH**——因为两者用的是完全独立、不通气的判断逻辑。
+
+**当前版本通过三层漏斗 + LLM 数据复用解决**：扫描器 Tier-3 阶段把 Tier-1 的技术指标和 Tier-2 的基本面数据**全部传给** SuperAnalystAgent（同 Agent 单股分析的引擎），LLM 看到与扫描器一致的数据，因此结论一致。
+
+---
+
+## 二、当前架构
+
+### 2.1 技术栈
+
+| 层 | 技术 |
+|---|---|
+| 后端 | FastAPI 0.110+ / Python 3.12 / SQLAlchemy 2.0 / SQLite (WAL) |
+| 前端 | Vue 3 / Vite / Element Plus / ECharts / vue-router (hash mode) |
+| 数据 | AKShare（新浪 + 腾讯 + 东方财富 + 同花顺多源） |
+| LLM | LLMClient 适配 OpenAI 兼容协议（DeepSeek / OpenAI / Qwen / Ollama） |
+| 推送 | 飞书 Webhook（异步 ThreadPoolExecutor fire-and-forget） |
+| 通信 | REST + WebSocket（行情 / 提醒） |
+
+### 2.2 服务模块（仅 6 个核心服务，已删 22 个 dead service）
+
+| 服务 | 文件 | 职责 |
+|---|---|---|
+| market | `market_service.py` | 行情双层缓存（精准 3s + 全市场 30s）、K 线、新闻、搜索 |
+| scanner | `scanner_service.py` | 三层漏斗扫描，6 维度技术评分 + 11 种策略 + LLM 终审 |
+| fundamental | `fundamental_service.py` | PE/PB/市值/资金流/龙虎榜/行业景气度 |
+| alert | `alert_service.py` | 价格提醒 + 持仓止损止盈，去重 + 异步飞书 |
+| feishu | `feishu_service.py` | 飞书卡片推送（线程池异步） |
+| llm | `llm_service.py` | LLM 客户端封装 |
+
+### 2.3 路由（10 个，全部生产用）
+
+```python
+# apps/api/app/api/router.py
+api_router.include_router(health.router)       # GET /health
+api_router.include_router(market.router)        # /market/*
+api_router.include_router(watchlist.router)     # /watchlist/*
+api_router.include_router(agent.router)         # /agent/*
+api_router.include_router(alerts.router)        # /alerts/*
+api_router.include_router(positions.router)     # /positions/*
+api_router.include_router(notify.router)        # /notify/*  (飞书测试)
+api_router.include_router(llm_config.router)    # /llm/*
+api_router.include_router(scanner.router)       # /scanner/*
+api_router.include_router(ws.router)            # /ws/*
+```
+
+### 2.4 数据库（4 张表，精简自原 19 张）
+
+| 表 | 用途 | 关键字段 |
+|---|---|---|
+| `watchlist` | 自选股 | symbol（唯一） / name / note / sort_order |
+| `alerts` | 提醒 | symbol / alert_type / target_price / triggered / feishu_sent |
+| `positions` | 持仓 | symbol / quantity / avg_cost / stop_loss_pct / take_profit_pct / **last_alert_at** / **last_alert_kind** |
+| `analysis_cache` | Agent 缓存 | symbol（唯一） / result(JSON) / **updated_at** |
+
+加粗字段是后期为修复 bug 加的，启动时 `_migrate_legacy_columns()` 自动 `ALTER TABLE` 兼容旧库。
+
+### 2.5 前端页面（7 个）
+
+| 页面 | 路径 | 职责 |
+|---|---|---|
+| Overview | `/overview` | 涨跌幅榜 / 自选股 / 详情抽屉 |
+| Market | `/market` | K 线 + 量能 + 新闻 + 实时推送 |
+| Scanner | `/scanner` | **核心**：三层漏斗扫描 + AI 推荐 + AI 否决展示 |
+| Agent | `/agent` | 单股深度分析（决策仪表盘） |
+| Alerts | `/alerts` | 价格提醒列表 |
+| Positions | `/positions` | 持仓管理 + 实时盈亏 |
+| Settings | `/settings` | LLM 配置（API Key / 模型 / 温度） |
+
+App.vue 用 `<keep-alive :include>` 缓存全部 7 个页面，切换不丢状态。
+
+---
+
+## 三、关键设计决策
+
+### 3.1 为什么是三层漏斗
+
+最初版本只有 Tier-1 单层（技术评分），存在三个问题：
+1. 同质策略重复加分（多头排列+MACD+站MA20 实质是同一现象）
+2. 看不到 PE / 流通市值，会把 ST 股 / 庄股 / 估值离谱的股推荐出来
+3. 与 Agent 单股分析结论矛盾
+
+引入 Tier-2 解决质量过滤，引入 Tier-3 让 LLM 做最终决策（与单股分析一致）。
+
+### 3.2 Tier-3 不重复调工具，复用 Tier-1+Tier-2 数据
+
+`SuperAnalystAgent.run` 接受 `context["preloaded_observations"]` 参数：
+
+```python
+# scanner_service.py 内
+preloaded = [
+    ToolResult(name="get_realtime_quote", output=quote_data),
+    ToolResult(name="get_daily_bars", output={"bars": bars[-30:]}),
+    ToolResult(name="get_technical_features", output=feat),  # Tier-1 已算的指标
+    ToolResult(name="detect_chart_pattern", output=pattern_data),  # 命中策略
+    ToolResult(name="get_support_resistance", output={...}),
+    ToolResult(name="search_news", output={"news": [
+        {"title": "扫描器整合数据", "content": "PE/市值/主力/换手/龙虎榜"},
+        {"title": "行业景气度", "content": "Top10 热门行业"},
+        {"title": "技术形态命中", "content": "11 种策略命中情况"},
+    ]}),
+    ToolResult(name="analyze_news_sentiment", output={...}),
+]
+agent.run(goal, context={"symbol": symbol, "preloaded_observations": preloaded})
+```
+
+LLM 看到的数据 = Tier-1 指标 + Tier-2 基本面 + 行业景气度。**不再重复调外部 API**，速度提升 2-3 倍。
+
+### 3.3 4 维独立评分（不再合并）
+
+之前把技术分 + 基本面分 + AI 置信度强行合并成一个数字，丢失了"哪个维度强、哪个维度弱"的关键信息。
+
+**现在每只股票独立显示 4 个分**：
+- 技术分（0-100）
+- 基本面分（0-25，PE 10 + 市值 10 + PB 5）
+- 资金面分（0-25，主力净流入 12 + 换手 5 + 龙虎榜机构 8）
+- AI 把握度（0-100）
+
+排序按 `(BUY > HOLD > 其他) → 综合可信度` 两级排，不依赖单一总分。
+
+### 3.4 LLM 失败优雅降级
+
+LLM 余额不足/限流/超时时，scanner 检测响应是否以 `[LLM error:` 开头或解析后是 `raw_response` 兜底模式，标记 `used_llm=false`，走规则引擎给出 BUY/HOLD/SELL/WATCH。
+
+返回结果中 `llm_status` 字段：
+- `ok`：所有 LLM 调用成功
+- `partial`：部分失败
+- `all_failed`：全部失败
+- `disabled`：用户关闭 / LLM 未配置
+
+前端根据状态显示红色或黄色 banner 引导用户。
+
+### 3.5 行情双层缓存
+
+`market_service.py` 维护两套缓存：
+
+| 缓存 | TTL | 数据源 | 用途 |
+|---|---|---|---|
+| `_precise_cache` | 3s | 新浪 `hq.sinajs.cn`（批量 URL） | 自选股+持仓精准跟踪 |
+| `_market_cache` | 30s | AKShare `stock_zh_a_spot`（新浪源） | 全市场涨跌榜+扫描器候选过滤 |
+
+`_precise_symbols` 限制最多 80 只，超过按 LRU 淘汰，避免新浪 URL 拼接超长。`get_single_quote` 用 `persistent=False` 标记不入精准集合（避免扫描器分析 200 只股票时全部进集合）。
+
+### 3.6 keep-alive + 路由 query 自动触发
+
+App.vue 包了 `<keep-alive :include="['Overview', 'Market', 'Scanner', 'Agent', 'Alerts', 'Positions', 'Settings']">`，每个 view 都用 `defineOptions({ name: 'X' })` 命名。
+
+Agent.vue 同时监听 3 个生命周期：
+- `onMounted`：首次进入
+- `onActivated`：keep-alive 激活
+- `watch(route.query.symbol + t)`：同 query 重复跳转
+
+跳转时带 `t: Date.now()` 时间戳确保 `watch` 触发，从扫描器/总览/行情跳过来都能自动开始分析。
+
+### 3.7 飞书发送异步 fire-and-forget
+
+`feishu_service.py` 内置 `ThreadPoolExecutor(max_workers=4)`，所有 `send_*` 函数把请求 submit 到线程池就立即返回 `True`，**不等飞书 webhook 网络响应**。这样：
+- 飞书网络抖动 5s 也不会阻塞 quote_loop（每 3s 推送）
+- 多个提醒可以并发发送
+
+---
+
+## 四、已修复的关键 Bug 历史
+
+记录下来给后续维护者参考，避免重复踩坑：
+
+### 致命级（生产中必爆）
+
+1. **持仓告警每 3 秒重复推送飞书**（已修）
+   - 现象：触发一次止损后，每 3 秒（quote_loop 周期）满足条件再推送一次，一晚刷上千条
+   - 修复：`PositionORM` 加 `last_alert_at`/`last_alert_kind`，DB 持久化 + 内存 2 小时冷却双层去重
+
+2. **启动瞬间 price=0 → 全部持仓被误判 -100% 触发止损**（已修）
+   - 现象：服务启动时市场缓存为空，price=0，pnl_pct = -100%，所有持仓瞬间触发止损
+   - 修复：`alert_service.py` 加 `if price <= 0: continue`
+
+3. **bootstrap.py 引用幻影 ORM**（已修）
+   - 现象：bootstrap.py 还 import `InstrumentORM` / `RecommendationORM` 等已删除的类，调用即 ImportError
+   - 修复：删除 22 个 dead service + 16 个 dead route + 11 个 dead schema
+
+4. **LLM 配置多 worker 不同步**（已修）
+   - 现象：用户改 API Key 只对一个 worker 生效，其他 worker 用旧 key
+   - 修复：`runtime_config.py` 基于文件 mtime 自动重载，写入用 `tmp.replace()` 原子化 + chmod 0o600
+
+### 高级（影响功能正确性）
+
+5. **MACD DEA 用 `dif * 0.9` 假算**（已修）
+   - 修复：`scanner_service._macd()` 用标准 12/26/9 EMA 计算
+
+6. **强势股目标价低于买入**（已修）
+   - 修复：`target1 = max(target1, entry_mid * 1.03)` + `target2 > target1 * 1.05` + `stop_loss < entry_low` 兜底
+
+7. **K 线 today_bar 与历史 K volume 单位混乱**（已修）
+   - 现象：腾讯 K 线 `amount` 字段实为「手数」（1 手=100 股），代码当成股数
+   - 修复：乘 100 转股数，估算成交额 = 收盘价 × 股数
+
+8. **周/月 K 线 volume 字段丢失**（已修）
+   - 修复：`_resample_kline` 同时聚合 amount 和 volume
+
+9. **keep-alive 下 setInterval 不会被清理**（已修）
+   - 现象：onUnmounted 不会触发，定时器永远在跑
+   - 修复：用 `onActivated` / `onDeactivated` 启停 setInterval
+
+10. **scanner 与 Agent 不一致**（已修，本次重构）
+    - 见 §3.2
+
+### 中级（边界情况）
+
+11. **一字板 pos_in_20d=50 误判健康**：改返回 100
+12. **涨跌停板硬编码 ±10%**：按板块识别（北交所 30% / 创业板&科创板 20% / ST 5% / 主板 10%）
+13. **删除持仓不清相关提醒**：`positions.delete_position` 同时 `delete AlertORM` + `reset_position_alert_state`
+14. **SQLite 未启用 WAL**：`session.py` 用 `event.listens_for(engine, 'connect')` 设置
+15. **analysis_cache 无 TTL**：加 `updated_at` 列 + `is_stale` 标志（>6h）
+16. **symbol 大小写不规范**：watchlist/positions 写库前 `_normalize_symbol`
+
+### 完整修复清单
+
+详见 git commit 历史：
+```bash
+git log --oneline
+# aa650f8 feat(scanner): 三层漏斗第二轮重构，解决 13 项设计漏洞
+# cfdf520 feat: 潜力扫描升级为三层漏斗+AI 终审
+# 2dc22f9 fix(agent): 重写决策天平
+# 41aa24b fix: 全面修复 32 项逻辑漏洞 + 潜力扫描升级
+# b94f97d feat: 重构为 A 股智能助手
+```
+
+---
+
+## 五、各服务工作机制详解
+
+### 5.1 market_service.py
+
+**两个后台线程**（`ensure_cache_running()` 在 lifespan 启动）：
+
+```python
+# 精准行情线程（3s 刷新）
+_precise_refresh_loop:
+    while True:
+        symbols = list(_precise_symbols)  # 自选股+持仓
+        if symbols:
+            data = _fetch_precise(symbols)  # 新浪批量 URL
+            _precise_cache.update(data)
+        sleep(3)
+
+# 全市场行情线程（30s 刷新）
+_market_refresh_loop:
+    # 启动立即拉一次
+    _market_cache = _fetch_market_all()
+    while True:
+        sleep(30)
+        _market_cache = _fetch_market_all()  # AKShare 新浪 spot
+```
+
+**K 线接口**：腾讯 `stock_zh_a_hist_tx`（稳定）+ 拼接今日实时 K 线。日 K 直接返回，周/月 K 通过 `_resample_kline` 聚合。
+
+### 5.2 scanner_service.py
+
+完整流程见 §3.2-3.3。关键参数：
+
+```python
+scan_potential_stocks(
+    top_n=20,                      # 最终输出数量
+    min_score=50,                  # Tier-1 最低分
+    candidate_pool=120,            # Tier-1 深度分析候选数量
+    use_cache=True,                # 5 分钟扫描结果缓存
+    enable_fundamental=True,       # 是否启用 Tier-2
+    enable_llm=True,               # 是否启用 Tier-3
+    llm_top_n=12,                  # Tier-3 最多 LLM 调用数（控制成本）
+    progress_callback=...,         # 进度回调（WebSocket）
+)
+```
+
+**LLM 调用并发**：max_workers=4（避免触发 OpenAI/DeepSeek 限流），每只 timeout=180s。
+
+**结果缓存 key**：`top{n}_min{s}_pool{p}_req{required_strategies}_f{fund}_l{llm}`，5 分钟 TTL。
+
+### 5.3 fundamental_service.py
+
+**4 个独立缓存**：
+- `_info_cache`：单股 PE/PB/市值（6 小时 TTL）
+- `_market_flow_cache`：全市场资金流（1 小时 TTL，一次拉全部）
+- `_lhb_cache`：龙虎榜（24 小时 TTL，失败优雅降级）
+- `_hot_industries` / `_hot_concepts`：行业景气度（30 分钟 TTL）
+
+**关键函数**：
+- `evaluate_fundamental(symbol)`：返回 `{hard_blocks, quality, flow_score, quality_items, flow_items, info, fund_flow, lhb}`
+- `get_hot_industries(top_n)`：行业排名 + 涨幅 + 资金流
+
+### 5.4 alert_service.py
+
+```python
+check_price_alerts(db, quotes):
+    for alert in 未触发的提醒:
+        if price <= 0: continue       # 启动保护
+        if hit:
+            alert.triggered = True    # DB 标记防重发
+            feishu.send_price_alert() # 异步发送
+            triggered.append(alert)
+
+check_position_alerts(db, quotes):
+    for pos in positions:
+        if price <= 0: continue
+        # 双层冷却：内存 _position_alert_state（2h）+ DB last_alert_at（重启不重发）
+        # 触发后写 DB last_alert_at + last_alert_kind
+```
+
+`reset_position_alert_state(symbol)` 在 positions delete/upsert 时调用，让新成本基线立即生效。
+
+### 5.5 ws.py（WebSocket 推送）
+
+启动一个 `_quote_loop`（asyncio task）每 3s 执行：
+
+```python
+async def _quote_loop():
+    while True:
+        if manager.count() == 0:  # 没客户端就跳过
+            sleep
+            continue
+        # 拉取所有 watchlist + positions 的实时行情
+        quotes = market_service.get_realtime_quotes(symbols)
+        await manager.broadcast("quotes", quotes)
+        # 同时检查提醒触发
+        triggered = await asyncio.to_thread(alert_service.check_*)
+        if triggered:
+            await manager.broadcast("alerts", triggered)
+        sleep(3)
+```
+
+### 5.6 LLM 配置（runtime_config.py）
+
+```python
+get_override():
+    # 检查文件 mtime，变了就重新加载（多 worker 自动同步）
+    if disk_mtime > _OVERRIDE_MTIME:
+        _OVERRIDE = _load_from_disk()
+        _OVERRIDE_MTIME = disk_mtime
+    return _OVERRIDE
+
+set_override(...):
+    # 原子写入：写 .tmp 再 rename
+    tmp.write(json)
+    tmp.replace(target)
+    chmod(target, 0o600)  # 只允许当前用户读
+```
+
+LLMClient 用方法链：`runtime_config > .env > 默认值`。前端通过 `/api/v1/llm/config` POST 修改后立即生效。
+
+---
+
+## 六、前端关键约定
+
+### 6.1 组件命名
+
+每个 view 必须用 `defineOptions({ name: 'X' })`，否则 keep-alive 不会正确缓存。
+
+### 6.2 路由跳转带时间戳
+
+跳到 Agent 页时带 `t: Date.now()` 触发 watch：
+
+```js
+router.push({
+  path: '/agent',
+  query: { symbol, name, t: Date.now() }
+})
+```
+
+否则 keep-alive 缓存的 Agent 页 `onActivated` 不会触发新分析。
+
+### 6.3 localStorage 持久化
+
+Scanner 扫描结果保存到 `localStorage['scanner:last_result_v1']`：
+- 切页/刷新/关浏览器都不丢
+- 含选中策略+参数+时间戳
+- 「清空记录」按钮可手动清
+
+### 6.4 颜色规范（A 股习惯）
+
+- 涨：红 `#f56c6c`
+- 跌：绿 `#67c23a`
+- 暗色背景：`#1a1a2e` / 边框 `#2a2a4a` / 文字 `#c0c4cc`
+
+---
+
+## 七、运维与故障排查
+
+### 7.1 启动失败
+
+1. **`ImportError: No module named ...`**
+   - 检查 Python 版本是否 3.12+
+   - 检查 `pip install -e .` 是否完整
+
+2. **`sqlite3.OperationalError: no such column ...`**
+   - DB 自动迁移失败。手动执行：
+   ```bash
+   python3 -c "from apps.api.app.db.session import init_db; init_db()"
+   ```
+   - 或删除 `var/quant.db` 让其重建
+
+3. **行情拉不到（启动后市场缓存空）**
+   - 检查 AKShare 版本 `>= 1.17`
+   - 检查网络（新浪 hq.sinajs.cn 在国外可能不可达）
+   - 看后台日志：`首次加载全市场行情缓存...`
+
+### 7.2 LLM 相关
+
+1. **扫描器全部返回规则引擎结果**
+   - 前端会显示红色 banner
+   - 检查设置页 LLM 是否配置正确
+   - 检查 LLM 余额：DeepSeek `https://platform.deepseek.com/usage`
+   - 试用 `POST /api/v1/llm/test?level=quick` 验证
+
+2. **LLM 返回非 JSON**
+   - 后台日志会有 `LLM 输出非 JSON 格式`
+   - 通常是模型不支持中文 JSON 输出（如某些小模型），换 deepseek-chat 或 gpt-4o-mini
+
+3. **多 worker 配置不同步**
+   - 已修复：mtime 自动重载
+   - 仍可手动重启 uvicorn
+
+### 7.3 飞书提醒
+
+1. **没收到提醒**
+   - 检查 `.env` 的 `QUANT_FEISHU_WEBHOOK_URL`
+   - 试用 `POST /api/v1/notify/test`
+   - 看后台日志的 `飞书消息发送成功 / 失败`
+
+2. **提醒疯狂刷屏**（已修但记录）
+   - 价格提醒：检查 alerts 表的 `triggered` 字段，应该已是 True
+   - 持仓提醒：检查 positions 表的 `last_alert_at`，应该已写入
+
+### 7.4 性能
+
+1. **扫描超过 8 分钟**
+   - 大概率是 LLM 调用慢，看 max_workers 是否 ≥ 4
+   - 减少 `llm_top_n` 参数（默认 12，可降到 6）
+
+2. **行情推送卡顿**
+   - 检查飞书发送是否阻塞了 quote_loop（已修复，feishu 是 fire-and-forget）
+   - 检查 WebSocket 连接数，过多客户端时考虑限制
+
+---
+
+## 八、安全注意
+
+### 8.1 API Key 保护
+
+- `data/llm_runtime.json` 文件权限 0600（已自动设置）
+- `.gitignore` 已排除 `data/llm_runtime.json` 和 `data/*.db*`
+- **千万不要**把 .env 或 data/ 提交到 git
+
+### 8.2 飞书 Webhook
+
+- Webhook URL 包含 token，泄露后任何人都能发消息
+- 建议把 webhook URL 也通过设置页配置（当前是 .env，可改进为运行时配置）
+
+### 8.3 认证
+
+默认 `QUANT_AUTH_ENABLED=false`，所有 API 公开访问。生产环境应设为 `true` 并配置 `QUANT_*_API_KEY`。
+
+---
+
+## 九、后续优化方向
+
+按重要性排序：
+
+### 高优先级
+
+1. **WebSocket 进度推送接到前端**：后端 `/ws/scan` 已实现实时进度推送，前端 Scanner.vue 还在用 REST 等结果，可以接上看到 Tier-1/2/3 各阶段实时进度
+2. **支持 LLM Cost 跟踪**：扫描一次约消耗 0.5-2 元，应该显示给用户
+3. **历史扫描结果对比**：对比今日推荐 vs 昨日推荐，看哪些股票连续被推荐
+4. **回测系统**：扫出推荐后跟踪 5 日 / 20 日表现，迭代评分系统
+
+### 中优先级
+
+5. **行业关联**：每只股票显示所属行业 + 行业排名（当前只有热门行业全局列表）
+6. **北向资金**：拉沪深港通持股变化，作为额外的资金面信号
+7. **机构研报评级**：拉 AKShare 研报数据，近 30 天评级买入数量加分
+8. **大股东减持公告**：扣分 / 一票否决
+
+### 低优先级
+
+9. **多账户**：当前是单用户单库，多用户场景需要加 user_id
+10. **手机端适配**：当前布局以桌面为主，移动端可继续优化
+11. **支持港股 / 美股**：架构已经预留 symbol 后缀（.SH/.SZ/.HK 等），数据源需要适配
+12. **回测 + 策略组合**：让用户保存自己的策略组合并跟踪
+
+---
+
+## 十、git 工作流
+
+```bash
+# 当前主分支
+git checkout main
+
+# 提交规范（Conventional Commits）
+git commit -m "feat: ..."   # 新功能
+git commit -m "fix: ..."    # bug 修复
+git commit -m "refactor: ..." # 重构
+git commit -m "docs: ..."   # 文档
+
+# 推送
+git push origin main
+```
+
+历史关键 commit：
+- `b94f97d` 重构为 A 股智能助手（删除 19 表→4 表）
+- `41aa24b` 全面修复 32 项逻辑漏洞
+- `2dc22f9` Agent 决策天平重写（让 AI 主动给立场）
+- `cfdf520` 潜力扫描升级为三层漏斗 + AI 终审
+- `aa650f8` 三层漏斗第二轮重构（解决 13 项设计漏洞）
+
+---
+
+## 十一、联系方式与已知 Owner
+
+> 项目作者：diminglucky  
+> GitHub：https://github.com/diminglucky/liangHuaJiaoYi
+
+**重要约定**：
+- 这只是个人投资辅助工具，**不是金融机构产品**
+- 不构成投资建议，所有买卖决策由用户自行承担
+- 数据来源都是公开免费 API，不保证 100% 实时准确
+
+---
+
+## 附：常用命令速查
+
+```bash
+# 启动后端（开发）
+uvicorn apps.api.app.main:app --reload --port 8000 --env-file .env
+
+# 启动前端（开发）
+cd apps/web && npm run dev
+
+# 构建前端
+cd apps/web && npm run build
+
+# 清空扫描器缓存
+curl -X DELETE http://127.0.0.1:8000/api/v1/scanner/cache
+
+# 测试扫描（小规模，约 1 分钟）
+curl -X POST http://127.0.0.1:8000/api/v1/scanner/scan \
+  -H "Content-Type: application/json" \
+  -d '{"top_n":5,"candidate_pool":40,"llm_top_n":5}'
+
+# 测试 LLM 配置
+curl -X POST http://127.0.0.1:8000/api/v1/llm/test?level=quick
+
+# 查看运行状态
+curl http://127.0.0.1:8000/api/v1/health
+curl http://127.0.0.1:8000/api/v1/market/cache-status
+
+# 查看数据库
+sqlite3 var/quant.db
+.tables
+SELECT * FROM positions;
+```
+
+---
+
+文档维护：每次重大改动同步更新本文档对应章节。
