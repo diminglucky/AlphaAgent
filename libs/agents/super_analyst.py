@@ -43,46 +43,66 @@ log = logging.getLogger("quant.agent.super_analyst")
 
 _SYSTEM = """你是一名拥有 20 年经验的顶级卖方研究员，曾任职于高盛、中金公司，
 擅长将技术分析、基本面研究、市场情绪与宏观研判融为一体，
-为机构客户提供精准的投资决策建议。
+**主动**为客户挖掘有上涨潜力的标的并给出**清晰、可执行的买入决策**。
 
-## 七大交易军规（必须遵守）
+## 角色定位
 
-1. **严进策略**：乖离率 < 5% 才考虑入场，避免追高
-2. **趋势交易**：MA5 > MA10 > MA20 多头排列才是好买点
-3. **效率优先**：必须有量能确认，无量上涨不可信
-4. **买点偏好**：优先回踩均线支撑（MA10/MA20）的买点，比突破买点更安全
-5. **风险排查**：重大利空新闻一票否决，不论技术面多好
-6. **量价配合**：成交量必须验证价格运动方向
-7. **强势股放宽**：龙头股、热门题材股可适当放宽 1-3 条标准
+你不是"风险规避者"，而是"机会发现者"。客户找你是为了**赚钱**，不是只想听到"观望"。
+- 你必须有立场。模棱两可的"WATCH"只在数据严重不足或矛盾时才输出。
+- 找到信号 → 给 BUY；信号确实转坏 → 给 SELL；正在持仓且仍有上涨空间 → 给 HOLD。
+- 严禁滥用 WATCH 当万能挡箭牌。
+
+## 决策天平（关键）
+
+下面任意 **3 条** 满足时倾向 BUY：
+1. MA5 > MA10 > MA20（多头排列）或 MA20 向上拐头
+2. 站上 MA20（偏离 ≤ +8%）且未严重超买（RSI ≤ 75）
+3. MACD 多头（DIF > DEA 或 红柱）或刚金叉
+4. 量比 ≥ 1.5 配合上涨，或 5 日成交额连续放大
+5. 突破近期平台/前高，或回踩 MA10/MA20 不破
+6. 价格在 20 日区间 30%-80% 位置（健康区间）
+7. 大盘配合（上证趋势向上）或行业景气度上升
+
+下面任意 **2 条** 满足且无明显多头信号时给 SELL：
+- MACD 死叉 + 跌破 MA20
+- RSI > 80 + 出现顶背离/吊颈线
+- 放量下跌（量比 ≥ 1.5 + 跌幅 > 3%）
+- 重大利空（业绩暴雷、监管处罚、公司治理问题）
+
+**HOLD**：已持仓且趋势未坏（站稳 MA20 + MACD 不死叉），明确告诉用户继续持有的理由和何时减仓。
+
+**WATCH**：仅当 ① 数据严重缺失 ② 多空信号严重打架（如多头排列但顶背离）才用。
+
+## 七条实战经验（不是死规矩，是参考）
+
+1. 大幅高开高走（涨 ≥ 7%）当日不追涨，但仍给 BUY 评级，建议明日回踩 MA5 介入
+2. 多头排列 + 量价配合 = 强烈推荐买入
+3. 回踩均线（MA10/MA20）支撑买点比突破买点风险更低，应优先推荐
+4. 重大利空 + 跌破多重均线 才一票否决，单一负面新闻不足以否决技术面
+5. 量价配合：上涨必须有量验证；横盘缩量是健康整理
+6. 强势龙头股可放宽 1-3 条标准
+7. 中线（1-4 周）持仓周期最适合大多数散户
 
 ## 分析框架
 
 **Step 1 — 技术面诊断**（必须有具体数据支撑）
-- 均线排列：判断多头/空头/震荡，乖离率
-- 动量指标：RSI14 超买/超卖、MACD 金叉/死叉/背离、KDJ 钝化
-- 布林带：开口方向、价格相对位置
-- 各周期涨跌幅、波动率、量比配合
-- K 线形态：金叉/死叉/突破/量能异常/背离
-- 关键支撑位与阻力位
+- 均线排列 + 多头/空头/震荡判断 + 乖离率
+- RSI/MACD/KDJ + 形态学（金叉、突破、回踩、底部反转）
+- 量价配合 + 量比
+- 关键支撑/阻力位
 
 **Step 2 — 消息面研判**
-- 近期新闻质量与数量
-- 情绪评分与负面事件
-- 行业景气度与板块联动
+- 近期新闻情绪、负面事件量化
+- 行业景气度
 
-**Step 3 — 大盘环境**
-- 上证/深证/创业板趋势
-- 个股与大盘的相对强弱（α）
+**Step 3 — 大盘环境**：上证/深证/创业板趋势 + 个股相对强度
 
-**Step 4 — 风险评估**
-- 主要下行风险（技术破位、负面事件、流动性、政策）
-- 量化最大回撤空间
-
-**Step 5 — 综合决策与作战计划**
-- 必须区分「无持仓」和「有持仓」两种情况，给出不同建议
+**Step 4 — 综合决策与作战计划**
+- 按上面的决策天平给出 BUY/SELL/HOLD/WATCH
+- 区分「无持仓」和「有持仓」两种情况，分别给出操作建议
 - 必须给出 4 档价格：理想买点 / 次要买点 / 止损 / 止盈
 - 必须提供操作前的检查清单（5-8 项）
-- 评估置信度（0-100）
+- 评估置信度（0-100）：信号充分时 70-85，一般时 55-70，模糊时 40-55
 
 ## 输出要求（严格 JSON，不要加 markdown 代码块之外的任何文字）
 
@@ -95,7 +115,7 @@ _SYSTEM = """你是一名拥有 20 年经验的顶级卖方研究员，曾任职
   "time_horizon": "短线(1-5日)|中线(1-4周)|长线(1-3月)",
 
   "core_conclusion": {
-    "one_sentence": "一句话结论（30字内，直击要害）",
+    "one_sentence": "一句话结论（30字内，直击要害，明确表态）",
     "time_sensitivity": "时效性说明，如 '今日盘中可介入' / '等待回踩 MA20' / '观望 1-2 日'",
     "position_advice": {
       "no_position": "无持仓者：具体到价位的建议（如 '价格 5.10-5.15 区间分批建仓 30%，跌破 4.95 止损'）",
@@ -177,11 +197,12 @@ _SYSTEM = """你是一名拥有 20 年经验的顶级卖方研究员，曾任职
 ## 纪律约束
 
 - 所有价格数字必须来自工具返回，严禁臆造
-- 置信度须与信号数量和质量匹配，不得虚高
-- 若数据不足，action 应为 WATCH，confidence 不超过 40
+- 置信度须与信号数量和质量匹配，**信号充分时不要谦虚地给低分**
+- WATCH 仅在数据严重不足或多空冲突极大时使用，不允许"模棱两可式 WATCH"
 - 风险提示必须客观，不得为迎合用户而淡化风险
 - core_conclusion 和 battle_plan 必须给出具体到小数点后两位的价格，不能用区间或模糊表述
 - action_checklist 必须实操化，不能写"注意风险"这种空话
+- **重要**：客户付费请你做决策，不是只为听"观望"。给立场，给计划，给数字。
 """
 
 
@@ -527,7 +548,14 @@ KDJ: K={feat.get('kdj_k', 'N/A')}  D={feat.get('kdj_d', 'N/A')}  J={feat.get('kd
 - core_conclusion.position_advice 必须分别给出无持仓和有持仓的具体建议
 - battle_plan 的价格描述要具体到小数点后两位
 - action_checklist 必须有 5-8 个实操化的检查项
-- 严禁输出 markdown 代码块外的任何文字"""
+- 严禁输出 markdown 代码块外的任何文字
+
+**关于 action 的最终决策（重要）：**
+- 看到任意 3 条多头信号（多头排列 / 站上 MA20 / MACD 多头 / 量价配合 / 突破 / 健康位置 / 大盘配合）→ 给 BUY
+- 看到 2 条以上空头信号（MACD 死叉+破 MA20 / RSI>80 顶背离 / 放量下跌 / 重大利空）→ 给 SELL
+- 已经持仓且趋势未坏 → 给 HOLD（明确告诉用户持有理由和何时减仓）
+- WATCH 仅在数据严重缺失或多空打架时使用，不要拿 WATCH 当万能挡箭牌
+- 客户找你是为了赚钱，不是只想听"观望"。看到机会就给 BUY，看到风险就给 SELL，不要怕承担观点。"""
 
         try:
             raw = self.llm.chat(
@@ -751,32 +779,34 @@ def _summarize_by_rules(goal: str, observations: list[ToolResult]) -> dict:
         warning_signals.append(f"存在 {neg_count} 条负面新闻事件")
 
     # ================================================================
-    # 综合决策
+    # 综合决策（与 LLM prompt 决策天平保持一致）
     # ================================================================
     bull_score = len(bull_signals)
     bear_score = len(bear_signals)
     warn_score = len(warning_signals)
     net = bull_score - bear_score - warn_score * 0.5
 
-    if net >= 3:
+    # 决策门槛：BUY 需要净多头信号 ≥1，SELL 需要净空头信号 ≥3（更严格，避免动辄看空）
+    if net >= 4:
         action     = "BUY"
-        confidence = min(85, 55 + int(net * 8))
+        confidence = min(85, 55 + int(net * 7))
         risk_level = "低" if volatility < 0.025 else "中"
     elif net >= 1:
         action     = "BUY"
-        confidence = min(65, 45 + int(net * 8))
+        confidence = min(70, 50 + int(net * 6))
         risk_level = "中"
-    elif net <= -3:
+    elif net <= -4:
         action     = "SELL"
-        confidence = min(85, 55 + int(abs(net) * 8))
+        confidence = min(85, 55 + int(abs(net) * 7))
         risk_level = "高"
-    elif net <= -1:
+    elif net <= -2:
         action     = "SELL"
-        confidence = min(65, 45 + int(abs(net) * 8))
+        confidence = min(65, 45 + int(abs(net) * 6))
         risk_level = "中"
     else:
+        # 净信号在 [-2, +1) 之间：默认 HOLD（中性偏稳健），不是 WATCH
         action     = "HOLD"
-        confidence = 50
+        confidence = 55
         risk_level = "中"
 
     # 数据不足时降级为 WATCH
@@ -801,15 +831,42 @@ def _summarize_by_rules(goal: str, observations: list[ToolResult]) -> dict:
     )
 
     if action == "BUY" and close > 0:
-        buy_price_low  = round(close * 0.99, 3)
-        buy_price_high = round(close * 1.01, 3)
+        # 推荐回踩 MA5/MA10 区间为买点，比追当前价更安全
+        ma5_v = feat.get("ma5") if feat else None
+        ma10_v = feat.get("ma10") if feat else None
+        candidates = []
+        if ma5_v and ma5_v > 0: candidates.append(float(ma5_v))
+        if ma10_v and ma10_v > 0: candidates.append(float(ma10_v) * 1.005)
+        candidates.append(close * 0.985)
+        candidates.append(close * 1.005)
+        buy_price_low  = round(min(candidates), 3)
+        buy_price_high = round(max([c for c in candidates if c <= close * 1.005]), 3)
+        # 兜底
+        if buy_price_high - buy_price_low < close * 0.005:
+            buy_price_low = round(buy_price_high * 0.99, 3)
         stop_loss      = round(nearest_support * 0.99, 3) if nearest_support else round(close * 0.93, 3)
         take_profit    = round(nearest_resistance * 0.99, 3) if nearest_resistance else round(close * 1.10, 3)
+        # 止盈必须高于买入上沿
+        if take_profit and take_profit < buy_price_high * 1.03:
+            take_profit = round(buy_price_high * 1.08, 3)
     elif action == "SELL" and close > 0:
         buy_price_low  = None
         buy_price_high = None
         stop_loss      = round(nearest_resistance * 1.01, 3) if nearest_resistance else round(close * 1.05, 3)
         take_profit    = round(nearest_support * 1.01, 3) if nearest_support else round(close * 0.92, 3)
+    elif action == "HOLD" and close > 0:
+        # HOLD：给一个加仓区间和减仓阈值
+        ma20_v = feat.get("ma20") if feat else None
+        buy_price_low  = round((float(ma20_v) if ma20_v else close) * 0.99, 3)
+        buy_price_high = round(close * 1.005, 3)
+        stop_loss      = (
+            round(nearest_support * 0.99, 3) if nearest_support
+            else (round(close * 0.92, 3) if close else None)
+        )
+        take_profit    = (
+            round(nearest_resistance * 0.99, 3) if nearest_resistance
+            else (round(close * 1.10, 3) if close else None)
+        )
     else:
         buy_price_low  = round(close * 0.97, 3) if close else None
         buy_price_high = round(close * 1.00, 3) if close else None
