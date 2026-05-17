@@ -212,6 +212,49 @@
       </div>
     </div>
 
+    <!-- 热门行业 -->
+    <div v-if="result?.hot_industries?.length" class="hot-industries">
+      <span class="hot-icon">🔥</span>
+      <span class="hot-label">今日热门行业:</span>
+      <el-tag
+        v-for="(ind, i) in result.hot_industries.slice(0, 8)"
+        :key="ind.name"
+        size="small"
+        :type="ind.change_pct >= 2 ? 'danger' : (ind.change_pct >= 0 ? 'warning' : 'success')"
+        effect="dark"
+        class="hot-tag"
+      >
+        #{{ i + 1 }} {{ ind.name }} {{ ind.change_pct >= 0 ? '+' : '' }}{{ ind.change_pct?.toFixed(2) }}%
+      </el-tag>
+    </div>
+
+    <!-- LLM 状态告警 -->
+    <el-alert
+      v-if="result?.llm_status === 'all_failed'"
+      type="error"
+      :closable="false"
+      class="llm-status-alert"
+    >
+      <template #title>
+        ⚠️ AI 终审失败：所有 LLM 调用都失败（可能是 API Key 余额不足或网络问题）
+      </template>
+      <template #default>
+        当前结果由「规则引擎兜底」生成，建议在
+        <router-link to="/settings" style="color:#f56c6c;text-decoration:underline">设置页</router-link>
+        检查 LLM 配置后重新扫描。
+      </template>
+    </el-alert>
+    <el-alert
+      v-else-if="result?.llm_status === 'partial'"
+      type="warning"
+      :closable="false"
+      class="llm-status-alert"
+    >
+      <template #title>
+        ⚠️ 部分 AI 调用失败，标记 ⚙️ 的股票为规则引擎兜底（非真实 AI 分析）
+      </template>
+    </el-alert>
+
     <!-- 扫描结果统计 -->
     <div v-if="result" class="scan-summary">
       <div class="summary-item">
@@ -267,9 +310,21 @@
             <div class="stock-name">{{ stock.name }}</div>
             <div class="stock-symbol">{{ stock.symbol }}</div>
           </div>
-          <div class="stock-score">
-            <div class="score-value">{{ stock.score }}</div>
-            <div class="score-label">分</div>
+          <!-- AI 评级标签作为整张卡的核心定调 -->
+          <div class="stock-action" v-if="stock.ai_analysis?.action">
+            <el-tag
+              :type="aiActionTagType(stock.ai_analysis.action)"
+              effect="dark"
+              size="default"
+              style="font-size:14px;padding:4px 12px"
+            >
+              {{ stock.ai_analysis.used_llm === false ? '⚙️' : '🤖' }}
+              {{ aiActionLabel(stock.ai_analysis.action) }}
+            </el-tag>
+            <div class="action-conf">
+              把握度 {{ stock.ai_analysis.confidence }}%
+              <span v-if="stock.ai_analysis.used_llm === false" style="color:#e6a23c">（规则引擎）</span>
+            </div>
           </div>
         </div>
 
@@ -277,6 +332,38 @@
           <div class="stock-price">¥{{ stock.price?.toFixed(2) }}</div>
           <div class="stock-pct" :class="stock.change_pct >= 0 ? 'up' : 'down'">
             {{ stock.change_pct >= 0 ? '+' : '' }}{{ stock.change_pct?.toFixed(2) }}%
+          </div>
+        </div>
+
+        <!-- 4 维独立评分 -->
+        <div class="dim-row">
+          <div class="dim-cell">
+            <div class="dim-cell-label">技术</div>
+            <div class="dim-cell-bar">
+              <div class="dim-cell-fill" :style="{ width: stock.score + '%', background: dimColor(stock.score, 100) }"></div>
+            </div>
+            <div class="dim-cell-value">{{ stock.score }}/100</div>
+          </div>
+          <div class="dim-cell" v-if="(stock.fundamental?.quality ?? null) != null">
+            <div class="dim-cell-label">基本面</div>
+            <div class="dim-cell-bar">
+              <div class="dim-cell-fill" :style="{ width: (stock.fundamental.quality / 25 * 100) + '%', background: dimColor(stock.fundamental.quality, 25) }"></div>
+            </div>
+            <div class="dim-cell-value">{{ stock.fundamental.quality }}/25</div>
+          </div>
+          <div class="dim-cell" v-if="(stock.fundamental?.flow_score ?? null) != null">
+            <div class="dim-cell-label">资金面</div>
+            <div class="dim-cell-bar">
+              <div class="dim-cell-fill" :style="{ width: (stock.fundamental.flow_score / 25 * 100) + '%', background: dimColor(stock.fundamental.flow_score, 25) }"></div>
+            </div>
+            <div class="dim-cell-value">{{ stock.fundamental.flow_score }}/25</div>
+          </div>
+          <div class="dim-cell" v-if="stock.ai_analysis?.confidence != null">
+            <div class="dim-cell-label">AI</div>
+            <div class="dim-cell-bar">
+              <div class="dim-cell-fill" :style="{ width: stock.ai_analysis.confidence + '%', background: dimColor(stock.ai_analysis.confidence, 100) }"></div>
+            </div>
+            <div class="dim-cell-value">{{ stock.ai_analysis.confidence }}/100</div>
           </div>
         </div>
 
@@ -420,7 +507,37 @@
       </div>
     </div>
 
-    <div v-else-if="result && !result.results?.length" class="empty-state">
+    <!-- AI 否决的股票（透明度展示）-->
+    <div v-if="result?.rejected_results?.length" class="rejected-section">
+      <div class="rejected-header" @click="rejectedOpen = !rejectedOpen">
+        <span class="rejected-title">
+          <el-icon><ArrowRight v-if="!rejectedOpen" /><ArrowDown v-else /></el-icon>
+          AI 否决（{{ result.rejected_results.length }} 只）
+        </span>
+        <span class="rejected-hint">
+          这些股票通过了技术海选 + 基本面过滤，但 AI 综合判断后认为不宜买入
+        </span>
+      </div>
+      <div v-if="rejectedOpen" class="rejected-list">
+        <div
+          v-for="r in result.rejected_results"
+          :key="r.symbol"
+          class="rejected-item"
+          @click="openDetail(r)"
+        >
+          <div class="rj-id">
+            <span class="rj-name">{{ r.name }}</span>
+            <span class="rj-symbol">{{ r.symbol }}</span>
+          </div>
+          <el-tag size="small" :type="aiActionTagType(r.ai_analysis?.action)" effect="plain">
+            {{ aiActionLabel(r.ai_analysis?.action) }} {{ r.ai_analysis?.confidence }}%
+          </el-tag>
+          <span class="rj-reason">{{ r.ai_analysis?.core_conclusion?.one_sentence || r.ai_analysis?.rejected_reason }}</span>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="result && !result.results?.length && !result.rejected_results?.length" class="empty-state">
       <div class="empty-icon">😶</div>
       <div class="empty-text">未找到符合条件的潜力股，可降低「最低分数」或减少策略限制再试</div>
     </div>
@@ -455,24 +572,110 @@
       size="560px"
     >
       <div v-if="detailStock" class="drawer-content">
-        <!-- 评分卡 -->
-        <div class="score-card" :class="`score-${scoreLevel(detailStock.score)}`">
-          <div class="sc-score-label">综合评分</div>
-          <div class="sc-score-value">{{ detailStock.score }}</div>
-          <div class="sc-score-bar">
-            <el-progress
-              :percentage="detailStock.score"
-              :color="scoreColor(detailStock.score)"
-              :stroke-width="10"
-              :show-text="false"
-            />
+        <!-- AI 终审结论作为标题（如果有）-->
+        <div v-if="detailStock.ai_analysis?.action" class="drawer-ai-card" :class="`ai-${(detailStock.ai_analysis.action || '').toLowerCase()}`">
+          <div class="dac-header">
+            <el-tag :type="aiActionTagType(detailStock.ai_analysis.action)" effect="dark" size="large">
+              🤖 AI {{ aiActionLabel(detailStock.ai_analysis.action) }}
+            </el-tag>
+            <span class="dac-conf">把握度 {{ detailStock.ai_analysis.confidence }}%</span>
           </div>
-          <div class="sc-meta">
-            <span>¥{{ detailStock.price?.toFixed(2) }}</span>
-            <span :class="detailStock.change_pct >= 0 ? 'up' : 'down'">
-              {{ detailStock.change_pct >= 0 ? '+' : '' }}{{ detailStock.change_pct?.toFixed(2) }}%
-            </span>
-            <span>成交额 {{ fmtAmt(detailStock.turnover) }}</span>
+          <div v-if="detailStock.ai_analysis.core_conclusion?.one_sentence" class="dac-quote">
+            "{{ detailStock.ai_analysis.core_conclusion.one_sentence }}"
+          </div>
+          <div v-if="detailStock.ai_analysis.core_conclusion?.position_advice" class="dac-advice">
+            <div v-if="detailStock.ai_analysis.core_conclusion.position_advice.no_position" class="advice-line">
+              <span class="advice-label">无持仓:</span>
+              <span>{{ detailStock.ai_analysis.core_conclusion.position_advice.no_position }}</span>
+            </div>
+            <div v-if="detailStock.ai_analysis.core_conclusion.position_advice.has_position" class="advice-line">
+              <span class="advice-label">有持仓:</span>
+              <span>{{ detailStock.ai_analysis.core_conclusion.position_advice.has_position }}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 4 维独立评分卡 -->
+        <div class="drawer-multi-score">
+          <div class="dms-cell">
+            <div class="dms-label">技术分</div>
+            <div class="dms-value" :style="{ color: dimColor(detailStock.score, 100) }">{{ detailStock.score }}</div>
+            <div class="dms-max">/ 100</div>
+          </div>
+          <div class="dms-cell" v-if="(detailStock.fundamental?.quality ?? null) != null">
+            <div class="dms-label">基本面</div>
+            <div class="dms-value" :style="{ color: dimColor(detailStock.fundamental.quality, 25) }">{{ detailStock.fundamental.quality }}</div>
+            <div class="dms-max">/ 25</div>
+          </div>
+          <div class="dms-cell" v-if="(detailStock.fundamental?.flow_score ?? null) != null">
+            <div class="dms-label">资金面</div>
+            <div class="dms-value" :style="{ color: dimColor(detailStock.fundamental.flow_score, 25) }">{{ detailStock.fundamental.flow_score }}</div>
+            <div class="dms-max">/ 25</div>
+          </div>
+          <div class="dms-cell" v-if="detailStock.ai_analysis?.confidence != null">
+            <div class="dms-label">AI 把握</div>
+            <div class="dms-value" :style="{ color: dimColor(detailStock.ai_analysis.confidence, 100) }">{{ detailStock.ai_analysis.confidence }}</div>
+            <div class="dms-max">/ 100</div>
+          </div>
+        </div>
+
+        <div class="drawer-section drawer-meta">
+          <span>¥{{ detailStock.price?.toFixed(2) }}</span>
+          <span :class="detailStock.change_pct >= 0 ? 'up' : 'down'">
+            {{ detailStock.change_pct >= 0 ? '+' : '' }}{{ detailStock.change_pct?.toFixed(2) }}%
+          </span>
+          <span>成交额 {{ fmtAmt(detailStock.turnover) }}</span>
+        </div>
+
+        <!-- 基本面详情 -->
+        <div v-if="detailStock.fundamental?.quality_items?.length" class="drawer-section">
+          <div class="drawer-section-title">💎 基本面分析</div>
+          <div class="fund-items">
+            <div
+              v-for="(item, i) in detailStock.fundamental.quality_items"
+              :key="'q'+i"
+              class="fund-item"
+              :class="`fi-${item.kind}`"
+            >
+              <span class="fi-score">{{ item.score >= 0 ? '+' : '' }}{{ item.score }}</span>
+              <span class="fi-desc">{{ item.desc }}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 资金面详情 -->
+        <div v-if="detailStock.fundamental?.flow_items?.length" class="drawer-section">
+          <div class="drawer-section-title">💰 资金面分析</div>
+          <div class="fund-items">
+            <div
+              v-for="(item, i) in detailStock.fundamental.flow_items"
+              :key="'f'+i"
+              class="fund-item"
+              :class="`fi-${item.kind}`"
+            >
+              <span class="fi-score">{{ item.score >= 0 ? '+' : '' }}{{ item.score }}</span>
+              <span class="fi-desc">{{ item.desc }}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- AI 看好理由 / 风险 -->
+        <div v-if="detailStock.ai_analysis?.key_points?.length" class="drawer-section">
+          <div class="drawer-section-title">🎯 AI 核心观点</div>
+          <ul class="ai-points">
+            <li v-for="(p, i) in detailStock.ai_analysis.key_points" :key="'kp'+i">{{ p }}</li>
+          </ul>
+          <div v-if="detailStock.ai_analysis.catalysts?.length" style="margin-top:8px">
+            <div class="ap-sub-title up">✓ 催化剂</div>
+            <ul class="ai-points">
+              <li v-for="(p, i) in detailStock.ai_analysis.catalysts" :key="'cat'+i">{{ p }}</li>
+            </ul>
+          </div>
+          <div v-if="detailStock.ai_analysis.risk_factors?.length" style="margin-top:8px">
+            <div class="ap-sub-title down">⚠ 风险</div>
+            <ul class="ai-points">
+              <li v-for="(p, i) in detailStock.ai_analysis.risk_factors" :key="'rf'+i">{{ p }}</li>
+            </ul>
           </div>
         </div>
 
@@ -645,7 +848,7 @@ defineOptions({ name: 'Scanner' })
 import { ref, reactive, computed, onMounted, onDeactivated, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { Loading } from '@element-plus/icons-vue'
+import { Loading, ArrowRight, ArrowDown } from '@element-plus/icons-vue'
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
 import { RadarChart, BarChart } from 'echarts/charts'
@@ -673,6 +876,7 @@ const result = ref(null)
 const drawerVisible = ref(false)
 const detailStock = ref(null)
 const paramsOpen = ref([])
+const rejectedOpen = ref(false)
 
 const strategies = ref([])
 const selectedStrategies = ref([])
@@ -1028,6 +1232,15 @@ function confColor(v) {
   if (v >= 80) return '#f56c6c'
   if (v >= 65) return '#e6a23c'
   if (v >= 50) return '#67c23a'
+  return '#909399'
+}
+
+function dimColor(value, max) {
+  if (value == null) return '#606266'
+  const pct = (value / max) * 100
+  if (pct >= 80) return '#f56c6c'
+  if (pct >= 60) return '#e6a23c'
+  if (pct >= 40) return '#67c23a'
   return '#909399'
 }
 
@@ -1484,6 +1697,82 @@ function indicatorGroups(ind) {
 }
 .ratio-val { color: #c0c4cc; font-family: monospace; min-width: 40px; text-align: right; }
 
+/* 热门行业 */
+.hot-industries {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  background: linear-gradient(135deg, rgba(245, 108, 108, 0.06), rgba(245, 179, 66, 0.04));
+  border: 1px solid rgba(245, 108, 108, 0.15);
+  border-radius: 8px;
+}
+.hot-icon { font-size: 16px; }
+.hot-label { font-size: 13px; color: #c0c4cc; font-weight: 600; }
+.hot-tag { font-family: monospace; }
+
+.llm-status-alert {
+  margin: 0;
+}
+
+/* AI 否决 */
+.rejected-section {
+  background: #1a1a2e;
+  border: 1px dashed #2a2a4a;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.rejected-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  cursor: pointer;
+  flex-wrap: wrap;
+}
+.rejected-header:hover { background: #1c1c34; }
+.rejected-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #909399;
+  font-weight: 600;
+}
+.rejected-hint {
+  font-size: 11px;
+  color: #606266;
+  margin-left: auto;
+}
+.rejected-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 16px 12px;
+}
+.rejected-item {
+  display: grid;
+  grid-template-columns: 200px 110px 1fr;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 12px;
+  background: #16162a;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+  border: 1px solid transparent;
+  font-size: 12px;
+}
+.rejected-item:hover { border-color: #2a2a4a; }
+.rj-id { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.rj-name { color: #c0c4cc; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rj-symbol { color: #606266; font-family: monospace; }
+.rj-reason { color: #909399; line-height: 1.5; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 768px) {
+  .rejected-item { grid-template-columns: 1fr; }
+}
+
 /* 扫描汇总 */
 .scan-summary {
   display: flex;
@@ -1585,6 +1874,60 @@ function indicatorGroups(ind) {
 .stock-card.score-mid  .score-value { color: #e6a23c; }
 .stock-card.score-low  .score-value { color: #909399; }
 .score-label { font-size: 10px; color: #606266; }
+
+/* 卡片头部右侧 AI 评级 */
+.stock-action {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  margin-right: 32px;
+}
+.action-conf {
+  font-size: 11px;
+  color: #909399;
+  font-family: monospace;
+}
+
+/* 4 维独立评分行 */
+.dim-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  padding: 8px 12px;
+  background: #16162a;
+  border-radius: 6px;
+}
+@media (max-width: 480px) {
+  .dim-row { grid-template-columns: repeat(2, 1fr); }
+}
+.dim-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.dim-cell-label {
+  font-size: 10px;
+  color: #909399;
+  font-weight: 600;
+}
+.dim-cell-bar {
+  height: 4px;
+  background: #1a1a2e;
+  border-radius: 2px;
+  overflow: hidden;
+}
+.dim-cell-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.3s;
+}
+.dim-cell-value {
+  font-size: 11px;
+  color: #c0c4cc;
+  font-family: monospace;
+}
 
 .stock-price-row {
   display: flex;
@@ -1911,6 +2254,137 @@ function indicatorGroups(ind) {
   gap: 14px;
   padding: 4px 0;
 }
+
+/* AI 终审主卡 */
+.drawer-ai-card {
+  background: linear-gradient(135deg, rgba(64, 158, 255, 0.10), rgba(103, 197, 214, 0.04));
+  border: 1px solid rgba(64, 158, 255, 0.30);
+  border-radius: 10px;
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.drawer-ai-card.ai-buy  { border-color: rgba(245, 108, 108, 0.55); background: linear-gradient(135deg, rgba(245, 108, 108, 0.14), rgba(245, 179, 66, 0.06)); }
+.drawer-ai-card.ai-hold { border-color: rgba(230, 162, 60, 0.45); background: linear-gradient(135deg, rgba(230, 162, 60, 0.12), rgba(230, 162, 60, 0.04)); }
+.drawer-ai-card.ai-sell { border-color: rgba(103, 194, 58, 0.45); background: linear-gradient(135deg, rgba(103, 194, 58, 0.12), rgba(103, 194, 58, 0.04)); }
+.dac-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.dac-conf {
+  font-size: 13px;
+  color: #c0c4cc;
+  font-weight: 700;
+  font-family: monospace;
+  margin-left: auto;
+}
+.dac-quote {
+  font-size: 14px;
+  color: #c0c4cc;
+  line-height: 1.6;
+  font-style: italic;
+}
+.dac-advice {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: rgba(22, 22, 42, 0.5);
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+.advice-line {
+  font-size: 12px;
+  color: #c0c4cc;
+  line-height: 1.5;
+}
+.advice-label {
+  color: #909399;
+  font-weight: 600;
+  margin-right: 6px;
+}
+
+/* 4 维评分卡 */
+.drawer-multi-score {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+.dms-cell {
+  background: #16162a;
+  border: 1px solid #2a2a4a;
+  border-radius: 8px;
+  padding: 12px 10px;
+  text-align: center;
+}
+.dms-label { font-size: 11px; color: #909399; margin-bottom: 4px; }
+.dms-value { font-size: 28px; font-weight: 800; line-height: 1; font-family: monospace; }
+.dms-max { font-size: 11px; color: #606266; margin-top: 2px; font-family: monospace; }
+
+.drawer-meta {
+  display: flex;
+  gap: 14px;
+  background: #1a1a2e;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #c0c4cc;
+}
+.drawer-meta .up { color: #f56c6c; }
+.drawer-meta .down { color: #67c23a; }
+
+/* 基本面/资金面 items */
+.fund-items {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.fund-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: #1a1a2e;
+  font-size: 12px;
+}
+.fund-item.fi-good    { border-left: 3px solid #67c23a; }
+.fund-item.fi-neutral { border-left: 3px solid #909399; }
+.fund-item.fi-warn    { border-left: 3px solid #e6a23c; }
+.fund-item.fi-bad     { border-left: 3px solid #f56c6c; }
+.fi-score {
+  font-family: monospace;
+  font-weight: 700;
+  font-size: 13px;
+  color: #c0c4cc;
+  min-width: 32px;
+}
+.fi-desc {
+  flex: 1;
+  color: #909399;
+  line-height: 1.5;
+}
+
+.ai-points {
+  padding-left: 18px;
+  margin: 0;
+}
+.ai-points li {
+  font-size: 12px;
+  color: #c0c4cc;
+  line-height: 1.7;
+  margin-bottom: 2px;
+}
+.ap-sub-title {
+  font-size: 11px;
+  color: #909399;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.ap-sub-title.up { color: #67c23a; }
+.ap-sub-title.down { color: #e6a23c; }
+
 .score-card {
   background: #16162a;
   border: 1px solid #2a2a4a;

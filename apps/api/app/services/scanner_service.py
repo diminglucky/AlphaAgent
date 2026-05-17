@@ -1085,23 +1085,22 @@ def scan_potential_stocks(
                 if ev["hard_blocks"]:
                     log.debug("T2 淘汰 %s: %s", r["symbol"], ev["hard_blocks"])
                     return None
-                # 调整分：tier1 score + 基本面 net_score
-                adjusted = max(0, min(100, r["score"] + ev["net_score"]))
+                # 不再修改 r["score"]（Tier-1 技术分保持独立），
+                # 而是把基本面/资金面分数作为独立维度附加
                 r2 = dict(r)
-                r2["score"] = adjusted
-                r2["tier2_score"] = adjusted
                 r2["fundamental"] = {
+                    "quality": ev["quality"],          # 0-25
+                    "flow_score": ev["flow_score"],    # 0-25
+                    "quality_items": ev["quality_items"],
+                    "flow_items": ev["flow_items"],
                     "info": ev["info"],
-                    "flow": ev["flow"],
+                    "fund_flow": ev["fund_flow"],
                     "lhb": ev["lhb"],
-                    "bonus": ev["bonus"],
-                    "penalty": ev["penalty"],
-                    "net_score": ev["net_score"],
                 }
                 return r2
             except Exception as e:
                 log.debug("T2 fund %s failed: %s", r.get("symbol"), e)
-                # 评估失败时不淘汰，只是没有基本面加分
+                # 评估失败时不淘汰，只是没有基本面分
                 return r
 
         with ThreadPoolExecutor(max_workers=10, thread_name_prefix="scanner-t2") as ex:
@@ -1115,7 +1114,7 @@ def scan_potential_stocks(
                 except Exception:
                     pass
 
-        tier2_results.sort(key=lambda x: x["score"], reverse=True)
+        tier2_results.sort(key=lambda x: x["score"], reverse=True)  # 按 Tier-1 技术分排序
         log.info("scanner T2 完成：%d → %d", len(tier1_top), len(tier2_results))
         if progress_callback:
             progress_callback("tier2_done", {"count": len(tier2_results)})
@@ -1124,6 +1123,17 @@ def scan_potential_stocks(
     # Tier 3：LLM 终审（只对 Tier-2 顶部做 LLM 分析）
     # ============================================================
     final_results = tier2_results
+    rejected_list: list[dict] = []
+    # 自动检测：LLM 不可用时跳过 Tier-3
+    if enable_llm:
+        try:
+            from libs.llm_analyst.llm_client import LLMClient
+            if not LLMClient().is_llm_available():
+                log.info("LLM 未配置，自动跳过 Tier-3")
+                enable_llm = False
+        except Exception:
+            enable_llm = False
+
     if enable_llm and tier2_results:
         llm_candidates = tier2_results[:llm_top_n]
         if progress_callback:
@@ -1131,28 +1141,128 @@ def scan_potential_stocks(
 
         def _llm_one(r: dict) -> Optional[dict]:
             try:
-                # 调用 SuperAnalystAgent 做完整的多维度分析
+                # 调用 SuperAnalystAgent 做综合决策
+                # 关键改动：把 Tier-1（技术）+ Tier-2（基本面）的数据全部传给 LLM，
+                # 这样 LLM 不需要重新调工具拉数据，且看到的是和扫描器一致的指标
                 from libs.agents.super_analyst import SuperAnalystAgent
+                from libs.agents.skills import ToolResult
+
+                bars = _get_kline_cached(r["symbol"]) or []
+                quote_data = {
+                    "symbol": r["symbol"],
+                    "name": r.get("name", ""),
+                    "price": r.get("price"),
+                    "change_pct": r.get("change_pct"),
+                    "turnover": r.get("turnover"),
+                }
+                # 把 Tier-1 indicators 重新组织成 Agent 期望的 feature dict
+                ind = r.get("indicators") or {}
+                feat = {
+                    "ma5": ind.get("ma5"), "ma10": ind.get("ma10"),
+                    "ma20": ind.get("ma20"), "ma60": ind.get("ma60"),
+                    "rsi14": ind.get("rsi14"),
+                    "macd_dif": ind.get("macd_dif"), "macd_dea": ind.get("macd_dea"),
+                    "macd_hist": ind.get("macd_hist"),
+                    "kdj_k": ind.get("kdj_k"), "kdj_d": ind.get("kdj_d"), "kdj_j": ind.get("kdj_j"),
+                    "vol_ratio": ind.get("vol_ratio"),
+                    "vol_20d": ind.get("vol_20d_pct"),
+                    "ret_1d": r.get("change_pct"),
+                    "ret_5d": ind.get("ret_5d"),
+                    "ret_20d": ind.get("ret_20d"),
+                    "high_20": ind.get("high_20"), "low_20": ind.get("low_20"),
+                    "high_60": ind.get("high_60"), "low_60": ind.get("low_60"),
+                    "pos_in_20d": ind.get("pos_in_20d"),
+                }
+                pattern_data = {
+                    "trend_20d": "上升" if ind.get("ret_20d", 0) > 5 else ("下降" if ind.get("ret_20d", 0) < -5 else "震荡"),
+                    "above_ma20": (ind.get("ma20") or 0) > 0 and r.get("price", 0) > (ind.get("ma20") or 0),
+                    "patterns": [{"name": s["name"], "desc": s["desc"]} for s in r.get("strategies", [])],
+                }
+
+                # 用 Tier-2 数据补充资金面
+                fund_block = r.get("fundamental") or {}
+                f_info = fund_block.get("info") or {}
+                f_flow = fund_block.get("fund_flow") or {}
+                # 把基本面+资金面整合成 LLM 可读的"intelligence"信号
+                intelligence_text = []
+                if f_info.get("pe") is not None:
+                    intelligence_text.append(f"PE(TTM)={f_info['pe']:.2f}")
+                if f_info.get("pb"):
+                    intelligence_text.append(f"PB={f_info['pb']:.2f}")
+                if f_info.get("float_mv"):
+                    intelligence_text.append(f"流通市值={f_info['float_mv']/1e8:.1f}亿")
+                if f_flow.get("today_net") is not None:
+                    intelligence_text.append(f"今日主力净流入={f_flow['today_net']/1e8:+.2f}亿")
+                if f_flow.get("turnover_rate"):
+                    intelligence_text.append(f"换手率={f_flow['turnover_rate']:.1f}%")
+                lhb_list = fund_block.get("lhb") or []
+                if lhb_list:
+                    intelligence_text.append(f"龙虎榜: {len(lhb_list)} 次上榜")
+
+                # 行业景气度
+                industries = fundamental_service.get_hot_industries(top_n=10)
+                hot_inds_text = "Top10 热门行业: " + " / ".join(
+                    f"{i['name']}({i['change_pct']:+.2f}%)" for i in industries[:10]
+                ) if industries else ""
+
+                # 命中策略
+                strategies_text = "命中策略: " + " / ".join(
+                    s['name'] for s in r.get('strategies', [])
+                ) if r.get('strategies') else "未命中经典策略"
+
+                preloaded = [
+                    ToolResult(call_id=None, name="get_realtime_quote", output=quote_data),
+                    ToolResult(call_id=None, name="get_daily_bars", output={"bars": bars[-30:] if bars else []}),
+                    ToolResult(call_id=None, name="get_technical_features", output=feat),
+                    ToolResult(call_id=None, name="detect_chart_pattern", output=pattern_data),
+                    ToolResult(call_id=None, name="get_support_resistance", output={
+                        "support_levels": [ind.get("low_20"), ind.get("low_60")],
+                        "resistance_levels": [ind.get("high_20"), ind.get("high_60")],
+                    }),
+                    # 给 LLM 一个简化的"new"和"sentiment"，里面塞基本面+行业景气
+                    ToolResult(call_id=None, name="search_news", output={
+                        "news": [{
+                            "title": "扫描器整合数据（基本面+资金面）",
+                            "content": " | ".join(intelligence_text),
+                            "publish_time": "today",
+                        }, {
+                            "title": "行业景气度",
+                            "content": hot_inds_text,
+                            "publish_time": "today",
+                        }, {
+                            "title": "技术形态命中",
+                            "content": strategies_text,
+                            "publish_time": "today",
+                        }],
+                    }),
+                    ToolResult(call_id=None, name="analyze_news_sentiment", output={
+                        "avg_sentiment": 0.1 if (f_flow.get("today_net") or 0) > 0 else -0.1,
+                        "sentiment_label": "中性偏正" if (f_flow.get("today_net") or 0) > 0 else "中性",
+                        "negative_events_count": 0,
+                    }),
+                ]
+
                 agent = SuperAnalystAgent()
                 run = agent.run(
                     f"深度分析 {r['symbol']} {r.get('name', '')}",
-                    context={"symbol": r["symbol"]},
+                    context={
+                        "symbol": r["symbol"],
+                        "preloaded_observations": preloaded,
+                    },
                 )
                 ai = run.final_answer or {}
 
                 action = (ai.get("action") or "").upper()
                 confidence = int(ai.get("confidence") or 0)
-
-                # 在 Tier-3 仅保留：BUY 且 confidence ≥ 60
-                # （留点空间，前端按颜色区分强烈推荐 vs 建议关注）
-                if action not in ("BUY", "HOLD") or confidence < 55:
-                    log.info("T3 淘汰 %s: action=%s conf=%d", r["symbol"], action, confidence)
-                    return None
+                # 区分：LLM 真正运行 vs 规则引擎兜底
+                used_llm = ai.get("llm_powered") is True or ai.get("method") != "fallback_rule_engine"
 
                 r3 = dict(r)
                 r3["ai_analysis"] = {
                     "action": action,
                     "confidence": confidence,
+                    "used_llm": used_llm,  # False = LLM 失败/未配置，是规则引擎兜底
+                    "method": ai.get("method", "llm"),
                     "risk_level": ai.get("risk_level"),
                     "time_horizon": ai.get("time_horizon"),
                     "core_conclusion": ai.get("core_conclusion", {}),
@@ -1164,16 +1274,20 @@ def scan_potential_stocks(
                     "buy_price_high": ai.get("buy_price_high"),
                     "stop_loss": ai.get("stop_loss"),
                     "take_profit": ai.get("take_profit"),
+                    "rejected_reason": None,
                 }
-                # 综合分：Tier2 分数 × 0.6 + LLM 置信度 × 0.4
-                r3["score"] = round(r["score"] * 0.6 + confidence * 0.4)
-                r3["tier3_score"] = r3["score"]
+
+                # AI 立场不达标：标记为 rejected 但保留信息
+                if action not in ("BUY", "HOLD") or confidence < 55:
+                    r3["ai_analysis"]["rejected_reason"] = f"AI 评级 {action} / 把握度 {confidence}%（不推荐）"
+                    r3["_ai_rejected"] = True
+                    log.info("T3 AI 不推荐 %s: action=%s conf=%d", r["symbol"], action, confidence)
+
                 return r3
             except Exception as e:
                 log.warning("T3 LLM %s failed: %s", r.get("symbol"), e)
-                # LLM 失败的不丢弃，但 score 不调整，标注未审
                 r3 = dict(r)
-                r3["ai_analysis"] = {"error": str(e)}
+                r3["ai_analysis"] = {"error": str(e)[:200]}
                 return r3
 
         # 并行调用 LLM（限制并发避免触发限流）
@@ -1194,16 +1308,59 @@ def scan_potential_stocks(
                 except Exception:
                     pass
 
-        final_results.sort(key=lambda x: x.get("score", 0), reverse=True)
-        log.info("scanner T3 完成：LLM 复审 %d → AI 推荐 %d", len(llm_candidates), len(final_results))
-        if progress_callback:
-            progress_callback("tier3_done", {"count": len(final_results)})
+        # 排序：BUY > HOLD > 其他；同档内按 confidence + 综合分
+        def _sort_key(r):
+            ai = r.get("ai_analysis") or {}
+            action = ai.get("action") or ""
+            conf = ai.get("confidence") or 0
+            tech = r.get("score", 0)
+            quality = (r.get("fundamental") or {}).get("quality", 0)
+            flow = (r.get("fundamental") or {}).get("flow_score", 0)
+            # 综合分（用于同档排序）：技术 + 基本面 + 资金面 + AI 置信度
+            composite = tech * 0.4 + quality * 1.2 + flow * 1.2 + conf * 0.4
+            # 三档：1 = BUY, 2 = HOLD, 3 = 其他
+            tier = 1 if action == "BUY" else (2 if action == "HOLD" else 3)
+            # rejected 一律降到第 4 档
+            if r.get("_ai_rejected"):
+                tier = 4
+            return (tier, -composite)
 
-    final_results = final_results[:top_n]
+        final_results.sort(key=_sort_key)
+        # 把 rejected 和正常分开计数
+        recommended = [r for r in final_results if not r.get("_ai_rejected")]
+        rejected = [r for r in final_results if r.get("_ai_rejected")]
+        log.info("scanner T3 完成：LLM 复审 %d → AI 推荐 %d，AI 否决 %d",
+                 len(llm_candidates), len(recommended), len(rejected))
+        if progress_callback:
+            progress_callback("tier3_done", {
+                "count": len(recommended),
+                "rejected": len(rejected),
+            })
+
+    # 推荐列表：未被 AI 否决的；保留 rejected 列表给前端显示
+    recommended_list = [r for r in final_results if not r.get("_ai_rejected")][:top_n]
+    rejected_list = [r for r in final_results if r.get("_ai_rejected")]
+    final_results = recommended_list
 
     elapsed = round((time.monotonic() - t0) * 1000, 1)
-    log.info("scanner: 三层漏斗完成，输出 %d 只 AI 推荐潜力股，耗时 %.0fms",
-             len(final_results), elapsed)
+    log.info("scanner: 三层漏斗完成，AI 推荐 %d / AI 否决 %d，耗时 %.0fms",
+             len(final_results), len(rejected_list) if enable_llm else 0, elapsed)
+
+    # 同时输出大盘行业排行（前端可用于显示）
+    hot_inds = fundamental_service.get_hot_industries(top_n=10)
+
+    # 检测 LLM 实际运行状态（盘点 Tier-3 中实际有多少只用了真 LLM）
+    llm_status = "disabled"
+    if enable_llm:
+        all_t3 = final_results + rejected_list
+        llm_used = [r for r in all_t3 if (r.get("ai_analysis") or {}).get("used_llm")]
+        rule_used = [r for r in all_t3 if (r.get("ai_analysis") or {}).get("used_llm") is False]
+        if rule_used and not llm_used:
+            llm_status = "all_failed"  # LLM 全失败（如余额不足）
+        elif rule_used:
+            llm_status = "partial"  # 部分失败
+        else:
+            llm_status = "ok"
 
     output = {
         "scanned": len(all_quotes),
@@ -1211,9 +1368,12 @@ def scan_potential_stocks(
         "analyzed": len(pool),
         "tier1_count": len(tier1_top),
         "tier2_count": len(tier2_results) if enable_fundamental else None,
-        "tier3_count": len(final_results) if enable_llm else None,
+        "tier3_count": (len(final_results) + len(rejected_list)) if enable_llm else None,
         "results": final_results,
+        "rejected_results": rejected_list if enable_llm else [],
         "market_status": market_status,
+        "hot_industries": hot_inds,
+        "llm_status": llm_status,
         "elapsed_ms": elapsed,
         "cached": False,
         "params": {

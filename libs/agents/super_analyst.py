@@ -267,7 +267,13 @@ class SuperAnalystAgent:
                 raise ValueError(f"无法从 goal 中提取股票代码: {goal!r}")
 
             # 2. Phase 1：并行调用所有工具
-            observations = self._run_tools_parallel(symbol, ctx, run)
+            #    （扫描器场景下可以传入 preloaded_observations 跳过工具调用，
+            #     避免重复拉取 K 线/行情/新闻，且让 LLM 看到与 Tier-1/Tier-2 一致的指标）
+            preloaded = ctx.get("preloaded_observations")
+            if preloaded:
+                observations = preloaded
+            else:
+                observations = self._run_tools_parallel(symbol, ctx, run)
 
             # 3. Phase 2：LLM 综合 or 规则引擎
             if run.llm_powered:
@@ -567,9 +573,17 @@ KDJ: K={feat.get('kdj_k', 'N/A')}  D={feat.get('kdj_d', 'N/A')}  J={feat.get('kd
             if not raw:
                 raise ValueError("LLM 返回空响应")
 
+            # 检测 LLM 客户端错误（如余额不足/限流/超时）
+            if raw.startswith("[LLM error:") or raw.startswith("[LLM 错误"):
+                raise ValueError(f"LLM 调用失败: {raw[:200]}")
+
             result = self._parse_llm_final(raw)
             if not result:
                 raise ValueError("JSON 解析失败")
+
+            # 检测解析后是兜底的 WATCH/raw_response 模式（说明 JSON 解析没成功）
+            if result.get("raw_response") and not result.get("core_conclusion"):
+                raise ValueError(f"LLM 输出非 JSON 格式: {raw[:200]}")
 
             result.setdefault("symbol", symbol)
             result.setdefault("name", quote.get("name", symbol))

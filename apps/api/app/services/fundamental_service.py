@@ -40,6 +40,13 @@ _market_flow_ts: float = 0.0
 _market_flow_lock = threading.Lock()
 _MARKET_FLOW_TTL = 3600  # 1 hour
 
+# 行业热度缓存（每天刷新，盘中按上涨幅度排名）
+_hot_industries: list[dict] = []  # [{name, change_pct, net_inflow, leader, leader_pct}]
+_hot_concepts: list[dict] = []
+_industry_ts: float = 0.0
+_industry_lock = threading.Lock()
+_INDUSTRY_TTL = 1800  # 30 min
+
 
 def _ak():
     import akshare as ak
@@ -210,6 +217,90 @@ def get_fund_flow(symbol: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 行业景气度（行业排名 + 资金流）
+# ---------------------------------------------------------------------------
+
+def _ensure_industries():
+    """拉取行业 + 概念资金流数据，按涨幅+净流入排序"""
+    global _hot_industries, _hot_concepts, _industry_ts
+    with _industry_lock:
+        if _hot_industries and (time.monotonic() - _industry_ts) < _INDUSTRY_TTL:
+            return
+        try:
+            ak = _ak()
+            # 行业资金流（同花顺源）
+            df_ind = ak.stock_fund_flow_industry()
+            inds = []
+            for _, row in df_ind.iterrows():
+                name = str(row.get("行业", "")).strip()
+                if not name:
+                    continue
+                pct = _safe_float(str(row.get("行业-涨跌幅") or "0").replace("%", ""))
+                inds.append({
+                    "name": name,
+                    "change_pct": pct or 0,
+                    "net_inflow": _parse_amt(row.get("净额")),
+                    "leader": str(row.get("领涨股", "")),
+                    "leader_pct": _safe_float(str(row.get("领涨股-涨跌幅") or "0").replace("%", "")),
+                    "company_count": int(row.get("公司家数") or 0),
+                })
+            inds.sort(key=lambda x: (x["change_pct"], x.get("net_inflow") or 0), reverse=True)
+            _hot_industries = inds
+
+            # 概念
+            df_con = ak.stock_fund_flow_concept()
+            cons = []
+            for _, row in df_con.iterrows():
+                name = str(row.get("行业", "")).strip()
+                if not name:
+                    continue
+                pct = _safe_float(str(row.get("行业-涨跌幅") or "0").replace("%", ""))
+                cons.append({
+                    "name": name,
+                    "change_pct": pct or 0,
+                    "net_inflow": _parse_amt(row.get("净额")),
+                    "leader": str(row.get("领涨股", "")),
+                    "leader_pct": _safe_float(str(row.get("领涨股-涨跌幅") or "0").replace("%", "")),
+                    "company_count": int(row.get("公司家数") or 0),
+                })
+            cons.sort(key=lambda x: (x["change_pct"], x.get("net_inflow") or 0), reverse=True)
+            _hot_concepts = cons
+            _industry_ts = time.monotonic()
+            log.info("行业景气度刷新: %d 个行业 / %d 个概念", len(inds), len(cons))
+        except Exception as e:
+            log.warning("行业景气度拉取失败: %s", str(e)[:100])
+
+
+def get_hot_industries(top_n: int = 20) -> list[dict]:
+    """获取热门行业 Top N（按涨幅排序）"""
+    _ensure_industries()
+    return _hot_industries[:top_n]
+
+
+def get_hot_concepts(top_n: int = 20) -> list[dict]:
+    """获取热门概念 Top N"""
+    _ensure_industries()
+    return _hot_concepts[:top_n]
+
+
+def get_industry_rank(industry_name: str) -> Optional[dict]:
+    """返回某个行业的排名信息：排名 / 总数 / 涨幅 / 净流入"""
+    _ensure_industries()
+    if not _hot_industries or not industry_name:
+        return None
+    for i, ind in enumerate(_hot_industries):
+        if ind["name"] == industry_name or ind["name"] in industry_name or industry_name in ind["name"]:
+            return {
+                "rank": i + 1,
+                "total": len(_hot_industries),
+                "change_pct": ind["change_pct"],
+                "net_inflow": ind.get("net_inflow"),
+                "matched_name": ind["name"],
+            }
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 龙虎榜：每天全市场拉一次
 # ---------------------------------------------------------------------------
 
@@ -263,14 +354,13 @@ def get_lhb_record(symbol: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def evaluate_fundamental(symbol: str, name: str = "") -> dict:
-    """对单股做基本面 + 资金面综合评估，返回：
+    """对单股做基本面 + 资金面综合评估，返回独立的多维评分（不再混合到一个数字）：
+
       - hard_blocks: 一票否决的原因列表（非空时直接淘汰）
-      - bonus: 加分项（list of (desc, score)）
-      - penalty: 扣分项（list of (desc, score)）
-      - net_score: 综合调整分（-30 ~ +30）
-      - info: 基本面 dict
-      - flow: 资金面 dict
-      - lhb: 龙虎榜 list
+      - quality: 基本面质量分（0-25），看 PE/盘子/亏损
+      - flow_score: 资金面分（0-25），看主力净流入/龙虎榜/换手健康度
+      - quality_items / flow_items: 各维度的明细（含分数和原因）
+      - info, fund_flow, lhb: 原始数据
     """
     info = get_stock_info(symbol)
     if not info["name"] and name:
@@ -278,100 +368,149 @@ def evaluate_fundamental(symbol: str, name: str = "") -> dict:
     if name and ("ST" in name or "*ST" in name):
         info["is_st"] = True
 
-    flow = get_fund_flow(symbol)
+    fund_flow = get_fund_flow(symbol)
     lhb = get_lhb_record(symbol)
 
     blocks: list[str] = []
-    bonus: list[tuple[str, int]] = []
-    penalty: list[tuple[str, int]] = []
 
     # === 一票否决（hard_blocks）===
     if info.get("is_st"):
-        blocks.append("ST 风险股，建议规避")
+        blocks.append("ST 风险股")
 
     days_listed = info.get("days_listed")
     if days_listed is not None and days_listed < 60:
-        blocks.append(f"上市仅 {days_listed} 天（次新股，价格不稳）")
+        blocks.append(f"上市仅 {days_listed} 天（次新股）")
 
     float_mv = info.get("float_mv")
-    if float_mv is not None and float_mv > 0 and float_mv < 30e8:
-        blocks.append(f"流通市值仅 {float_mv/1e8:.1f} 亿（小盘庄股温床）")
+    if float_mv is not None and 0 < float_mv < 30e8:
+        blocks.append(f"流通市值仅 {float_mv/1e8:.1f} 亿（小盘风险高）")
 
-    # PE 严重异常一票否决
     pe = info.get("pe")
     if pe is not None:
-        if pe < 0 and abs(pe) > 200:
-            blocks.append(f"PE={pe:.1f}（深度亏损）")
+        if pe < -100:  # 严重亏损
+            blocks.append(f"PE={pe:.0f}（严重亏损）")
         elif pe > 200:
-            blocks.append(f"PE={pe:.1f}（估值严重过高）")
+            blocks.append(f"PE={pe:.0f}（估值严重过高）")
 
-    # 龙虎榜负面：上榜原因含「跌幅偏离值」+ 净卖出
+    # 龙虎榜负面：跌幅净卖出
     for r in lhb:
         if "跌幅" in r["reason"] and r["net_buy"] < -1e7:
-            blocks.append(f"龙虎榜：{r['date']} {r['reason']}，机构净卖出 {r['net_buy']/1e8:.2f}亿")
+            blocks.append(f"龙虎榜异动卖出：{r['reason']}")
             break
 
-    # === 加分项 ===
-    # 中等盘子（30-200 亿流通市值，机构关注且不易被操纵）
+    # === 基本面质量分（0-25）===
+    quality_items: list[dict] = []
+    quality = 0
+
+    # 估值（10 分）
+    if pe is not None:
+        if 0 < pe <= 20:
+            quality += 10
+            quality_items.append({"score": 10, "desc": f"PE={pe:.1f}（低估值）", "kind": "good"})
+        elif 20 < pe <= 35:
+            quality += 7
+            quality_items.append({"score": 7, "desc": f"PE={pe:.1f}（合理估值）", "kind": "good"})
+        elif 35 < pe <= 60:
+            quality += 4
+            quality_items.append({"score": 4, "desc": f"PE={pe:.1f}（估值偏高）", "kind": "neutral"})
+        elif 60 < pe <= 100:
+            quality += 1
+            quality_items.append({"score": 1, "desc": f"PE={pe:.1f}（估值高）", "kind": "warn"})
+        elif 100 < pe <= 200:
+            quality_items.append({"score": 0, "desc": f"PE={pe:.1f}（估值过高）", "kind": "warn"})
+        else:
+            quality_items.append({"score": 0, "desc": f"PE={pe:.0f}（亏损中）", "kind": "warn"})
+    else:
+        quality_items.append({"score": 0, "desc": "PE 数据缺失", "kind": "neutral"})
+
+    # 盘子（10 分）
     if float_mv is not None:
-        if 30e8 <= float_mv <= 200e8:
-            bonus.append((f"流通市值 {float_mv/1e8:.0f}亿，盘子适中", 5))
-        elif 200e8 < float_mv <= 1000e8:
-            bonus.append((f"流通市值 {float_mv/1e8:.0f}亿，机构重仓股", 3))
+        fmv_yi = float_mv / 1e8
+        if 50 <= fmv_yi <= 300:
+            quality += 10
+            quality_items.append({"score": 10, "desc": f"流通市值 {fmv_yi:.0f}亿（机构友好盘子）", "kind": "good"})
+        elif 300 < fmv_yi <= 1000:
+            quality += 7
+            quality_items.append({"score": 7, "desc": f"流通市值 {fmv_yi:.0f}亿（机构重仓）", "kind": "good"})
+        elif 30 <= fmv_yi < 50:
+            quality += 5
+            quality_items.append({"score": 5, "desc": f"流通市值 {fmv_yi:.0f}亿（中小盘）", "kind": "neutral"})
+        elif fmv_yi > 1000:
+            quality += 3
+            quality_items.append({"score": 3, "desc": f"流通市值 {fmv_yi:.0f}亿（超大盘，涨速慢）", "kind": "neutral"})
+    else:
+        quality_items.append({"score": 0, "desc": "市值数据缺失", "kind": "neutral"})
 
-    # PE 合理估值
-    if pe is not None and 0 < pe <= 30:
-        bonus.append((f"PE={pe:.1f}，估值合理", 4))
-    elif pe is not None and 30 < pe <= 60:
-        bonus.append((f"PE={pe:.1f}，估值偏高但可接受", 1))
+    # PB 估值（5 分）
+    pb = info.get("pb")
+    if pb is not None and pb > 0:
+        if pb <= 2:
+            quality += 5
+            quality_items.append({"score": 5, "desc": f"PB={pb:.2f}（低估值）", "kind": "good"})
+        elif 2 < pb <= 5:
+            quality += 3
+            quality_items.append({"score": 3, "desc": f"PB={pb:.2f}（合理）", "kind": "neutral"})
+        elif pb > 10:
+            quality_items.append({"score": 0, "desc": f"PB={pb:.2f}（高估）", "kind": "warn"})
 
-    # 资金面：当日主力净流入
-    today_net = flow.get("today_net")
+    # === 资金面分（0-25）===
+    flow_items: list[dict] = []
+    flow_score = 0
+
+    today_net = fund_flow.get("today_net")
     if today_net is not None:
-        if today_net > 1e8:
-            bonus.append((f"今日主力净流入 {today_net/1e8:.2f}亿，资金强势", 8))
-        elif today_net > 0.3e8:
-            bonus.append((f"今日主力净流入 {today_net/1e8:.2f}亿", 4))
+        if today_net > 2e8:
+            flow_score += 12
+            flow_items.append({"score": 12, "desc": f"主力净流入 {today_net/1e8:.2f}亿（资金强势）", "kind": "good"})
+        elif today_net > 5e7:
+            flow_score += 8
+            flow_items.append({"score": 8, "desc": f"主力净流入 {today_net/1e8:.2f}亿", "kind": "good"})
+        elif today_net > 0:
+            flow_score += 4
+            flow_items.append({"score": 4, "desc": f"主力小幅净流入 {today_net/1e8:.2f}亿", "kind": "neutral"})
+        elif today_net > -5e7:
+            flow_items.append({"score": 0, "desc": f"主力净流出 {abs(today_net)/1e8:.2f}亿", "kind": "warn"})
+        else:
+            flow_items.append({"score": 0, "desc": f"主力大幅净流出 {abs(today_net)/1e8:.2f}亿", "kind": "bad"})
+    else:
+        flow_items.append({"score": 0, "desc": "资金流数据缺失", "kind": "neutral"})
 
-    # 换手率合理（活跃但不过热）
-    tor = flow.get("turnover_rate")
-    if tor is not None and 2 <= tor <= 8:
-        bonus.append((f"换手率 {tor:.1f}%（活跃度健康）", 3))
+    # 换手率（5 分）
+    tor = fund_flow.get("turnover_rate")
+    if tor is not None:
+        if 3 <= tor <= 10:
+            flow_score += 5
+            flow_items.append({"score": 5, "desc": f"换手 {tor:.1f}%（健康活跃）", "kind": "good"})
+        elif 10 < tor <= 20:
+            flow_score += 3
+            flow_items.append({"score": 3, "desc": f"换手 {tor:.1f}%（活跃偏高）", "kind": "neutral"})
+        elif tor > 20:
+            flow_items.append({"score": 0, "desc": f"换手 {tor:.1f}%（过热风险）", "kind": "warn"})
+        elif tor < 1:
+            flow_items.append({"score": 0, "desc": f"换手仅 {tor:.1f}%（流动性差）", "kind": "warn"})
 
-    # 龙虎榜机构净买入
+    # 龙虎榜机构买入（8 分）
     for r in lhb:
         if r["net_buy"] > 5e7 and "机构" in r["interpret"]:
-            bonus.append((f"龙虎榜：{r['date']} 机构净买入 {r['net_buy']/1e8:.2f}亿", 8))
+            flow_score += 8
+            flow_items.append({
+                "score": 8,
+                "desc": f"龙虎榜：{r['date']} 机构净买入 {r['net_buy']/1e8:.2f}亿",
+                "kind": "good"
+            })
             break
 
-    # === 扣分项 ===
-    if pe is not None:
-        if 100 < pe <= 200:
-            penalty.append((f"PE={pe:.1f}，估值偏高", -6))
-        elif pe < 0:
-            penalty.append((f"PE={pe:.1f}（亏损）", -8))
-
-    if float_mv is not None and float_mv > 1000e8:
-        penalty.append((f"市值 {float_mv/1e8:.0f}亿，盘子过大涨速慢", -3))
-
-    if today_net is not None and today_net < -0.5e8:
-        penalty.append((f"今日主力净流出 {abs(today_net)/1e8:.2f}亿", -8))
-
-    if tor is not None:
-        if tor > 20:
-            penalty.append((f"换手率 {tor:.1f}%（过热）", -5))
-        elif tor < 0.5:
-            penalty.append((f"换手率仅 {tor:.1f}%（流动性差）", -3))
-
-    net_score = sum(s for _, s in bonus) + sum(s for _, s in penalty)
+    quality = max(0, min(25, quality))
+    flow_score = max(0, min(25, flow_score))
 
     return {
         "hard_blocks": blocks,
-        "bonus": [{"desc": d, "score": s} for d, s in bonus],
-        "penalty": [{"desc": d, "score": s} for d, s in penalty],
-        "net_score": net_score,
+        "quality": quality,
+        "flow_score": flow_score,
+        "quality_items": quality_items,
+        "flow_items": flow_items,
         "info": info,
-        "flow": flow,
+        "fund_flow": fund_flow,
         "lhb": lhb,
     }
 
@@ -379,9 +518,13 @@ def evaluate_fundamental(symbol: str, name: str = "") -> dict:
 def clear_cache():
     """清除所有缓存"""
     global _info_cache, _flow_cache, _lhb_cache, _lhb_ts, _market_flow_cache, _market_flow_ts
+    global _hot_industries, _hot_concepts, _industry_ts
     _info_cache.clear()
     _flow_cache.clear()
     _market_flow_cache = {}
     _market_flow_ts = 0.0
     _lhb_cache = {}
     _lhb_ts = 0.0
+    _hot_industries = []
+    _hot_concepts = []
+    _industry_ts = 0.0
