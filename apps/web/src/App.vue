@@ -3,7 +3,7 @@
     <!-- 顶部导航 -->
     <el-header class="app-header">
       <div class="header-left">
-        <span class="logo">📈 A股智能助手</span>
+        <span class="logo">🤖 AlphaAgent</span>
       </div>
       <el-menu
         mode="horizontal"

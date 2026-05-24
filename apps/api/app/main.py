@@ -30,7 +30,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app_name,
         version="2.0.0",
-        description="A股智能助手 — 实时行情 + Agent分析 + 飞书提醒",
+        description="AlphaAgent — 实时行情 + AI Agent分析 + 飞书提醒",
         lifespan=lifespan,
     )
 

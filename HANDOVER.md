@@ -1,7 +1,7 @@
 # 📋 项目交接文档
 
-> 项目：A 股智能助手  
-> 仓库：`git@github.com:diminglucky/liangHuaJiaoYi.git`  
+> 项目：AlphaAgent (A股智能助手)  
+> 仓库：`git@github.com:diminglucky/AlphaAgent.git`  
 > 当前 HEAD：`aa650f8`
 
 本文档记录项目结构、设计决策、已修复问题、运维注意事项和后续路线。新接手的开发者读完这份文档应该能在 30 分钟内上手。
@@ -240,7 +240,7 @@ git log --oneline
 # cfdf520 feat: 潜力扫描升级为三层漏斗+AI 终审
 # 2dc22f9 fix(agent): 重写决策天平
 # 41aa24b fix: 全面修复 32 项逻辑漏洞 + 潜力扫描升级
-# b94f97d feat: 重构为 A 股智能助手
+# b94f97d feat: 重构为 AlphaAgent (A股智能助手)
 ```
 
 ---
@@ -522,7 +522,7 @@ git push origin main
 ```
 
 历史关键 commit：
-- `b94f97d` 重构为 A 股智能助手（删除 19 表→4 表）
+- `b94f97d` 重构为 AlphaAgent (A股智能助手)（删除 19 表→4 表）
 - `41aa24b` 全面修复 32 项逻辑漏洞
 - `2dc22f9` Agent 决策天平重写（让 AI 主动给立场）
 - `cfdf520` 潜力扫描升级为三层漏斗 + AI 终审
@@ -533,7 +533,7 @@ git push origin main
 ## 十一、联系方式与已知 Owner
 
 > 项目作者：diminglucky  
-> GitHub：https://github.com/diminglucky/liangHuaJiaoYi
+> GitHub：https://github.com/diminglucky/AlphaAgent
 
 **重要约定**：
 - 这只是个人投资辅助工具，**不是金融机构产品**

@@ -373,7 +373,7 @@ async function testFeishu() {
   testingFeishu.value = true
   feishuResult.value = null
   try {
-    await http.post('/notify/test', { title: '测试消息', content: '飞书机器人配置成功！来自 A股智能助手。' })
+    await http.post('/notify/test', { title: '测试消息', content: '飞书机器人配置成功！来自 AlphaAgent。' })
     feishuResult.value = { ok: true, msg: '✓ 发送成功' }
   } catch (e) {
     feishuResult.value = { ok: false, msg: '✗ 发送失败：' + e.message }

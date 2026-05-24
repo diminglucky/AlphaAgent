@@ -12,7 +12,7 @@ def _bool(key: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
-    app_name: str = os.getenv("QUANT_APP_NAME", "A股智能助手")
+    app_name: str = os.getenv("QUANT_APP_NAME", "AlphaAgent")
     api_v1_prefix: str = "/api/v1"
     database_url: str = os.getenv("QUANT_DATABASE_URL", "sqlite:///./var/quant.db")
 

@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "a-share-quant-assistant"
+name = "alpha-agent"
 version = "2.0.0"
-description = "A股智能助手 — 实时行情 + Agent分析 + 飞书提醒"
+description = "AlphaAgent — 实时行情 + AI Agent分析 + 飞书提醒"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.110,<1.0",

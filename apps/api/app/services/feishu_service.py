@@ -60,7 +60,7 @@ def send_feishu(title: str, content: str, color: str = "blue") -> bool:
                     "tag": "note",
                     "elements": [{
                         "tag": "plain_text",
-                        "content": f"A股智能助手 · {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                        "content": f"AlphaAgent · {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                     }],
                 },
             ],
