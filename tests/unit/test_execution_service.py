@@ -1,19 +1,29 @@
-from apps.api.app.schemas.execution import OrderSimulationRequest
-from apps.api.app.services.execution_service import ExecutionService
+from apps.qmt_gateway.backends import MockBackend, PlaceOrder
 
 
-def test_simulate_order_accepts_reasonable_buy() -> None:
-    service = ExecutionService()
+def test_qmt_mock_market_order_auto_fills() -> None:
+    backend = MockBackend(initial_cash=50_000)
+    order = backend.place_order(PlaceOrder(
+        symbol="000001.SZ",
+        side="BUY",
+        quantity=100,
+        order_type="MARKET",
+    ))
 
-    result = service.simulate_order(
-        OrderSimulationRequest(
-            symbol="300750.SZ",
-            side="BUY",
-            quantity=100,
-            price=236.8,
-        )
-    )
+    assert order.status == "FILLED"
+    assert order.filled_quantity == 100
+    assert backend.get_account().cash < 50_000
 
-    assert result["accepted"] is True
-    assert result["remaining_cash_after_order"] > 0
 
+def test_qmt_mock_cancel_pending_order() -> None:
+    backend = MockBackend()
+    order = backend.place_order(PlaceOrder(
+        symbol="000001.SZ",
+        side="BUY",
+        quantity=100,
+        order_type="LIMIT",
+        price=10.0,
+    ))
+
+    cancelled = backend.cancel_order(order.order_id)
+    assert cancelled.status == "CANCELLED"

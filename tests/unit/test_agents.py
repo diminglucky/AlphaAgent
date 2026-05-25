@@ -9,6 +9,47 @@ from libs.agents.market_scout import MarketScoutAgent
 from libs.agents.portfolio_guardian import PortfolioGuardianAgent
 
 
+def _sample_bars(n: int = 80) -> list[dict]:
+    bars = []
+    for i in range(n):
+        close = 10.0 + i * 0.1
+        bars.append({
+            "date": f"2026-04-{(i % 28) + 1:02d}",
+            "open": close - 0.05,
+            "high": close + 0.2,
+            "low": close - 0.2,
+            "close": close,
+            "volume": 100_000 + i,
+            "amount": 1_000_000 + i * 1000,
+            "change_pct": 1.0,
+        })
+    return bars
+
+
+def _patch_market(monkeypatch) -> None:
+    from apps.api.app.services import market_service
+
+    hot = [
+        {
+            "symbol": f"00000{i}.SZ",
+            "name": f"样本{i}",
+            "price": 10 + i,
+            "change": 0.1,
+            "change_pct": 1.0 + i,
+            "volume": 1000,
+            "turnover": 1_000_000,
+        }
+        for i in range(1, 8)
+    ]
+    monkeypatch.setattr(market_service, "get_hot_stocks", lambda top_n=50: hot[:top_n])
+    monkeypatch.setattr(market_service, "get_kline", lambda symbol, period="daily", count=120: _sample_bars(count))
+    monkeypatch.setattr(
+        market_service,
+        "get_single_quote",
+        lambda symbol: {"symbol": symbol, "name": symbol, "price": 18.0, "change_pct": 1.0},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Skill registry
 # ---------------------------------------------------------------------------
@@ -36,7 +77,8 @@ def test_skill_openai_format() -> None:
 # Skill execution (smoke)
 # ---------------------------------------------------------------------------
 
-def test_list_universe_returns_data() -> None:
+def test_list_universe_returns_data(monkeypatch) -> None:
+    _patch_market(monkeypatch)
     reg = get_default_registry()
     res = reg.execute(ToolCall(name="list_universe", arguments={"max_count": 5}))
     assert res.error is None
@@ -45,7 +87,8 @@ def test_list_universe_returns_data() -> None:
     assert "symbol" in res.output[0]
 
 
-def test_get_technical_features_for_real_symbol() -> None:
+def test_get_technical_features_for_real_symbol(monkeypatch) -> None:
+    _patch_market(monkeypatch)
     reg = get_default_registry()
     # 002230.SZ exists only in extended universe → 60 synthetic bars
     res = reg.execute(ToolCall(
@@ -54,10 +97,11 @@ def test_get_technical_features_for_real_symbol() -> None:
     assert res.error is None
     out = res.output
     assert out["symbol"] == "002230.SZ"
-    assert "current_close" in out
+    assert "current" in out
 
 
-def test_detect_chart_pattern() -> None:
+def test_detect_chart_pattern(monkeypatch) -> None:
+    _patch_market(monkeypatch)
     reg = get_default_registry()
     res = reg.execute(ToolCall(
         name="detect_chart_pattern", arguments={"symbol": "002230.SZ"},

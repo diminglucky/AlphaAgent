@@ -15,6 +15,7 @@ dependencies = [
   "httpx>=0.27,<1.0",
   "akshare>=1.17.00,<2.0",
   "python-dotenv>=1.0,<2.0",
+  "pandas>=2.0,<3.0",
 ]
 
 [project.optional-dependencies]
@@ -24,4 +25,10 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["apps*", "libs*"]
+include = ["apps*", "libs*", "pipelines*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+markers = [
+  "replay: deterministic replay-style checks",
+]

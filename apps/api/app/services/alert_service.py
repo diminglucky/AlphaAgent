@@ -19,13 +19,6 @@ _position_alert_lock = threading.Lock()
 _POSITION_ALERT_COOLDOWN = timedelta(hours=2)  # 同一只股票同类告警 2 小时内不重发
 
 
-def _send_feishu_async(fn, *args, **kwargs):
-    """飞书发送移到后台线程，避免阻塞 quote_loop"""
-    threading.Thread(
-        target=lambda: fn(*args, **kwargs),
-        daemon=True,
-        name="feishu-async",
-    ).start()
 
 
 def check_price_alerts(db: Session, quotes: list[dict]) -> list[dict]:

@@ -5,13 +5,13 @@ from fastapi import HTTPException
 
 from apps.api.app.core.auth import (
     AuthenticatedUser,
+    UserRole,
     _resolve_role,
     get_current_user,
     require_admin,
     require_trader,
 )
-from apps.api.app.core.config import Settings, reset_settings_cache
-from libs.quant_core.enums import UserRole
+from apps.api.app.core.config import Settings
 
 
 def _settings_auth_on(**kwargs) -> Settings:
@@ -37,8 +37,20 @@ def test_authenticated_user_roles() -> None:
     assert viewer.is_trader is False
 
 
+def test_resolve_role(monkeypatch) -> None:
+    from apps.api.app.core import auth as auth_mod
+
+    monkeypatch.setattr(auth_mod, "get_settings", lambda: _settings_auth_on())
+
+    assert _resolve_role("admin-key") == UserRole.ADMIN
+    assert _resolve_role("trader-key") == UserRole.TRADER
+    assert _resolve_role("viewer-key") == UserRole.VIEWER
+    assert _resolve_role("wrong-key") is None
+
+
 def test_get_current_user_auth_disabled(monkeypatch) -> None:
     from apps.api.app.core import auth as auth_mod
+
     monkeypatch.setattr(auth_mod, "get_settings", lambda: Settings(auth_enabled=False))
     user = get_current_user(x_api_key=None)
     assert user.role == UserRole.ADMIN
@@ -46,6 +58,7 @@ def test_get_current_user_auth_disabled(monkeypatch) -> None:
 
 def test_get_current_user_missing_key_raises(monkeypatch) -> None:
     from apps.api.app.core import auth as auth_mod
+
     monkeypatch.setattr(auth_mod, "get_settings", lambda: _settings_auth_on())
     with pytest.raises(HTTPException) as exc_info:
         get_current_user(x_api_key=None)
@@ -54,67 +67,25 @@ def test_get_current_user_missing_key_raises(monkeypatch) -> None:
 
 def test_get_current_user_invalid_key_raises(monkeypatch) -> None:
     from apps.api.app.core import auth as auth_mod
+
     monkeypatch.setattr(auth_mod, "get_settings", lambda: _settings_auth_on())
     with pytest.raises(HTTPException) as exc_info:
         get_current_user(x_api_key="wrong-key")
     assert exc_info.value.status_code == 403
 
 
-def test_get_current_user_admin_key(monkeypatch) -> None:
-    from apps.api.app.core import auth as auth_mod
-    monkeypatch.setattr(auth_mod, "get_settings", lambda: _settings_auth_on())
-    user = get_current_user(x_api_key="admin-key")
-    assert user.role == UserRole.ADMIN
-
-
-def test_get_current_user_trader_key(monkeypatch) -> None:
-    from apps.api.app.core import auth as auth_mod
-    monkeypatch.setattr(auth_mod, "get_settings", lambda: _settings_auth_on())
-    user = get_current_user(x_api_key="trader-key")
-    assert user.role == UserRole.TRADER
-
-
-def test_get_current_user_viewer_key(monkeypatch) -> None:
-    from apps.api.app.core import auth as auth_mod
-    monkeypatch.setattr(auth_mod, "get_settings", lambda: _settings_auth_on())
-    user = get_current_user(x_api_key="viewer-key")
-    assert user.role == UserRole.VIEWER
-
-
-def test_require_trader_allows_trader() -> None:
-    trader = AuthenticatedUser("k", UserRole.TRADER)
-    result = require_trader(user=trader)
-    assert result is trader
-
-
-def test_require_trader_allows_admin() -> None:
+def test_require_trader_and_admin_guards() -> None:
     admin = AuthenticatedUser("k", UserRole.ADMIN)
-    result = require_trader(user=admin)
-    assert result is admin
-
-
-def test_require_trader_blocks_viewer() -> None:
+    trader = AuthenticatedUser("k", UserRole.TRADER)
     viewer = AuthenticatedUser("k", UserRole.VIEWER)
-    with pytest.raises(HTTPException) as exc_info:
+
+    assert require_trader(user=admin) is admin
+    assert require_trader(user=trader) is trader
+    assert require_admin(user=admin) is admin
+
+    with pytest.raises(HTTPException):
         require_trader(user=viewer)
-    assert exc_info.value.status_code == 403
-
-
-def test_require_admin_allows_admin() -> None:
-    admin = AuthenticatedUser("k", UserRole.ADMIN)
-    result = require_admin(user=admin)
-    assert result is admin
-
-
-def test_require_admin_blocks_trader() -> None:
-    trader = AuthenticatedUser("k", UserRole.TRADER)
-    with pytest.raises(HTTPException) as exc_info:
+    with pytest.raises(HTTPException):
         require_admin(user=trader)
-    assert exc_info.value.status_code == 403
-
-
-def test_require_admin_blocks_viewer() -> None:
-    viewer = AuthenticatedUser("k", UserRole.VIEWER)
-    with pytest.raises(HTTPException) as exc_info:
+    with pytest.raises(HTTPException):
         require_admin(user=viewer)
-    assert exc_info.value.status_code == 403

@@ -116,8 +116,28 @@ def delete_position(symbol: str, db: Session = Depends(get_db)):
 
 def _normalize_symbol(symbol: str) -> str:
     """统一格式：600519.SH（数字部分.交易所大写）"""
-    s = (symbol or "").strip()
+    s = (symbol or "").strip().upper()
+    if not s:
+        return s
+
     if "." in s:
         code, suffix = s.split(".", 1)
-        return f"{code.lstrip('0123456789').zfill(6) if not code.isdigit() else code}.{suffix.upper()}"
-    return s
+    else:
+        prefix = s[:2]
+        if prefix in {"SH", "SZ", "BJ"} and s[2:].isdigit():
+            code, suffix = s[2:], prefix
+        else:
+            code = s
+            suffix = "SH" if code.startswith(("6", "9")) else "SZ"
+
+    code = code.strip().upper()
+    for prefix in ("SH", "SZ", "BJ"):
+        if code.startswith(prefix):
+            code = code[2:]
+            if not suffix:
+                suffix = prefix
+            break
+
+    if code.isdigit():
+        code = code.zfill(6)
+    return f"{code}.{suffix.upper()}"

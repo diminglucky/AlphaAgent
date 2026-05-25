@@ -16,36 +16,37 @@ from typing import Optional
 _LOCK = threading.RLock()
 _OVERRIDE: dict | None = None
 _OVERRIDE_MTIME: float = 0.0
-_PERSIST_PATH = Path(
-    os.getenv("QUANT_LLM_CONFIG_PATH", "data/llm_runtime.json")
-)
+def _persist_path() -> Path:
+    return Path(os.getenv("QUANT_LLM_CONFIG_PATH", "data/llm_runtime.json"))
 
 
 def _load_from_disk() -> dict:
-    if not _PERSIST_PATH.exists():
+    path = _persist_path()
+    if not path.exists():
         return {}
     try:
-        return json.loads(_PERSIST_PATH.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 
 def _save_to_disk(data: dict) -> None:
     """原子写入：先写临时文件，再重命名，避免读到一半的状态"""
-    _PERSIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _PERSIST_PATH.with_suffix(_PERSIST_PATH.suffix + ".tmp")
+    path = _persist_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(_PERSIST_PATH)
+    tmp.replace(path)
     # 限制权限（防止 API Key 被其他用户读取）
     try:
-        os.chmod(_PERSIST_PATH, 0o600)
+        os.chmod(path, 0o600)
     except Exception:
         pass
 
 
 def _disk_mtime() -> float:
     try:
-        return _PERSIST_PATH.stat().st_mtime
+        return _persist_path().stat().st_mtime
     except FileNotFoundError:
         return 0.0
 
@@ -105,9 +106,10 @@ def clear_override(persist: bool = True) -> None:
     with _LOCK:
         _OVERRIDE = {}
         _OVERRIDE_MTIME = 0.0
-        if persist and _PERSIST_PATH.exists():
+        path = _persist_path()
+        if persist and path.exists():
             try:
-                _PERSIST_PATH.unlink()
+                path.unlink()
             except Exception:
                 pass
 

@@ -14,6 +14,12 @@ from apps.api.app.db.session import init_db
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # 配置日志
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
     # 建表
     init_db()
     # 启动全市场行情缓存后台线程
@@ -23,6 +29,20 @@ async def lifespan(_: FastAPI):
     from apps.api.app.api.routes.ws import ensure_running
     await ensure_running()
     yield
+    # 优雅关闭
+    # 1. 停止 WS quote_loop
+    from apps.api.app.api.routes.ws import stop as ws_stop
+    try:
+        await ws_stop()
+    except Exception as e:
+        logging.getLogger("quant.main").warning("WebSocket stop failed: %s", e)
+    # 2. 关闭飞书线程池
+    from apps.api.app.services.feishu_service import shutdown as feishu_shutdown
+    try:
+        feishu_shutdown()
+    except Exception as e:
+        logging.getLogger("quant.main").warning("Feishu pool shutdown failed: %s", e)
+
 
 
 def create_app() -> FastAPI:

@@ -47,3 +47,8 @@ class Settings:
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+def reset_settings_cache() -> None:
+    """Clear cached settings after tests or env changes."""
+    get_settings.cache_clear()

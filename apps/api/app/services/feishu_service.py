@@ -115,3 +115,10 @@ def send_price_alert(symbol: str, name: str, price: float, target: float,
         content = f"**当前价格：** ¥{price:.2f}\n**已跌破目标价：** ¥{target:.2f}"
         color = "red"
     return send_feishu(title, content, color=color)
+
+
+def shutdown():
+    """优雅关闭飞书发送线程池"""
+    log.info("正在关闭飞书消息发送线程池...")
+    _feishu_pool.shutdown(wait=True)
+

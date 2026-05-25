@@ -107,16 +107,24 @@ def _calc_indicators(kline: list[dict]) -> dict:
         rs = avg_gain / avg_loss
         return round(100 - 100 / (1 + rs), 2)
 
+    def ema_series(prices, period):
+        if not prices:
+            return []
+        k = 2 / (period + 1)
+        out = [prices[0]]
+        for p in prices[1:]:
+            out.append(p * k + out[-1] * (1 - k))
+        return out
+
     def macd(prices):
         if len(prices) < 26:
             return None, None, None
-        ema12 = ema(prices, 12)
-        ema26 = ema(prices, 26)
-        if ema12 is None or ema26 is None:
-            return None, None, None
-        dif = round(ema12 - ema26, 4)
-        # 简化：用最近9日DIF均值作为DEA
-        dea = round(dif * 0.9, 4)
+        ema12_series = ema_series(prices, 12)
+        ema26_series = ema_series(prices, 26)
+        dif_series = [fast - slow for fast, slow in zip(ema12_series, ema26_series)]
+        dea_series = ema_series(dif_series, 9)
+        dif = round(dif_series[-1], 4)
+        dea = round(dea_series[-1], 4)
         hist = round((dif - dea) * 2, 4)
         return dif, dea, hist
 

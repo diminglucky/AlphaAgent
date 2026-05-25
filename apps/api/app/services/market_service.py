@@ -45,6 +45,22 @@ def _to_code(symbol: str) -> str:
     return symbol.split(".")[0]
 
 
+def _is_trading_time() -> bool:
+    """判断当前是否为 A 股交易时间（周一至周五 09:15-11:30, 13:00-15:00）"""
+    now = datetime.now()
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    # 09:15 - 11:30
+    m_start = 9 * 60 + 15
+    m_end = 11 * 60 + 30
+    # 13:00 - 15:00
+    a_start = 13 * 60
+    a_end = 15 * 60
+    return (m_start <= minutes <= m_end) or (a_start <= minutes <= a_end)
+
+
+
 def _normalize_code(raw: str) -> str:
     """sh600519 → 600519"""
     raw = str(raw).strip().lower()
@@ -232,20 +248,27 @@ def _precise_refresh_loop():
     """精准行情后台线程：每 3 秒刷新自选股行情"""
     global _precise_cache
     while True:
-        with _precise_lock:
-            symbols = list(_precise_symbols)
+        try:
+            with _precise_lock:
+                symbols = list(_precise_symbols)
 
-        if symbols:
-            try:
-                data = _fetch_precise(symbols)
-                if data:
-                    with _precise_lock:
-                        _precise_cache.update(data)
-                    log.debug("精准行情刷新: %d 只", len(data))
-            except Exception as e:
-                log.warning("精准行情刷新失败: %s", e)
+            if symbols:
+                try:
+                    data = _fetch_precise(symbols)
+                    if data:
+                        with _precise_lock:
+                            _precise_cache.update(data)
+                        log.debug("精准行情刷新: %d 只", len(data))
+                except Exception as e:
+                    log.warning("精准行情刷新失败: %s", e)
 
-        time.sleep(_PRECISE_TTL)
+            if _is_trading_time():
+                time.sleep(_PRECISE_TTL)
+            else:
+                time.sleep(60)
+        except Exception as e:
+            log.exception("精准行情线程意外异常，5秒后重试: %s", e)
+            time.sleep(5)
 
 
 # ---------------------------------------------------------------------------
@@ -312,16 +335,23 @@ def _market_refresh_loop():
         log.warning("全市场缓存首次加载失败: %s", e)
 
     while True:
-        time.sleep(_MARKET_TTL)
         try:
-            log.info("刷新全市场行情缓存...")
-            data = _fetch_market_all()
-            if data:
-                with _market_lock:
-                    _market_cache = data
-                log.info("全市场缓存刷新完成，共 %d 只", len(data))
+            if _is_trading_time():
+                time.sleep(_MARKET_TTL)
+            else:
+                time.sleep(60)
+            try:
+                log.info("刷新全市场行情缓存...")
+                data = _fetch_market_all()
+                if data:
+                    with _market_lock:
+                        _market_cache = data
+                    log.info("全市场缓存刷新完成，共 %d 只", len(data))
+            except Exception as e:
+                log.warning("全市场缓存刷新失败: %s", e)
         except Exception as e:
-            log.warning("全市场缓存刷新失败: %s", e)
+            log.exception("全市场行情线程意外异常，5秒后重试: %s", e)
+            time.sleep(5)
 
 
 def ensure_cache_running():

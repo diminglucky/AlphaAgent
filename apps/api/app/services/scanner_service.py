@@ -60,15 +60,20 @@ _CACHE_TTL = 300
 # K 线缓存（同一次扫描内复用，TTL 5 分钟，扫描期间避免重复拉取）
 _kline_cache: dict[str, tuple[float, list[dict]]] = {}
 _KLINE_TTL = 300
+_MAX_KLINE_CACHE = 600  # 防止内存无限膨胀
 
 
 def _get_kline_cached(symbol: str) -> list[dict]:
-    """带 TTL 缓存的 K 线获取"""
+    """带 TTL + 容量上限的 K 线缓存"""
     ts, bars = _kline_cache.get(symbol, (0, None))
     if bars is not None and (time.monotonic() - ts) < _KLINE_TTL:
         return bars
     bars = market_service.get_kline(symbol, period="daily", count=120)
     if bars:
+        # 容量淘汰：超过上限时删除最早的条目
+        if len(_kline_cache) >= _MAX_KLINE_CACHE:
+            oldest_key = min(_kline_cache, key=lambda k: _kline_cache[k][0])
+            _kline_cache.pop(oldest_key, None)
         _kline_cache[symbol] = (time.monotonic(), bars)
     return bars or []
 
@@ -244,13 +249,14 @@ def _strategy_pullback_yearline(closes):
     if not (-0.02 <= gap <= 0.05):
         return False, None
     # 60 日内有突破年线
-    for i in range(-60, -1):
-        if i+1 < -len(closes):
-            continue
-        ma_i = sum(closes[i-249:i+1]) / 250 if i >= -250+250 else None
-        if ma_i and closes[i-1] < ma_i and closes[i] > ma_i:
+    n_len = len(closes)
+    for j in range(max(250, n_len - 60), n_len):
+        ma_prev = sum(closes[j-250:j]) / 250
+        ma_curr = sum(closes[j-249:j+1]) / 250
+        if closes[j-1] < ma_prev and closes[j] > ma_curr:
             return True, f"回踩年线（MA250={ma250:.2f}，当前距{gap*100:+.1f}%）"
     return False, None
+
 
 
 def _strategy_breakout_platform(closes, amounts):
@@ -977,8 +983,9 @@ def scan_potential_stocks(
         required_strategies: 必须命中的策略名列表
     """
     global _scan_cache, _scan_ts
+    from datetime import date as _date
 
-    cache_key = f"top{top_n}_min{min_score}_pool{candidate_pool}_req{required_strategies}_f{enable_fundamental}_l{enable_llm}"
+    cache_key = f"{_date.today()}_top{top_n}_min{min_score}_pool{candidate_pool}_req{required_strategies}_f{enable_fundamental}_l{enable_llm}"
     if use_cache and _scan_cache.get(cache_key) and (time.monotonic() - _scan_ts < _CACHE_TTL):
         result = dict(_scan_cache[cache_key])
         result["cached"] = True

@@ -5,8 +5,16 @@ from __future__ import annotations
 from fastapi import Depends, Header, HTTPException, status
 from typing import Optional
 
+from enum import Enum
+
 from apps.api.app.core.config import get_settings
-from libs.quant_core.enums import UserRole
+
+
+class UserRole(str, Enum):
+    """用户角色（内联定义，避免依赖 legacy libs.quant_core）"""
+    ADMIN = "admin"
+    TRADER = "trader"
+    VIEWER = "viewer"
 
 
 class AuthenticatedUser:

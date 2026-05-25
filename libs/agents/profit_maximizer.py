@@ -194,7 +194,21 @@ class ProfitMaximizerAgent(BaseAgent):
         from libs.agents.portfolio_guardian import PortfolioGuardianAgent
 
         if len(observations) < 2 or observations[0].error or observations[1].error:
-            return {"error": "anchor calls failed", "buy_actions": [], "sell_actions": []}
+            return {
+                "method": "fallback_deterministic",
+                "error": "anchor calls failed",
+                "buy_actions": [],
+                "sell_actions": [],
+                "watch_list": [],
+                "hold_list": [],
+                "n_universe_scanned": 0,
+                "n_holdings": 0,
+                "cash_pct": 1.0,
+                "cash_to_deploy": 0.0,
+                "expected_portfolio_alpha": 0.0,
+                "sell_first": False,
+                "summary": "无法生成计划：基础行情或持仓工具调用失败",
+            }
 
         ctx = self._captured_ctx
         reg = get_default_registry()

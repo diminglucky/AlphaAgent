@@ -23,6 +23,7 @@ log = logging.getLogger("quant.fundamental")
 # 单股基本面缓存（TTL 6 小时）
 _info_cache: dict[str, tuple[float, dict]] = {}
 _INFO_TTL = 6 * 3600
+_MAX_INFO_CACHE = 1000  # 防止内存无限膨胀
 
 # 龙虎榜全市场缓存（每天刷新一次）
 _lhb_cache: dict[str, list[dict]] = {}  # symbol -> 上榜记录
@@ -125,6 +126,10 @@ def get_stock_info(symbol: str) -> dict:
     except Exception:
         pass
 
+    # 容量淘汰：超过上限时删除最早的条目
+    if len(_info_cache) >= _MAX_INFO_CACHE:
+        oldest_key = min(_info_cache, key=lambda k: _info_cache[k][0])
+        _info_cache.pop(oldest_key, None)
     _info_cache[code] = (time.monotonic(), info)
     return info
 

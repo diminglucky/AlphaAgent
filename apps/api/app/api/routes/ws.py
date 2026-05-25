@@ -56,6 +56,7 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
+_shutdown_event = asyncio.Event()
 _quote_task: Optional[asyncio.Task] = None
 
 
@@ -69,9 +70,12 @@ async def _quote_loop():
 
     settings = get_settings()
 
-    while True:
+    while not _shutdown_event.is_set():
         if manager.count() == 0:
-            await asyncio.sleep(settings.quote_interval)
+            try:
+                await asyncio.wait_for(_shutdown_event.wait(), timeout=settings.quote_interval)
+            except asyncio.TimeoutError:
+                pass
             continue
 
         try:
@@ -81,7 +85,10 @@ async def _quote_loop():
 
             symbols = list(set(wl_symbols + pos_symbols))
             if not symbols:
-                await asyncio.sleep(settings.quote_interval)
+                try:
+                    await asyncio.wait_for(_shutdown_event.wait(), timeout=settings.quote_interval)
+                except asyncio.TimeoutError:
+                    pass
                 continue
 
             # 注册精准跟踪，从缓存读（毫秒级）
@@ -113,13 +120,31 @@ async def _quote_loop():
         except Exception as e:
             log.warning("quote_loop error: %s", e)
 
-        await asyncio.sleep(settings.quote_interval)
+        try:
+            await asyncio.wait_for(_shutdown_event.wait(), timeout=settings.quote_interval)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def ensure_running():
     global _quote_task
+    _shutdown_event.clear()
     if _quote_task is None or _quote_task.done():
         _quote_task = asyncio.create_task(_quote_loop())
+
+
+async def stop():
+    global _quote_task
+    log.info("正在停止 WebSocket 行情推送循环...")
+    _shutdown_event.set()
+    if _quote_task and not _quote_task.done():
+        try:
+            await _quote_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.warning("停止行情推送循环异常: %s", e)
+
 
 
 # ---------------------------------------------------------------------------

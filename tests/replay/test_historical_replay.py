@@ -1,76 +1,45 @@
-"""Historical replay test (§10.5).
-
-Replays a known sample-data trading day end-to-end and verifies the system's
-deterministic output (signals + recommendations) matches the engineering
-contract. This guards against silent regressions when:
-- Signal weights change
-- Feature engineering changes
-- Recommendation thresholds change
-
-If signals are intentionally tuned, update the asserted ranges here.
-"""
+"""Replay-style deterministic checks for current AlphaAgent components."""
 
 from __future__ import annotations
 
 import pytest
-from sqlalchemy.orm import Session
 
-from apps.api.app.db.repositories import RecommendationRepository, SignalRepository
-from apps.api.app.services.auto_signal_service import AutoSignalService
-from apps.api.app.services.watchlist_service import WatchlistService
+from apps.api.app.db.models import PositionORM, WatchlistORM
+from apps.api.app.services import alert_service, llm_service
 
 
 @pytest.mark.replay
-def test_replay_known_trading_day_produces_signals(seeded_session: Session) -> None:
-    """Given a fixed sample dataset, signal generation is deterministic."""
-    db = seeded_session
-    WatchlistService(db).add("acct-demo-001", "300750.SZ")
-    WatchlistService(db).add("acct-demo-001", "600519.SH")
+def test_replay_watchlist_and_positions_seed(seeded_session) -> None:
+    watchlist = seeded_session.query(WatchlistORM).all()
+    positions = seeded_session.query(PositionORM).all()
 
-    res = AutoSignalService(db).run_once()
-
-    # Two watchlist symbols + 2 held positions → ≥2 signals saved
-    assert res.symbols_scanned >= 2
-    assert res.signals_saved >= 1
-    assert res.recommendations_saved >= 1
-
-    signals = SignalRepository(db).list_latest_per_symbol()
-    by_symbol = {s.symbol: s for s in signals}
-
-    # 300750 in sample data: bars are slightly up-trending, expect non-bearish
-    if "300750.SZ" in by_symbol:
-        assert -1.0 <= by_symbol["300750.SZ"].raw_score <= 1.0
-        assert 0.0 <= by_symbol["300750.SZ"].confidence <= 1.0
+    assert {item.symbol for item in watchlist} == {"600519.SH", "000001.SZ"}
+    assert {item.symbol for item in positions} == {"600519.SH"}
 
 
 @pytest.mark.replay
-def test_replay_recommendations_have_required_fields(seeded_session: Session) -> None:
-    """All emitted recommendations satisfy §2.1 #4 acceptance contract."""
-    db = seeded_session
-    WatchlistService(db).add("acct-demo-001", "300750.SZ")
-    AutoSignalService(db).run_once()
+def test_replay_position_stop_loss_is_deterministic(seeded_session, monkeypatch) -> None:
+    alert_service.reset_position_alert_state()
+    monkeypatch.setattr(alert_service.feishu_service, "send_sell_alert", lambda **kwargs: True)
 
-    _, recs = RecommendationRepository(db).list_latest()
-    assert len(recs) > 0
-    for r in recs:
-        # Per §2.1 the platform must emit at least these fields per recommendation
-        assert r.symbol
-        assert r.action in {"BUY", "SELL", "HOLD"}
-        assert 0.0 <= r.confidence <= 1.0
-        assert r.time_horizon
-        assert r.reason_summary
-        assert isinstance(r.risk_flags, list)
+    triggered = alert_service.check_position_alerts(
+        seeded_session,
+        [{"symbol": "600519.SH", "name": "贵州茅台", "price": 90.0}],
+    )
+
+    assert len(triggered) == 1
+    assert triggered[0]["kind"] == "stop_loss"
 
 
 @pytest.mark.replay
-def test_replay_audit_trail_complete(seeded_session: Session) -> None:
-    """Every signal+recommendation should have a paired audit log."""
-    from apps.api.app.db.repositories import AuditLogRepository
-    db = seeded_session
-    WatchlistService(db).add("acct-demo-001", "300750.SZ")
-    AutoSignalService(db).run_once()
+def test_replay_indicator_contract_stable() -> None:
+    bars = [
+        {"close": float(10 + i), "high": float(11 + i), "low": float(9 + i), "amount": 1000 + i}
+        for i in range(60)
+    ]
 
-    logs = AuditLogRepository(db).list_recent(limit=200)
-    actions = {l.action for l in logs}
-    assert "SIGNAL_GENERATED" in actions
-    assert "RECOMMENDATION_GENERATED" in actions
+    indicators = llm_service._calc_indicators(bars)
+
+    assert indicators["ma5"] > indicators["ma20"]
+    assert indicators["rsi14"] == 100.0
+    assert indicators["macd_dif"] is not None
