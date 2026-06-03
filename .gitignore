@@ -24,3 +24,6 @@ apps/web/node_modules/
 .vscode/
 .idea/
 *.swp
+
+# Local Playwright MCP artifacts
+.playwright-mcp/
