@@ -14,6 +14,9 @@
         text-color="#ccc"
         active-text-color="#409eff"
       >
+        <el-menu-item index="/advisor">
+          <el-icon><Aim /></el-icon> 实时推荐
+        </el-menu-item>
         <el-menu-item index="/overview">
           <el-icon><DataAnalysis /></el-icon> 总览
         </el-menu-item>
@@ -22,6 +25,9 @@
         </el-menu-item>
         <el-menu-item index="/scanner">
           <el-icon><Aim /></el-icon> 潜力扫描
+        </el-menu-item>
+        <el-menu-item index="/evolution">
+          <el-icon><DataAnalysis /></el-icon> 模型进化
         </el-menu-item>
         <el-menu-item index="/agent">
           <el-icon><MagicStick /></el-icon> Agent分析
@@ -33,6 +39,9 @@
         </el-menu-item>
         <el-menu-item index="/positions">
           <el-icon><Wallet /></el-icon> 持仓
+        </el-menu-item>
+        <el-menu-item index="/trading">
+          <el-icon><Tickets /></el-icon> 交易
         </el-menu-item>
         <el-menu-item index="/settings">
           <el-icon><Setting /></el-icon> 设置
@@ -52,7 +61,7 @@
 
     <el-main class="app-main">
       <router-view v-slot="{ Component }">
-        <keep-alive :include="['Overview', 'Market', 'Scanner', 'Agent', 'Alerts', 'Positions', 'Settings']">
+        <keep-alive :include="['RealtimeAdvisor', 'Overview', 'Market', 'Scanner', 'Evolution', 'Agent', 'Alerts', 'Positions', 'Trading', 'Settings']">
           <component :is="Component" />
         </keep-alive>
       </router-view>
@@ -63,7 +72,7 @@
 <script setup>
 import { computed, ref, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
-import { TrendCharts, MagicStick, Bell, Wallet, Setting, DataAnalysis, Aim } from '@element-plus/icons-vue'
+import { TrendCharts, MagicStick, Bell, Wallet, Setting, DataAnalysis, Aim, Tickets } from '@element-plus/icons-vue'
 import { ElNotification } from 'element-plus'
 import { openStream } from './api.js'
 import { quotesMap, wsConnected, unreadAlerts, lastQuoteTime, initStreams } from './store.js'

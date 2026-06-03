@@ -1,7 +1,12 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 
 const routes = [
-  { path: '/', redirect: '/overview' },
+  { path: '/', redirect: '/advisor' },
+  {
+    path: '/advisor',
+    component: () => import('../views/RealtimeAdvisor.vue'),
+    meta: { title: '实时推荐' },
+  },
   {
     path: '/overview',
     component: () => import('../views/Overview.vue'),
@@ -18,6 +23,11 @@ const routes = [
     meta: { title: '潜力扫描' },
   },
   {
+    path: '/evolution',
+    component: () => import('../views/Evolution.vue'),
+    meta: { title: '模型进化' },
+  },
+  {
     path: '/agent',
     component: () => import('../views/Agent.vue'),
     meta: { title: 'Agent 分析' },
@@ -31,6 +41,11 @@ const routes = [
     path: '/positions',
     component: () => import('../views/Positions.vue'),
     meta: { title: '持仓' },
+  },
+  {
+    path: '/trading',
+    component: () => import('../views/Trading.vue'),
+    meta: { title: '交易' },
   },
   {
     path: '/settings',

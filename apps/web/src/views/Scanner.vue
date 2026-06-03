@@ -151,8 +151,9 @@
       <el-icon class="is-loading"><Loading /></el-icon>
       <div class="scanning-content">
         <div class="scanning-title">
-          正在扫描全市场（一阶段快速过滤 → 二阶段并行深度分析 → 6 维度评分）
+          {{ scanStage || '正在扫描全市场（一阶段快速过滤 → 二阶段并行深度分析 → 6 维度评分）' }}
         </div>
+        <div v-if="scanStageDetail" class="scanning-stage-detail">{{ scanStageDetail }}</div>
         <div class="scanning-progress">
           <el-progress
             :percentage="Math.min(99, Math.round((elapsedSec / estimateSec) * 100))"
@@ -282,6 +283,9 @@
         <div class="summary-value">{{ result.results?.length || 0 }}</div>
       </div>
       <div class="summary-time">
+        <el-tag v-if="result.evolution?.model_version" size="small" type="primary" effect="plain" style="margin-right:6px">
+          模型 {{ result.evolution.model_version }}
+        </el-tag>
         <el-tag v-if="lastScanAt" size="small" type="warning" effect="plain" style="margin-right:6px">
           📌 {{ fmtSavedAt(lastScanAt) }} 保存
         </el-tag>
@@ -332,6 +336,23 @@
           <div class="stock-price">¥{{ stock.price?.toFixed(2) }}</div>
           <div class="stock-pct" :class="stock.change_pct >= 0 ? 'up' : 'down'">
             {{ stock.change_pct >= 0 ? '+' : '' }}{{ stock.change_pct?.toFixed(2) }}%
+          </div>
+        </div>
+
+        <div v-if="stock.evolution" class="evo-row">
+          <div class="evo-pill primary">
+            <span>进化模型概率</span>
+            <b>{{ stock.evolution.probability_pct }}%</b>
+          </div>
+          <div class="evo-pill">
+            <span>{{ stock.evolution.best_horizon_days }} 日目标</span>
+            <b>+{{ stock.evolution.target_return_pct }}%</b>
+          </div>
+          <div class="evo-pill">
+            <span>预期收益</span>
+            <b :class="stock.evolution.expected_return_pct >= 0 ? 'up' : 'down'">
+              {{ stock.evolution.expected_return_pct >= 0 ? '+' : '' }}{{ stock.evolution.expected_return_pct }}%
+            </b>
           </div>
         </div>
 
@@ -437,6 +458,43 @@
           <span v-if="stock.fundamental.info.float_mv" class="fund-cell">
             流通 <b>{{ (stock.fundamental.info.float_mv/1e8).toFixed(0) }}亿</b>
           </span>
+          <span v-if="stock.fundamental.info.industry" class="fund-cell industry-cell">
+            行业 <b>{{ stock.fundamental.info.industry }}</b>
+            <em v-if="stock.fundamental.industry_rank">
+              #{{ stock.fundamental.industry_rank.rank }}/{{ stock.fundamental.industry_rank.total }}
+            </em>
+          </span>
+          <span v-if="stock.fundamental.industry_score != null" class="fund-cell">
+            景气 <b :class="industryScoreClass(stock.fundamental.industry_score)">
+              {{ stock.fundamental.industry_score }}/15
+            </b>
+          </span>
+          <span v-if="stock.fundamental.northbound?.add_mv_5d != null" class="fund-cell">
+            北向 <b :class="stock.fundamental.northbound.add_mv_5d>=0?'up':'down'">
+              {{ fmtSignedAmt(stock.fundamental.northbound.add_mv_5d) }}
+            </b>
+          </span>
+          <span v-if="stock.fundamental.northbound_score != null" class="fund-cell">
+            北向分 <b :class="industryScoreClass(stock.fundamental.northbound_score)">
+              {{ stock.fundamental.northbound_score }}/15
+            </b>
+          </span>
+          <span v-if="stock.fundamental.research?.report_count" class="fund-cell">
+            研报 <b class="up">{{ stock.fundamental.research.report_count }}篇</b>
+          </span>
+          <span v-if="stock.fundamental.research_score != null" class="fund-cell">
+            研报分 <b :class="industryScoreClass(stock.fundamental.research_score)">
+              {{ stock.fundamental.research_score }}/15
+            </b>
+          </span>
+          <span v-if="stock.fundamental.insider_reduction?.reduce_count" class="fund-cell">
+            减持 <b class="down">{{ stock.fundamental.insider_reduction.reduce_count }}次</b>
+          </span>
+          <span v-if="stock.fundamental.insider_reduction_score != null" class="fund-cell">
+            减持风险 <b :class="stock.fundamental.insider_reduction_score >= 5 ? 'down' : 'up'">
+              {{ stock.fundamental.insider_reduction_score }}/15
+            </b>
+          </span>
           <span v-if="stock.fundamental.flow?.today_net != null" class="fund-cell">
             主力 <b :class="stock.fundamental.flow.today_net>=0?'up':'down'">
               {{ stock.fundamental.flow.today_net>=0?'+':'' }}{{ (stock.fundamental.flow.today_net/1e8).toFixed(2) }}亿
@@ -502,6 +560,9 @@
           </el-button>
           <el-button size="small" @click.stop="goKline(stock)" plain>
             📉 K线
+          </el-button>
+          <el-button size="small" type="warning" @click.stop="goTrade(stock)" plain>
+            交易
           </el-button>
         </div>
       </div>
@@ -612,10 +673,64 @@
             <div class="dms-value" :style="{ color: dimColor(detailStock.fundamental.flow_score, 25) }">{{ detailStock.fundamental.flow_score }}</div>
             <div class="dms-max">/ 25</div>
           </div>
+          <div class="dms-cell" v-if="(detailStock.fundamental?.industry_score ?? null) != null">
+            <div class="dms-label">行业景气</div>
+            <div class="dms-value" :style="{ color: dimColor(detailStock.fundamental.industry_score, 15) }">{{ detailStock.fundamental.industry_score }}</div>
+            <div class="dms-max">/ 15</div>
+          </div>
+          <div class="dms-cell" v-if="(detailStock.fundamental?.northbound_score ?? null) != null">
+            <div class="dms-label">北向资金</div>
+            <div class="dms-value" :style="{ color: dimColor(detailStock.fundamental.northbound_score, 15) }">{{ detailStock.fundamental.northbound_score }}</div>
+            <div class="dms-max">/ 15</div>
+          </div>
+          <div class="dms-cell" v-if="(detailStock.fundamental?.research_score ?? null) != null">
+            <div class="dms-label">机构研报</div>
+            <div class="dms-value" :style="{ color: dimColor(detailStock.fundamental.research_score, 15) }">{{ detailStock.fundamental.research_score }}</div>
+            <div class="dms-max">/ 15</div>
+          </div>
+          <div class="dms-cell" v-if="(detailStock.fundamental?.insider_reduction_score ?? null) != null">
+            <div class="dms-label">减持风险</div>
+            <div class="dms-value" :style="{ color: riskColor(detailStock.fundamental.insider_reduction_score, 15) }">{{ detailStock.fundamental.insider_reduction_score }}</div>
+            <div class="dms-max">/ 15</div>
+          </div>
           <div class="dms-cell" v-if="detailStock.ai_analysis?.confidence != null">
             <div class="dms-label">AI 把握</div>
             <div class="dms-value" :style="{ color: dimColor(detailStock.ai_analysis.confidence, 100) }">{{ detailStock.ai_analysis.confidence }}</div>
             <div class="dms-max">/ 100</div>
+          </div>
+        </div>
+
+        <div v-if="detailStock.evolution" class="drawer-section evolution-detail">
+          <div class="drawer-section-title">🧬 模型进化预测</div>
+          <div class="evo-big-grid">
+            <div class="evo-big-cell">
+              <div class="evo-big-label">最佳周期</div>
+              <div class="evo-big-value">{{ detailStock.evolution.best_horizon_days }} 日</div>
+            </div>
+            <div class="evo-big-cell">
+              <div class="evo-big-label">上涨概率</div>
+              <div class="evo-big-value up">{{ detailStock.evolution.probability_pct }}%</div>
+            </div>
+            <div class="evo-big-cell">
+              <div class="evo-big-label">目标涨幅</div>
+              <div class="evo-big-value">+{{ detailStock.evolution.target_return_pct }}%</div>
+            </div>
+            <div class="evo-big-cell">
+              <div class="evo-big-label">预期收益</div>
+              <div class="evo-big-value" :class="detailStock.evolution.expected_return_pct >= 0 ? 'up' : 'down'">
+                {{ detailStock.evolution.expected_return_pct >= 0 ? '+' : '' }}{{ detailStock.evolution.expected_return_pct }}%
+              </div>
+            </div>
+          </div>
+          <div v-if="detailStock.evolution.probabilities_by_horizon?.length" class="evo-horizons">
+            <div
+              v-for="h in detailStock.evolution.probabilities_by_horizon"
+              :key="h.horizon_days"
+              class="evo-horizon"
+            >
+              <span>{{ h.horizon_days }} 日</span>
+              <b>{{ h.probability_pct }}%</b>
+            </div>
           </div>
         </div>
 
@@ -625,6 +740,44 @@
             {{ detailStock.change_pct >= 0 ? '+' : '' }}{{ detailStock.change_pct?.toFixed(2) }}%
           </span>
           <span>成交额 {{ fmtAmt(detailStock.turnover) }}</span>
+        </div>
+
+        <!-- 行业景气详情 -->
+        <div v-if="detailStock.fundamental?.info?.industry || detailStock.fundamental?.industry_rank" class="drawer-section industry-detail">
+          <div class="drawer-section-title">🏭 行业景气</div>
+          <div class="industry-grid">
+            <div class="industry-cell-big">
+              <span>所属行业</span>
+              <b>{{ detailStock.fundamental?.info?.industry || '未知' }}</b>
+            </div>
+            <div v-if="detailStock.fundamental?.industry_rank" class="industry-cell-big">
+              <span>行业排名</span>
+              <b>#{{ detailStock.fundamental.industry_rank.rank }}/{{ detailStock.fundamental.industry_rank.total }}</b>
+            </div>
+            <div v-if="detailStock.fundamental?.industry_rank" class="industry-cell-big">
+              <span>行业涨跌</span>
+              <b :class="detailStock.fundamental.industry_rank.change_pct >= 0 ? 'up' : 'down'">
+                {{ fmtSignedPct(detailStock.fundamental.industry_rank.change_pct) }}
+              </b>
+            </div>
+            <div v-if="detailStock.fundamental?.industry_rank?.net_inflow != null" class="industry-cell-big">
+              <span>行业净流入</span>
+              <b :class="detailStock.fundamental.industry_rank.net_inflow >= 0 ? 'up' : 'down'">
+                {{ fmtSignedAmt(detailStock.fundamental.industry_rank.net_inflow) }}
+              </b>
+            </div>
+          </div>
+          <div v-if="detailStock.fundamental?.industry_items?.length" class="fund-items industry-items">
+            <div
+              v-for="(item, i) in detailStock.fundamental.industry_items"
+              :key="'ind'+i"
+              class="fund-item"
+              :class="`fi-${item.kind}`"
+            >
+              <span class="fi-score">{{ item.score >= 0 ? '+' : '' }}{{ item.score }}</span>
+              <span class="fi-desc">{{ item.desc }}</span>
+            </div>
+          </div>
         </div>
 
         <!-- 基本面详情 -->
@@ -655,6 +808,142 @@
             >
               <span class="fi-score">{{ item.score >= 0 ? '+' : '' }}{{ item.score }}</span>
               <span class="fi-desc">{{ item.desc }}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 北向资金详情 -->
+        <div v-if="detailStock.fundamental?.northbound || detailStock.fundamental?.northbound_items?.length" class="drawer-section northbound-detail">
+          <div class="drawer-section-title">🧭 北向资金</div>
+          <div v-if="detailStock.fundamental?.northbound" class="industry-grid">
+            <div class="industry-cell-big">
+              <span>5日增持市值</span>
+              <b :class="detailStock.fundamental.northbound.add_mv_5d >= 0 ? 'up' : 'down'">
+                {{ fmtSignedAmt(detailStock.fundamental.northbound.add_mv_5d) }}
+              </b>
+            </div>
+            <div class="industry-cell-big">
+              <span>5日市值增幅</span>
+              <b :class="detailStock.fundamental.northbound.add_mv_pct_5d >= 0 ? 'up' : 'down'">
+                {{ fmtSignedPct(detailStock.fundamental.northbound.add_mv_pct_5d) }}
+              </b>
+            </div>
+            <div class="industry-cell-big">
+              <span>占流通股变化</span>
+              <b :class="detailStock.fundamental.northbound.add_ratio_float_5d >= 0 ? 'up' : 'down'">
+                {{ fmtSignedPct(detailStock.fundamental.northbound.add_ratio_float_5d) }}
+              </b>
+            </div>
+            <div class="industry-cell-big">
+              <span>当前持股市值</span>
+              <b>{{ fmtAmt(detailStock.fundamental.northbound.hold_mv) }}</b>
+            </div>
+          </div>
+          <div v-if="detailStock.fundamental?.northbound_items?.length" class="fund-items industry-items">
+            <div
+              v-for="(item, i) in detailStock.fundamental.northbound_items"
+              :key="'nb'+i"
+              class="fund-item"
+              :class="`fi-${item.kind}`"
+            >
+              <span class="fi-score">{{ item.score >= 0 ? '+' : '' }}{{ item.score }}</span>
+              <span class="fi-desc">{{ item.desc }}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 机构研报详情 -->
+        <div v-if="detailStock.fundamental?.research || detailStock.fundamental?.research_items?.length" class="drawer-section research-detail">
+          <div class="drawer-section-title">📚 机构研报</div>
+          <div v-if="detailStock.fundamental?.research" class="industry-grid">
+            <div class="industry-cell-big">
+              <span>近30天研报</span>
+              <b>{{ detailStock.fundamental.research.report_count || 0 }} 篇</b>
+            </div>
+            <div class="industry-cell-big">
+              <span>买入评级</span>
+              <b class="up">{{ detailStock.fundamental.research.buy_count || 0 }} 篇</b>
+            </div>
+            <div class="industry-cell-big">
+              <span>正面评级</span>
+              <b class="up">{{ detailStock.fundamental.research.positive_count || 0 }} 篇</b>
+            </div>
+            <div class="industry-cell-big">
+              <span>覆盖机构</span>
+              <b>{{ detailStock.fundamental.research.institutions?.length || 0 }} 家</b>
+            </div>
+          </div>
+          <div v-if="detailStock.fundamental?.research_items?.length" class="fund-items industry-items">
+            <div
+              v-for="(item, i) in detailStock.fundamental.research_items"
+              :key="'rs'+i"
+              class="fund-item"
+              :class="`fi-${item.kind}`"
+            >
+              <span class="fi-score">{{ item.score >= 0 ? '+' : '' }}{{ item.score }}</span>
+              <span class="fi-desc">{{ item.desc }}</span>
+            </div>
+          </div>
+          <div v-if="detailStock.fundamental?.research?.latest_reports?.length" class="research-list">
+            <div
+              v-for="(report, i) in detailStock.fundamental.research.latest_reports"
+              :key="'report'+i"
+              class="research-item"
+            >
+              <span class="research-date">{{ report.date }}</span>
+              <span class="research-rating">{{ report.rating || '未评级' }}</span>
+              <span class="research-title">{{ report.title }}</span>
+              <span class="research-org">{{ report.institution }}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 减持风险详情 -->
+        <div v-if="detailStock.fundamental?.insider_reduction || detailStock.fundamental?.insider_reduction_items?.length" class="drawer-section reduction-detail">
+          <div class="drawer-section-title">⚠️ 减持风险</div>
+          <div v-if="detailStock.fundamental?.insider_reduction" class="industry-grid">
+            <div class="industry-cell-big">
+              <span>近90天减持</span>
+              <b :class="detailStock.fundamental.insider_reduction.reduce_count ? 'down' : 'up'">
+                {{ detailStock.fundamental.insider_reduction.reduce_count || 0 }} 次
+              </b>
+            </div>
+            <div class="industry-cell-big">
+              <span>估算金额</span>
+              <b :class="detailStock.fundamental.insider_reduction.total_reduce_amount ? 'down' : 'up'">
+                {{ fmtAmt(detailStock.fundamental.insider_reduction.total_reduce_amount) }}
+              </b>
+            </div>
+            <div class="industry-cell-big">
+              <span>估算股数</span>
+              <b>{{ fmtShares(detailStock.fundamental.insider_reduction.total_reduce_shares) }}</b>
+            </div>
+            <div class="industry-cell-big">
+              <span>最近日期</span>
+              <b>{{ detailStock.fundamental.insider_reduction.latest_date || '无' }}</b>
+            </div>
+          </div>
+          <div v-if="detailStock.fundamental?.insider_reduction_items?.length" class="fund-items industry-items">
+            <div
+              v-for="(item, i) in detailStock.fundamental.insider_reduction_items"
+              :key="'rd'+i"
+              class="fund-item"
+              :class="`fi-${item.kind}`"
+            >
+              <span class="fi-score">{{ item.score }}</span>
+              <span class="fi-desc">{{ item.desc }}</span>
+            </div>
+          </div>
+          <div v-if="detailStock.fundamental?.insider_reduction?.events?.length" class="research-list">
+            <div
+              v-for="(event, i) in detailStock.fundamental.insider_reduction.events"
+              :key="'reduce'+i"
+              class="research-item reduction-item"
+            >
+              <span class="research-date">{{ event.date }}</span>
+              <span class="research-rating">{{ event.person || '相关方' }}</span>
+              <span class="research-title">{{ event.reason || event.relation || '股份变动' }}</span>
+              <span class="research-org down">{{ fmtSignedAmt(event.amount) }}</span>
             </div>
           </div>
         </div>
@@ -883,7 +1172,10 @@ const selectedStrategies = ref([])
 
 const elapsedSec = ref(0)
 const estimateSec = ref(180)
+const scanStage = ref('')
+const scanStageDetail = ref('')
 let _scanTimer = null
+let _scanWs = null
 
 const params = reactive({
   top_n: 20,
@@ -993,14 +1285,18 @@ onMounted(async () => {
 // keep-alive 时停掉计时器，避免离开页面后 setInterval 仍跑
 onDeactivated(() => {
   if (_scanTimer) { clearInterval(_scanTimer); _scanTimer = null }
+  if (_scanWs) { _scanWs.close(); _scanWs = null }
 })
 onUnmounted(() => {
   if (_scanTimer) { clearInterval(_scanTimer); _scanTimer = null }
+  if (_scanWs) { _scanWs.close(); _scanWs = null }
 })
 
 async function runScan(forceRefresh = false) {
   scanning.value = true
   elapsedSec.value = 0
+  scanStage.value = '准备扫描参数'
+  scanStageDetail.value = ''
   // 三层漏斗预估：T1 (~candidate_pool*1.0s) + T2 (~30s 基本面) + T3 (~llm_top_n*15s LLM)
   const t1 = params.candidate_pool * 1.0
   const t2 = params.enable_fundamental ? 30 : 0
@@ -1019,7 +1315,14 @@ async function runScan(forceRefresh = false) {
     if (selectedStrategies.value.length > 0) {
       payload.required_strategies = selectedStrategies.value
     }
-    const data = await api.scannerScan(payload)
+    let data
+    try {
+      data = await scanWithWebSocket(payload)
+    } catch (wsErr) {
+      scanStage.value = '实时进度连接失败，已回退普通扫描'
+      scanStageDetail.value = wsErr.message || ''
+      data = await api.scannerScan(payload)
+    }
     result.value = data
     _saveCachedResult()
     if (!data.results?.length) {
@@ -1031,7 +1334,82 @@ async function runScan(forceRefresh = false) {
     ElMessage.error('扫描失败: ' + e.message)
   } finally {
     scanning.value = false
+    scanStage.value = ''
+    scanStageDetail.value = ''
     if (_scanTimer) { clearInterval(_scanTimer); _scanTimer = null }
+    if (_scanWs) { _scanWs.close(); _scanWs = null }
+  }
+}
+
+function scanWithWebSocket(payload) {
+  return new Promise((resolve, reject) => {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+    const ws = new WebSocket(`${proto}://${location.host}/api/v1/scanner/ws/scan`)
+    _scanWs = ws
+    let settled = false
+    const timeout = setTimeout(() => {
+      if (settled) return
+      settled = true
+      try { ws.close() } catch (_) {}
+      reject(new Error('扫描进度连接超时'))
+    }, 15 * 60 * 1000)
+
+    function finish(fn, value) {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      fn(value)
+    }
+
+    ws.onopen = () => {
+      scanStage.value = '连接实时扫描通道'
+      ws.send(JSON.stringify(payload))
+    }
+    ws.onmessage = (e) => {
+      let msg
+      try { msg = JSON.parse(e.data) } catch (_) { return }
+      const event = msg.event
+      const data = msg.data || {}
+      updateScanStage(event, data)
+      if (event === 'done') {
+        finish(resolve, data.result || {})
+        try { ws.close() } catch (_) {}
+      } else if (event === 'error') {
+        finish(reject, new Error(data.message || '扫描失败'))
+      }
+    }
+    ws.onerror = () => finish(reject, new Error('WebSocket 扫描连接失败'))
+    ws.onclose = () => {
+      if (!settled) finish(reject, new Error('WebSocket 扫描连接已断开'))
+    }
+  })
+}
+
+function updateScanStage(event, data) {
+  if (event === 'tier1_start') {
+    scanStage.value = 'Tier-1 技术海选中'
+    scanStageDetail.value = `全市场 ${data.total || 0} 只股票，正在筛选候选池`
+  } else if (event === 'tier1_done') {
+    scanStage.value = 'Tier-1 技术海选完成'
+    scanStageDetail.value = `通过技术评分 ${data.count || 0} 只`
+  } else if (event === 'tier2_start') {
+    scanStage.value = 'Tier-2 基本面与资金面过滤中'
+    scanStageDetail.value = `正在评估 ${data.count || 0} 只股票`
+  } else if (event === 'tier2_done') {
+    scanStage.value = 'Tier-2 过滤完成'
+    scanStageDetail.value = `剩余 ${data.count || 0} 只进入 AI 终审候选`
+  } else if (event === 'tier3_start') {
+    scanStage.value = 'Tier-3 AI 终审中'
+    scanStageDetail.value = `正在让 AI 复核 ${data.count || 0} 只股票`
+  } else if (event === 'tier3_progress') {
+    scanStage.value = 'Tier-3 AI 终审中'
+    scanStageDetail.value = `${data.completed || 0}/${data.total || 0} 已完成，当前 ${data.symbol || ''}`
+  } else if (event === 'tier3_done') {
+    scanStage.value = 'Tier-3 AI 终审完成'
+    scanStageDetail.value = `AI 推荐 ${data.count || 0} 只，否决 ${data.rejected || 0} 只`
+  } else if (event === 'done') {
+    scanStage.value = '扫描完成'
+    scanStageDetail.value = '正在渲染结果'
   }
 }
 
@@ -1063,6 +1441,29 @@ function goAnalyze(stock) {
 
 function goKline(stock) {
   router.push({ path: '/market', query: { symbol: stock.symbol, name: stock.name } })
+}
+
+function goTrade(stock) {
+  const plan = stock.trade_plan || {}
+  const evo = stock.evolution || {}
+  const price = plan.entry_mid || plan.entry_low || stock.price || 0
+  const reason = [
+    `扫描推荐：${stock.name || stock.symbol}`,
+    plan.rating ? `评级 ${plan.rating}` : '',
+    evo.probability_pct ? `进化概率 ${evo.probability_pct}%/${evo.best_horizon_days}日` : '',
+    plan.tomorrow_plan || '',
+  ].filter(Boolean).join('；')
+  router.push({
+    path: '/trading',
+    query: {
+      symbol: stock.symbol,
+      name: stock.name || '',
+      side: 'BUY',
+      price: price ? Number(price).toFixed(2) : '',
+      reason,
+      source: 'scanner',
+    },
+  })
 }
 
 async function addWatchlist(stock) {
@@ -1244,11 +1645,26 @@ function dimColor(value, max) {
   return '#909399'
 }
 
+function riskColor(value, max) {
+  if (value == null) return '#606266'
+  const pct = (value / max) * 100
+  if (pct >= 65) return '#67c23a'
+  if (pct >= 35) return '#e6a23c'
+  return '#f56c6c'
+}
+
 function peClass(pe) {
   if (pe == null) return ''
   if (pe < 0) return 'down'
   if (pe > 100) return 'down'
   if (pe <= 30) return 'up'
+  return ''
+}
+
+function industryScoreClass(v) {
+  if (v == null) return ''
+  if (v >= 10) return 'up'
+  if (v <= 4) return 'down'
   return ''
 }
 
@@ -1287,6 +1703,24 @@ function fmtAmt(v) {
   if (v >= 1e8) return (v / 1e8).toFixed(2) + '亿'
   if (v >= 1e4) return (v / 1e4).toFixed(0) + '万'
   return v.toFixed(0)
+}
+
+function fmtShares(v) {
+  if (!v) return '—'
+  if (v >= 1e8) return (v / 1e8).toFixed(2) + '亿股'
+  if (v >= 1e4) return (v / 1e4).toFixed(0) + '万股'
+  return Number(v).toFixed(0) + '股'
+}
+
+function fmtSignedAmt(v) {
+  if (v == null || Number.isNaN(v)) return '—'
+  const sign = v >= 0 ? '+' : '-'
+  return sign + fmtAmt(Math.abs(v))
+}
+
+function fmtSignedPct(v) {
+  if (v == null || Number.isNaN(v)) return '—'
+  return `${v >= 0 ? '+' : ''}${Number(v).toFixed(2)}%`
 }
 
 function groupSignalsByDim(signals) {
@@ -1630,6 +2064,10 @@ function indicatorGroups(ind) {
   gap: 8px;
 }
 .scanning-title { color: #409eff; font-weight: 500; }
+.scanning-stage-detail {
+  color: #a7b7cc;
+  font-size: 12px;
+}
 .scanning-progress {
   display: flex;
   align-items: center;
@@ -1940,6 +2378,24 @@ function indicatorGroups(ind) {
 .stock-price { font-size: 17px; font-weight: 600; color: #e0e0e0; }
 .stock-pct { font-size: 14px; font-weight: 600; }
 
+.evo-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+.evo-pill {
+  background: #141c32;
+  border: 1px solid #2a3a64;
+  border-radius: 8px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.evo-pill.primary { border-color: #409eff; background: #10233d; }
+.evo-pill span { color: #909399; font-size: 10px; }
+.evo-pill b { color: #e0e0e0; font-size: 16px; font-family: monospace; }
+
 /* 卡片中部：雷达 + 标签 */
 .card-mid {
   display: grid;
@@ -2080,6 +2536,12 @@ function indicatorGroups(ind) {
 }
 .fund-cell b.up { color: #f56c6c; }
 .fund-cell b.down { color: #67c23a; }
+.industry-cell em {
+  color: #f5b342;
+  font-style: normal;
+  font-family: monospace;
+  margin-left: 4px;
+}
 
 /* 明日交易计划（卡片紧凑版） */
 .trade-plan {
@@ -2308,7 +2770,7 @@ function indicatorGroups(ind) {
 /* 4 维评分卡 */
 .drawer-multi-score {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
   gap: 8px;
 }
 .dms-cell {
@@ -2322,6 +2784,40 @@ function indicatorGroups(ind) {
 .dms-value { font-size: 28px; font-weight: 800; line-height: 1; font-family: monospace; }
 .dms-max { font-size: 11px; color: #606266; margin-top: 2px; font-family: monospace; }
 
+.evolution-detail {
+  border-color: rgba(64, 158, 255, 0.35) !important;
+  background: linear-gradient(135deg, rgba(64, 158, 255, 0.10), rgba(26, 26, 46, 0.65));
+}
+.evo-big-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+.evo-big-cell {
+  background: #16162a;
+  border: 1px solid #2a2a4a;
+  border-radius: 8px;
+  padding: 10px;
+}
+.evo-big-label { color: #909399; font-size: 11px; margin-bottom: 6px; }
+.evo-big-value { color: #fff; font-size: 20px; font-weight: 800; font-family: monospace; }
+.evo-horizons {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+.evo-horizon {
+  display: flex;
+  justify-content: space-between;
+  background: #111827;
+  border-radius: 6px;
+  padding: 7px 9px;
+  color: #909399;
+  font-size: 12px;
+}
+.evo-horizon b { color: #7db7ff; font-family: monospace; }
+
 .drawer-meta {
   display: flex;
   gap: 14px;
@@ -2333,6 +2829,85 @@ function indicatorGroups(ind) {
 }
 .drawer-meta .up { color: #f56c6c; }
 .drawer-meta .down { color: #67c23a; }
+
+.industry-detail {
+  border: 1px solid rgba(245, 179, 66, 0.22);
+  background: linear-gradient(135deg, rgba(245, 179, 66, 0.08), rgba(22, 22, 42, 0.88));
+}
+.northbound-detail {
+  border: 1px solid rgba(64, 158, 255, 0.22);
+  background: linear-gradient(135deg, rgba(64, 158, 255, 0.08), rgba(22, 22, 42, 0.88));
+}
+.research-detail {
+  border: 1px solid rgba(103, 194, 58, 0.22);
+  background: linear-gradient(135deg, rgba(103, 194, 58, 0.08), rgba(22, 22, 42, 0.88));
+}
+.reduction-detail {
+  border: 1px solid rgba(245, 108, 108, 0.26);
+  background: linear-gradient(135deg, rgba(245, 108, 108, 0.09), rgba(22, 22, 42, 0.88));
+}
+.industry-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(116px, 1fr));
+  gap: 8px;
+}
+.industry-cell-big {
+  background: #1a1a2e;
+  border: 1px solid #2a2a4a;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.industry-cell-big span {
+  display: block;
+  color: #909399;
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+.industry-cell-big b {
+  color: #e0e0e0;
+  font-size: 15px;
+  font-family: monospace;
+}
+.industry-cell-big b.up { color: #f56c6c; }
+.industry-cell-big b.down { color: #67c23a; }
+.industry-items { margin-top: 10px; }
+.research-list {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.research-item {
+  display: grid;
+  grid-template-columns: 78px 58px 1fr 76px;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 9px;
+  background: #1a1a2e;
+  border-radius: 6px;
+  color: #909399;
+  font-size: 12px;
+}
+.research-date,
+.research-rating,
+.research-org {
+  font-family: monospace;
+  white-space: nowrap;
+}
+.research-rating { color: #f5b342; }
+.research-org.down { color: #67c23a; }
+.research-title {
+  color: #c0c4cc;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+@media (max-width: 640px) {
+  .research-item { grid-template-columns: 1fr; }
+}
+.reduction-item {
+  grid-template-columns: 78px 72px 1fr 86px;
+}
 
 /* 基本面/资金面 items */
 .fund-items {

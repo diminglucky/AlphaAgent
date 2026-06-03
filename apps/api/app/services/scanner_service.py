@@ -62,6 +62,71 @@ _kline_cache: dict[str, tuple[float, list[dict]]] = {}
 _KLINE_TTL = 300
 _MAX_KLINE_CACHE = 600  # 防止内存无限膨胀
 
+# 新闻缓存（同一次扫描内复用，TTL 10 分钟）
+_news_cache: dict[str, tuple[float, list[dict]]] = {}
+_NEWS_TTL = 600
+
+_NEWS_POS_KW = (
+    "增长", "盈利", "利好", "突破", "新高", "合作", "中标", "获批",
+    "分红", "回购", "上涨", "涨停", "增持", "扩产", "订单", "预增",
+)
+_NEWS_NEG_KW = (
+    "亏损", "下滑", "利空", "跌停", "违规", "处罚", "诉讼", "减持",
+    "质押", "风险", "下跌", "暴跌", "退市", "立案", "问询", "预减", "商誉",
+)
+
+
+def _get_stock_news_cached(symbol: str, count: int = 12) -> list[dict]:
+    """带 TTL 的个股新闻缓存，避免同次扫描重复请求。"""
+    ts, news = _news_cache.get(symbol, (0.0, None))
+    if news is not None and (time.monotonic() - ts) < _NEWS_TTL:
+        return news
+    try:
+        news = market_service.get_stock_news(symbol, count=count) or []
+    except Exception as e:  # noqa: BLE001
+        log.warning("scan get_stock_news %s failed: %s", symbol, e)
+        news = []
+    if len(_news_cache) > _MAX_KLINE_CACHE:
+        _news_cache.clear()
+    _news_cache[symbol] = (time.monotonic(), news)
+    return news
+
+
+def _score_news_sentiment(news: list[dict]) -> dict:
+    """基于真实新闻标题/内容的关键词情绪打分。"""
+    if not news:
+        return {
+            "avg_sentiment": 0.0,
+            "sentiment_label": "无新闻",
+            "negative_events_count": 0,
+            "top_negative": [],
+            "count": 0,
+        }
+    scores: list[float] = []
+    negative_events: list[dict] = []
+    for n in news:
+        text = f"{n.get('title', '')} {n.get('content', '')}"
+        pos = sum(1 for kw in _NEWS_POS_KW if kw in text)
+        neg = sum(1 for kw in _NEWS_NEG_KW if kw in text)
+        total = pos + neg
+        score = (pos - neg) / total if total > 0 else 0.0
+        scores.append(score)
+        if score < -0.3:
+            negative_events.append({
+                "title": n.get("title", ""),
+                "sentiment": round(score, 2),
+                "time": n.get("time", ""),
+            })
+    avg = round(sum(scores) / len(scores), 3) if scores else 0.0
+    label = "正面" if avg > 0.1 else "负面" if avg < -0.1 else "中性"
+    return {
+        "avg_sentiment": avg,
+        "sentiment_label": label,
+        "negative_events_count": len(negative_events),
+        "top_negative": negative_events[:3],
+        "count": len(news),
+    }
+
 
 def _get_kline_cached(symbol: str) -> list[dict]:
     """带 TTL + 容量上限的 K 线缓存"""
@@ -1098,10 +1163,25 @@ def scan_potential_stocks(
                 r2["fundamental"] = {
                     "quality": ev["quality"],          # 0-25
                     "flow_score": ev["flow_score"],    # 0-25
+                    "industry_score": ev.get("industry_score", 0),  # 0-15
+                    "northbound_score": ev.get("northbound_score", 0),  # 0-15
+                    "research_score": ev.get("research_score", 0),  # 0-15
+                    "insider_reduction_score": ev.get("insider_reduction_score", 0),  # 0-15 risk
                     "quality_items": ev["quality_items"],
                     "flow_items": ev["flow_items"],
+                    "industry_items": ev.get("industry_items", []),
+                    "northbound_items": ev.get("northbound_items", []),
+                    "research_items": ev.get("research_items", []),
+                    "insider_reduction_items": ev.get("insider_reduction_items", []),
+                    "industry_rank": ev.get("industry_rank"),
                     "info": ev["info"],
                     "fund_flow": ev["fund_flow"],
+                    "flow": ev["fund_flow"],  # 前端兼容别名
+                    "northbound_flow": ev.get("northbound_flow"),
+                    "northbound": ev.get("northbound_flow"),  # 前端兼容别名
+                    "research_rating": ev.get("research_rating"),
+                    "research": ev.get("research_rating"),  # 前端兼容别名
+                    "insider_reduction": ev.get("insider_reduction"),
                     "lhb": ev["lhb"],
                 }
                 return r2
@@ -1121,7 +1201,27 @@ def scan_potential_stocks(
                 except Exception:
                     pass
 
-        tier2_results.sort(key=lambda x: x["score"], reverse=True)  # 按 Tier-1 技术分排序
+        def _tier2_sort_key(r: dict):
+            fund = r.get("fundamental") or {}
+            quality = float(fund.get("quality") or 0)
+            flow = float(fund.get("flow_score") or 0)
+            industry = float(fund.get("industry_score") or 0)
+            northbound = float(fund.get("northbound_score") or 0)
+            research = float(fund.get("research_score") or 0)
+            reduction_risk = float(fund.get("insider_reduction_score") or 0)
+            tech = float(r.get("score") or 0)
+            return (
+                tech
+                + quality * 0.8
+                + flow * 1.0
+                + industry * 1.0
+                + northbound * 1.0
+                + research * 0.8
+                - reduction_risk * 1.4,
+                tech,
+            )
+
+        tier2_results.sort(key=_tier2_sort_key, reverse=True)
         log.info("scanner T2 完成：%d → %d", len(tier1_top), len(tier2_results))
         if progress_callback:
             progress_callback("tier2_done", {"count": len(tier2_results)})
@@ -1198,10 +1298,40 @@ def scan_potential_stocks(
                     intelligence_text.append(f"PB={f_info['pb']:.2f}")
                 if f_info.get("float_mv"):
                     intelligence_text.append(f"流通市值={f_info['float_mv']/1e8:.1f}亿")
+                if f_info.get("industry"):
+                    intelligence_text.append(f"所属行业={f_info['industry']}")
+                industry_rank = fund_block.get("industry_rank") or {}
+                if industry_rank:
+                    industry_change = industry_rank.get("change_pct")
+                    try:
+                        industry_change_text = f"{float(industry_change):+.2f}%"
+                    except Exception:
+                        industry_change_text = "未知"
+                    intelligence_text.append(
+                        f"行业排名={industry_rank.get('rank')}/{industry_rank.get('total')} "
+                        f"({industry_rank.get('matched_name')}, {industry_change_text})"
+                    )
                 if f_flow.get("today_net") is not None:
                     intelligence_text.append(f"今日主力净流入={f_flow['today_net']/1e8:+.2f}亿")
                 if f_flow.get("turnover_rate"):
                     intelligence_text.append(f"换手率={f_flow['turnover_rate']:.1f}%")
+                northbound_flow = fund_block.get("northbound_flow") or {}
+                if northbound_flow.get("add_mv_5d") is not None:
+                    intelligence_text.append(f"北向5日增持市值={northbound_flow['add_mv_5d']/1e8:+.2f}亿")
+                if northbound_flow.get("add_ratio_float_5d") is not None:
+                    intelligence_text.append(f"北向5日增持占流通股比={northbound_flow['add_ratio_float_5d']:+.3f}%")
+                research = fund_block.get("research_rating") or {}
+                if research.get("report_count"):
+                    intelligence_text.append(
+                        f"近30天研报={research.get('report_count')}篇 "
+                        f"买入={research.get('buy_count')}篇 正面={research.get('positive_count')}篇"
+                    )
+                reduction = fund_block.get("insider_reduction") or {}
+                if reduction.get("reduce_count"):
+                    intelligence_text.append(
+                        f"董监高/相关人员近90天减持={reduction.get('reduce_count')}次 "
+                        f"金额={float(reduction.get('total_reduce_amount') or 0)/1e8:.2f}亿"
+                    )
                 lhb_list = fund_block.get("lhb") or []
                 if lhb_list:
                     intelligence_text.append(f"龙虎榜: {len(lhb_list)} 次上榜")
@@ -1217,6 +1347,10 @@ def scan_potential_stocks(
                     s['name'] for s in r.get('strategies', [])
                 ) if r.get('strategies') else "未命中经典策略"
 
+                # 真实个股新闻 + 关键词情绪（只对进入 LLM 终审的 Top N 拉取）
+                real_news = _get_stock_news_cached(r["symbol"], count=12)
+                news_sentiment = _score_news_sentiment(real_news)
+
                 preloaded = [
                     ToolResult(call_id=None, name="get_realtime_quote", output=quote_data),
                     ToolResult(call_id=None, name="get_daily_bars", output={"bars": bars[-30:] if bars else []}),
@@ -1226,26 +1360,42 @@ def scan_potential_stocks(
                         "support_levels": [ind.get("low_20"), ind.get("low_60")],
                         "resistance_levels": [ind.get("high_20"), ind.get("high_60")],
                     }),
-                    # 给 LLM 一个简化的"new"和"sentiment"，里面塞基本面+行业景气
+                    # 真实个股新闻 + 基本面/资金面/行业景气 作为补充情报
                     ToolResult(call_id=None, name="search_news", output={
-                        "news": [{
-                            "title": "扫描器整合数据（基本面+资金面）",
-                            "content": " | ".join(intelligence_text),
-                            "publish_time": "today",
-                        }, {
-                            "title": "行业景气度",
-                            "content": hot_inds_text,
-                            "publish_time": "today",
-                        }, {
-                            "title": "技术形态命中",
-                            "content": strategies_text,
-                            "publish_time": "today",
-                        }],
+                        "symbol": r["symbol"],
+                        "count": len(real_news) + 3,
+                        "articles": (
+                            [{
+                                "title": n.get("title", ""),
+                                "content": n.get("content", ""),
+                                "source": n.get("source", ""),
+                                "publish_time": n.get("time", ""),
+                            } for n in real_news[:8]]
+                            + [{
+                                "title": "扫描器整合数据（基本面+资金面）",
+                                "content": " | ".join(intelligence_text),
+                                "source": "scanner",
+                                "publish_time": "today",
+                            }, {
+                                "title": "行业景气度",
+                                "content": hot_inds_text,
+                                "source": "scanner",
+                                "publish_time": "today",
+                            }, {
+                                "title": "技术形态命中",
+                                "content": strategies_text,
+                                "source": "scanner",
+                                "publish_time": "today",
+                            }]
+                        ),
                     }),
                     ToolResult(call_id=None, name="analyze_news_sentiment", output={
-                        "avg_sentiment": 0.1 if (f_flow.get("today_net") or 0) > 0 else -0.1,
-                        "sentiment_label": "中性偏正" if (f_flow.get("today_net") or 0) > 0 else "中性",
-                        "negative_events_count": 0,
+                        "symbol": r["symbol"],
+                        "count": news_sentiment["count"],
+                        "avg_sentiment": news_sentiment["avg_sentiment"],
+                        "sentiment_label": news_sentiment["sentiment_label"],
+                        "negative_events_count": news_sentiment["negative_events_count"],
+                        "top_negative": news_sentiment["top_negative"],
                     }),
                 ]
 
@@ -1323,8 +1473,21 @@ def scan_potential_stocks(
             tech = r.get("score", 0)
             quality = (r.get("fundamental") or {}).get("quality", 0)
             flow = (r.get("fundamental") or {}).get("flow_score", 0)
-            # 综合分（用于同档排序）：技术 + 基本面 + 资金面 + AI 置信度
-            composite = tech * 0.4 + quality * 1.2 + flow * 1.2 + conf * 0.4
+            industry = (r.get("fundamental") or {}).get("industry_score", 0)
+            northbound = (r.get("fundamental") or {}).get("northbound_score", 0)
+            research = (r.get("fundamental") or {}).get("research_score", 0)
+            reduction_risk = (r.get("fundamental") or {}).get("insider_reduction_score", 0)
+            # 综合分（用于同档排序）：技术 + 基本面 + 资金面 + 行业景气 + 北向 + 研报 - 减持风险 + AI 置信度
+            composite = (
+                tech * 0.4
+                + quality * 1.0
+                + flow * 1.1
+                + industry * 1.0
+                + northbound * 1.0
+                + research * 0.8
+                - reduction_risk * 1.4
+                + conf * 0.4
+            )
             # 三档：1 = BUY, 2 = HOLD, 3 = 其他
             tier = 1 if action == "BUY" else (2 if action == "HOLD" else 3)
             # rejected 一律降到第 4 档
@@ -1369,6 +1532,32 @@ def scan_potential_stocks(
         else:
             llm_status = "ok"
 
+    evolution_meta = {}
+    try:
+        from apps.api.app.services import evolution_service
+        enriched = evolution_service.enrich_scan_results_with_model(final_results)
+        final_results = enriched["results"]
+        evolution_meta = {
+            "model_version_id": enriched.get("model_version_id"),
+            "model_version": enriched.get("model_version"),
+        }
+
+        def _evolution_sort_key(r: dict):
+            ai = r.get("ai_analysis") or {}
+            action = str(ai.get("action") or "BUY").upper()
+            action_rank = 2 if action == "BUY" else (1 if action == "HOLD" else 0)
+            evo = r.get("evolution") or {}
+            return (
+                action_rank,
+                float(evo.get("probability") or 0),
+                float(evo.get("expected_return_pct") or 0),
+                int(r.get("score") or 0),
+            )
+
+        final_results.sort(key=_evolution_sort_key, reverse=True)
+    except Exception as e:
+        log.warning("scanner evolution enrichment failed: %s", e)
+
     output = {
         "scanned": len(all_quotes),
         "candidates": len(candidates),
@@ -1383,6 +1572,7 @@ def scan_potential_stocks(
         "llm_status": llm_status,
         "elapsed_ms": elapsed,
         "cached": False,
+        "evolution": evolution_meta,
         "params": {
             "top_n": top_n,
             "min_score": min_score,
@@ -1393,6 +1583,15 @@ def scan_potential_stocks(
             "llm_top_n": llm_top_n,
         },
     }
+
+    try:
+        from apps.api.app.services import evolution_service
+        record_meta = evolution_service.record_scan_result(output)
+        if record_meta.get("recorded"):
+            output["scan_run_id"] = record_meta.get("scan_run_id")
+            output["evolution"] = {**(output.get("evolution") or {}), **record_meta}
+    except Exception as e:
+        log.warning("scanner evolution record failed: %s", e)
 
     _scan_cache[cache_key] = output
     _scan_ts = time.monotonic()

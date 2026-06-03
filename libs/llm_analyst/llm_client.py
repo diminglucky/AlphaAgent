@@ -127,9 +127,14 @@ class LLMClient:
             "tool_choice": tool_choice,
             "temperature": self._cfg.temperature,
         }
-        resp = httpx.post(url, headers=headers, json=payload, timeout=self._cfg.timeout)
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            resp = httpx.post(url, headers=headers, json=payload, timeout=self._cfg.timeout)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            self._record_usage("chat_with_tools", None, success=False, error=str(exc))
+            raise
+        self._record_usage("chat_with_tools", data.get("usage"), success=True)
         msg = data["choices"][0]["message"]
         return {
             "content": msg.get("content") or "",
@@ -184,7 +189,34 @@ class LLMClient:
             "max_tokens": 8000,  # 仪表盘 JSON 字段较多，需要更大上限
         }
 
-        resp = httpx.post(url, headers=headers, json=payload, timeout=self._cfg.timeout)
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            resp = httpx.post(url, headers=headers, json=payload, timeout=self._cfg.timeout)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            self._record_usage("chat", None, success=False, error=str(exc))
+            raise
+        self._record_usage("chat", data.get("usage"), success=True)
         return data["choices"][0]["message"]["content"]
+
+    def _record_usage(
+        self,
+        endpoint: str,
+        usage: dict[str, Any] | None,
+        *,
+        success: bool,
+        error: str = "",
+    ) -> None:
+        try:
+            from apps.api.app.services.llm_usage_service import record_usage
+            record_usage(
+                provider=self._cfg.provider.value,
+                model=self._cfg.model,
+                endpoint=endpoint,
+                usage=usage,
+                source="llm_client",
+                success=success,
+                error=error,
+            )
+        except Exception:
+            pass

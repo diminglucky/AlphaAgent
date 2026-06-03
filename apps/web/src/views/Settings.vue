@@ -2,6 +2,31 @@
   <div class="settings-page">
     <h2>系统设置</h2>
 
+    <div class="settings-card">
+      <div class="card-header">
+        <span class="card-title">🔐 API 鉴权</span>
+        <el-tag :type="apiKeyConfigured ? 'success' : 'info'" size="small" effect="dark">
+          {{ apiKeyConfigured ? '已保存' : '未设置' }}
+        </el-tag>
+      </div>
+      <el-form label-width="100px">
+        <el-form-item label="X-Api-Key">
+          <el-input
+            v-model="apiKeyInput"
+            type="password"
+            show-password
+            placeholder="生产环境开启 QUANT_AUTH_ENABLED 后填写"
+            clearable
+          />
+          <div class="field-hint">这是平台 API 鉴权 Key，不是大模型 API Key。保存后所有请求会自动带上该请求头。</div>
+        </el-form-item>
+      </el-form>
+      <div class="card-actions">
+        <el-button type="primary" @click="saveApiKey">保存 API Key</el-button>
+        <el-button plain @click="clearApiKey">清除</el-button>
+      </div>
+    </div>
+
     <!-- LLM 配置 -->
     <div class="settings-card">
       <div class="card-header">
@@ -234,7 +259,7 @@ defineOptions({ name: 'Settings' })
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
-import { api, http } from '../api.js'
+import { api, http, getApiKey, setApiKey } from '../api.js'
 
 const health = ref({ llm_configured: false, feishu_configured: false, market_provider: 'akshare' })
 const wsStatus = ref({ loop_running: false, quotes_clients: 0, alerts_clients: 0 })
@@ -246,6 +271,8 @@ const testing = ref(false)
 const testingFeishu = ref(false)
 const testResult = ref(null)
 const feishuResult = ref(null)
+const apiKeyInput = ref(getApiKey())
+const apiKeyConfigured = ref(Boolean(apiKeyInput.value))
 
 const llmForm = ref({
   provider: 'deepseek',
@@ -257,6 +284,19 @@ const llmForm = ref({
 })
 
 const currentPreset = computed(() => presets.value[llmForm.value.provider] || null)
+
+function saveApiKey() {
+  setApiKey(apiKeyInput.value)
+  apiKeyConfigured.value = Boolean(apiKeyInput.value?.trim())
+  ElMessage.success('API Key 已保存')
+}
+
+function clearApiKey() {
+  apiKeyInput.value = ''
+  setApiKey('')
+  apiKeyConfigured.value = false
+  ElMessage.success('API Key 已清除')
+}
 
 // 检测表单配置与生效配置是否一致
 const configMismatch = computed(() => {

@@ -97,6 +97,16 @@ def reset_config(user: AuthenticatedUser = Depends(require_admin)) -> dict:
     return _build_config_view()
 
 
+@router.get("/usage")
+def get_usage(
+    limit: int = Query(100, ge=1, le=500),
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> dict:
+    """Return recent LLM token usage and optional configured cost estimate."""
+    from apps.api.app.services import llm_usage_service
+    return llm_usage_service.usage_summary(limit=limit)
+
+
 # ---------------------------------------------------------------------------
 # Connectivity tests
 # ---------------------------------------------------------------------------

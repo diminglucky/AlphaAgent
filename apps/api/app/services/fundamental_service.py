@@ -15,8 +15,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime
-from typing import Optional
+from datetime import date, datetime, timedelta
+from typing import Any, Optional
 
 log = logging.getLogger("quant.fundamental")
 
@@ -41,6 +41,23 @@ _market_flow_ts: float = 0.0
 _market_flow_lock = threading.Lock()
 _MARKET_FLOW_TTL = 3600  # 1 hour
 
+# 北向持股变化缓存（全市场一次拉取，避免逐股调用东方财富）
+_northbound_cache: dict[str, dict] = {}  # code -> 5日北向增减持排行记录
+_northbound_ts: float = 0.0
+_northbound_lock = threading.Lock()
+_NORTHBOUND_TTL = 3600
+
+# 个股研报缓存（接口是逐股查询，只在 Tier-2 候选池调用）
+_research_cache: dict[str, tuple[float, dict]] = {}
+_RESEARCH_TTL = 24 * 3600
+_MAX_RESEARCH_CACHE = 600
+
+# 董监高/相关人员持股变动缓存（全市场一次拉取）
+_insider_change_cache: dict[str, dict] = {}
+_insider_change_ts: float = 0.0
+_insider_change_lock = threading.Lock()
+_INSIDER_CHANGE_TTL = 6 * 3600
+
 # 行业热度缓存（每天刷新，盘中按上涨幅度排名）
 _hot_industries: list[dict] = []  # [{name, change_pct, net_inflow, leader, leader_pct}]
 _hot_concepts: list[dict] = []
@@ -64,6 +81,105 @@ def _safe_float(v) -> Optional[float]:
         return None
 
 
+def _is_blank(v: Any) -> bool:
+    if v is None:
+        return True
+    try:
+        if v != v:  # NaN
+            return True
+    except Exception:
+        pass
+    txt = str(v).strip()
+    return txt in {"", "-", "--", "None", "nan", "NaN"}
+
+
+def _clean_text(v: Any) -> str:
+    return "" if _is_blank(v) else str(v).strip()
+
+
+def _normalize_code(symbol: str) -> str:
+    return symbol.split(".")[0].strip().zfill(6)
+
+
+def _row_value(row: Any, names: tuple[str, ...], pos: int):
+    for name in names:
+        try:
+            if name in row.index:
+                v = row.get(name)
+                if not _is_blank(v):
+                    return v
+        except Exception:
+            pass
+    try:
+        return row.iloc[pos]
+    except Exception:
+        return None
+
+
+def _parse_yyyymmdd(v: Any) -> tuple[str, Optional[int]]:
+    """Return ISO date + days since list date for AKShare date variants."""
+    if _is_blank(v):
+        return "", None
+    if isinstance(v, datetime):
+        d = v.date()
+    elif isinstance(v, date):
+        d = v
+    else:
+        txt = str(v).strip()
+        if txt.endswith(".0"):
+            txt = txt[:-2]
+        parsed = None
+        for fmt in ("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                parsed = datetime.strptime(txt, fmt).date()
+                break
+            except Exception:
+                continue
+        if parsed is None:
+            return txt, None
+        d = parsed
+    return d.isoformat(), max(0, (date.today() - d).days)
+
+
+def _parse_date_only(v: Any) -> Optional[date]:
+    if _is_blank(v):
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    txt = str(v).strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(txt[:10] if "-" in txt or "/" in txt else txt, fmt).date()
+        except Exception:
+            continue
+    return None
+
+
+def _stock_individual_info(code: str) -> dict:
+    """Fetch per-stock static facts from Eastmoney via AKShare.
+
+    ``stock_value_em`` is fast for valuation but usually does not include
+    industry or list date. This auxiliary call fills those missing facts.
+    """
+    try:
+        ak = _ak()
+        df = ak.stock_individual_info_em(symbol=code)
+        if df is None or df.empty:
+            return {}
+        out = {}
+        for _, row in df.iterrows():
+            key = _clean_text(_row_value(row, ("item", "项目", "指标"), 0))
+            if not key:
+                continue
+            out[key] = _row_value(row, ("value", "值", "数据"), 1)
+        return out
+    except Exception as e:
+        log.debug("stock_individual_info_em(%s) failed: %s", code, e)
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # 基本面：流通市值 / PE / PB / 行业 / 上市时间
 # ---------------------------------------------------------------------------
@@ -76,7 +192,7 @@ def get_stock_info(symbol: str) -> dict:
       - pe (TTM), pe_static, pb, peg, ps
     缓存 6 小时。
     """
-    code = symbol.split(".")[0]
+    code = _normalize_code(symbol)
     cached = _info_cache.get(code)
     if cached and (time.monotonic() - cached[0]) < _INFO_TTL:
         return cached[1]
@@ -125,6 +241,18 @@ def get_stock_info(symbol: str) -> dict:
             info["is_st"] = "ST" in info["name"] or "*ST" in info["name"]
     except Exception:
         pass
+
+    # === 辅助：行业 / 上市时间（用于行业景气度排名和次新股过滤）===
+    indiv = _stock_individual_info(code)
+    if indiv:
+        info["name"] = info["name"] or _clean_text(indiv.get("股票简称") or indiv.get("简称"))
+        info["industry"] = _clean_text(indiv.get("行业") or indiv.get("所属行业"))
+        list_date, days_listed = _parse_yyyymmdd(indiv.get("上市时间") or indiv.get("上市日期"))
+        if list_date:
+            info["list_date"] = list_date
+            info["days_listed"] = days_listed
+        info["total_mv"] = info["total_mv"] or _safe_float(indiv.get("总市值"))
+        info["float_mv"] = info["float_mv"] or _safe_float(indiv.get("流通市值"))
 
     # 容量淘汰：超过上限时删除最早的条目
     if len(_info_cache) >= _MAX_INFO_CACHE:
@@ -222,6 +350,381 @@ def get_fund_flow(symbol: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 北向资金：沪深港通持股变化
+# ---------------------------------------------------------------------------
+
+def _ensure_northbound():
+    """Load 5-day northbound holding change rank once per TTL."""
+    global _northbound_cache, _northbound_ts
+    with _northbound_lock:
+        if _northbound_ts > 0 and (time.monotonic() - _northbound_ts) < _NORTHBOUND_TTL:
+            return
+        try:
+            ak = _ak()
+            df = ak.stock_hsgt_hold_stock_em(market="北向", indicator="5日排行")
+            if df is None or df.empty:
+                _northbound_cache = {}
+                _northbound_ts = time.monotonic()
+                return
+            cache = {}
+            for _, row in df.iterrows():
+                code = str(row.get("代码", "")).strip().zfill(6)
+                if not code:
+                    continue
+                cache[code] = {
+                    "name": _clean_text(row.get("名称")),
+                    "date": _clean_text(row.get("日期")),
+                    "hold_mv": _safe_float(row.get("今日持股-市值")),
+                    "hold_ratio_float": _safe_float(row.get("今日持股-占流通股比")),
+                    "hold_ratio_total": _safe_float(row.get("今日持股-占总股本比")),
+                    "add_shares_5d": _safe_float(row.get("5日增持估计-股数")),
+                    "add_mv_5d": _safe_float(row.get("5日增持估计-市值")),
+                    "add_mv_pct_5d": _safe_float(row.get("5日增持估计-市值增幅")),
+                    "add_ratio_float_5d": _safe_float(row.get("5日增持估计-占流通股比")),
+                    "add_ratio_total_5d": _safe_float(row.get("5日增持估计-占总股本比")),
+                    "board": _clean_text(row.get("所属板块")),
+                }
+            _northbound_cache = cache
+            _northbound_ts = time.monotonic()
+            log.info("northbound holding rank refreshed: %d stocks", len(cache))
+        except Exception as e:
+            _northbound_ts = time.monotonic()
+            log.warning("northbound holding rank failed: %s", str(e)[:100])
+
+
+def get_northbound_flow(symbol: str) -> dict:
+    """Return 5-day northbound holding change for A-share symbols."""
+    code = _normalize_code(symbol)
+    out = {
+        "date": "",
+        "hold_mv": None,
+        "hold_ratio_float": None,
+        "hold_ratio_total": None,
+        "add_shares_5d": None,
+        "add_mv_5d": None,
+        "add_mv_pct_5d": None,
+        "add_ratio_float_5d": None,
+        "add_ratio_total_5d": None,
+        "board": "",
+        "_partial": True,
+    }
+    _ensure_northbound()
+    rec = _northbound_cache.get(code)
+    if rec:
+        out.update(rec)
+        out["_partial"] = False
+    return out
+
+
+def _score_northbound(flow: dict) -> tuple[int, list[dict]]:
+    """Score northbound holding changes independently on a 0-15 scale."""
+    add_mv = _safe_float(flow.get("add_mv_5d"))
+    add_pct = _safe_float(flow.get("add_mv_pct_5d"))
+    add_ratio = _safe_float(flow.get("add_ratio_float_5d"))
+    if add_mv is None and add_pct is None and add_ratio is None:
+        return 0, [{"score": 0, "desc": "北向持股数据缺失", "kind": "neutral"}]
+
+    score = 0
+    if add_mv is not None:
+        if add_mv >= 5e8:
+            score += 6
+        elif add_mv >= 1e8:
+            score += 4
+        elif add_mv > 0:
+            score += 2
+        elif add_mv <= -3e8:
+            score -= 4
+        elif add_mv < 0:
+            score -= 2
+
+    if add_pct is not None:
+        if add_pct >= 20:
+            score += 4
+        elif add_pct >= 5:
+            score += 3
+        elif add_pct > 0:
+            score += 1
+        elif add_pct <= -10:
+            score -= 3
+        elif add_pct < 0:
+            score -= 1
+
+    if add_ratio is not None:
+        if add_ratio >= 0.5:
+            score += 5
+        elif add_ratio >= 0.1:
+            score += 3
+        elif add_ratio > 0:
+            score += 1
+        elif add_ratio <= -0.3:
+            score -= 3
+        elif add_ratio < 0:
+            score -= 1
+
+    score = max(0, min(15, score))
+    kind = "good" if score >= 10 else ("neutral" if score >= 5 else "warn")
+    parts = []
+    if add_mv is not None:
+        parts.append(f"5日增持市值 {add_mv/1e8:+.2f}亿")
+    if add_pct is not None:
+        parts.append(f"市值增幅 {add_pct:+.2f}%")
+    if add_ratio is not None:
+        parts.append(f"占流通股比 {add_ratio:+.3f}%")
+    desc = "北向资金 " + "，".join(parts)
+    return score, [{"score": score, "desc": desc, "kind": kind}]
+
+
+# ---------------------------------------------------------------------------
+# 机构研报：近 30 天评级热度
+# ---------------------------------------------------------------------------
+
+def get_research_rating(symbol: str, days: int = 30) -> dict:
+    """Return recent research-report rating summary for one stock."""
+    code = _normalize_code(symbol)
+    cached = _research_cache.get(code)
+    if cached and (time.monotonic() - cached[0]) < _RESEARCH_TTL:
+        return cached[1]
+
+    out = {
+        "days": days,
+        "report_count": 0,
+        "buy_count": 0,
+        "positive_count": 0,
+        "neutral_count": 0,
+        "negative_count": 0,
+        "institutions": [],
+        "latest_reports": [],
+        "_partial": True,
+    }
+    try:
+        ak = _ak()
+        df = ak.stock_research_report_em(symbol=code)
+        if df is not None and not df.empty:
+            cutoff = date.today() - timedelta(days=days)
+            reports = []
+            institutions: set[str] = set()
+            buy_count = positive_count = neutral_count = negative_count = 0
+            for _, row in df.iterrows():
+                d = _parse_date_only(row.get("日期"))
+                if d is None or d < cutoff:
+                    continue
+                rating = _clean_text(row.get("东财评级"))
+                title = _clean_text(row.get("报告名称"))
+                org = _clean_text(row.get("机构"))
+                if org:
+                    institutions.add(org)
+                if "买入" in rating:
+                    buy_count += 1
+                    positive_count += 1
+                elif "增持" in rating or "推荐" in rating or "强推" in rating:
+                    positive_count += 1
+                elif "卖出" in rating or "减持" in rating:
+                    negative_count += 1
+                elif rating:
+                    neutral_count += 1
+                reports.append({
+                    "date": d.isoformat(),
+                    "title": title,
+                    "rating": rating,
+                    "institution": org,
+                    "pdf_url": _clean_text(row.get("报告PDF链接")),
+                })
+            reports.sort(key=lambda x: x["date"], reverse=True)
+            out.update({
+                "report_count": len(reports),
+                "buy_count": buy_count,
+                "positive_count": positive_count,
+                "neutral_count": neutral_count,
+                "negative_count": negative_count,
+                "institutions": sorted(institutions)[:12],
+                "latest_reports": reports[:3],
+                "_partial": False,
+            })
+    except Exception as e:
+        log.debug("stock_research_report_em(%s) failed: %s", code, e)
+
+    if len(_research_cache) >= _MAX_RESEARCH_CACHE:
+        oldest_key = min(_research_cache, key=lambda k: _research_cache[k][0])
+        _research_cache.pop(oldest_key, None)
+    _research_cache[code] = (time.monotonic(), out)
+    return out
+
+
+def _score_research_rating(research: dict) -> tuple[int, list[dict]]:
+    """Score recent institution research signal independently on 0-15."""
+    count = int(research.get("report_count") or 0)
+    if count <= 0:
+        return 0, [{"score": 0, "desc": "近 30 天无机构研报", "kind": "neutral"}]
+
+    buy = int(research.get("buy_count") or 0)
+    positive = int(research.get("positive_count") or 0)
+    negative = int(research.get("negative_count") or 0)
+    inst_count = len(research.get("institutions") or [])
+
+    score = 0
+    if count >= 10:
+        score += 4
+    elif count >= 5:
+        score += 3
+    elif count >= 2:
+        score += 2
+    else:
+        score += 1
+
+    if buy >= 3:
+        score += 5
+    elif buy >= 1:
+        score += 3
+
+    if positive >= 8:
+        score += 4
+    elif positive >= 3:
+        score += 3
+    elif positive >= 1:
+        score += 1
+
+    if inst_count >= 5:
+        score += 2
+    elif inst_count >= 2:
+        score += 1
+
+    if negative > 0:
+        score -= min(4, negative * 2)
+
+    score = max(0, min(15, score))
+    kind = "good" if score >= 10 else ("neutral" if score >= 5 else "warn")
+    desc = f"近 30 天研报 {count} 篇，买入 {buy} 篇，正面 {positive} 篇，机构 {inst_count} 家"
+    if negative:
+        desc += f"，负面评级 {negative} 篇"
+    return score, [{"score": score, "desc": desc, "kind": kind}]
+
+
+# ---------------------------------------------------------------------------
+# 减持风险：董监高及相关人员持股变动
+# ---------------------------------------------------------------------------
+
+def _ensure_insider_changes(days: int = 90):
+    """Load recent insider holding changes once per TTL."""
+    global _insider_change_cache, _insider_change_ts
+    with _insider_change_lock:
+        if _insider_change_ts > 0 and (time.monotonic() - _insider_change_ts) < _INSIDER_CHANGE_TTL:
+            return
+        try:
+            ak = _ak()
+            df = ak.stock_hold_management_detail_em()
+            if df is None or df.empty:
+                _insider_change_cache = {}
+                _insider_change_ts = time.monotonic()
+                return
+            cutoff = date.today() - timedelta(days=days)
+            grouped: dict[str, dict] = {}
+            for _, row in df.iterrows():
+                d = _parse_date_only(row.get("日期"))
+                if d is None or d < cutoff:
+                    continue
+                code = str(row.get("代码", "")).strip().zfill(6)
+                if not code:
+                    continue
+                shares = _safe_float(row.get("变动股数"))
+                amount = _safe_float(row.get("变动金额"))
+                if (shares is None or shares >= 0) and (amount is None or amount >= 0):
+                    continue
+                amount_abs = abs(amount or 0.0)
+                shares_abs = abs(shares or 0.0)
+                rec = grouped.setdefault(code, {
+                    "reduce_count": 0,
+                    "total_reduce_amount": 0.0,
+                    "total_reduce_shares": 0.0,
+                    "latest_date": "",
+                    "events": [],
+                    "days": days,
+                })
+                rec["reduce_count"] += 1
+                rec["total_reduce_amount"] += amount_abs
+                rec["total_reduce_shares"] += shares_abs
+                date_text = d.isoformat()
+                if date_text > rec["latest_date"]:
+                    rec["latest_date"] = date_text
+                rec["events"].append({
+                    "date": date_text,
+                    "name": _clean_text(row.get("名称")),
+                    "person": _clean_text(row.get("变动人")),
+                    "position": _clean_text(row.get("职务")),
+                    "relation": _clean_text(row.get("变动人与董监高的关系")),
+                    "reason": _clean_text(row.get("变动原因")),
+                    "shares": shares,
+                    "amount": amount,
+                    "price": _safe_float(row.get("成交均价")),
+                    "ratio": _safe_float(row.get("变动比例")),
+                })
+            for rec in grouped.values():
+                rec["events"].sort(key=lambda x: x.get("date") or "", reverse=True)
+                rec["events"] = rec["events"][:5]
+            _insider_change_cache = grouped
+            _insider_change_ts = time.monotonic()
+            log.info("insider holding changes refreshed: %d stocks", len(grouped))
+        except Exception as e:
+            _insider_change_ts = time.monotonic()
+            log.warning("insider holding changes failed: %s", str(e)[:100])
+
+
+def get_insider_reduction(symbol: str, days: int = 90) -> dict:
+    """Return recent insider reduction summary."""
+    code = _normalize_code(symbol)
+    out = {
+        "days": days,
+        "reduce_count": 0,
+        "total_reduce_amount": 0.0,
+        "total_reduce_shares": 0.0,
+        "latest_date": "",
+        "events": [],
+        "_partial": True,
+    }
+    _ensure_insider_changes(days=days)
+    rec = _insider_change_cache.get(code)
+    if rec:
+        out.update(rec)
+        out["_partial"] = False
+    return out
+
+
+def _score_insider_reduction(reduction: dict) -> tuple[int, list[dict]]:
+    """Risk score for insider reductions, 0 means no risk and 15 means severe."""
+    count = int(reduction.get("reduce_count") or 0)
+    amount = _safe_float(reduction.get("total_reduce_amount")) or 0.0
+    if count <= 0 and amount <= 0:
+        return 0, [{"score": 0, "desc": "近 90 天未发现董监高/相关人员减持", "kind": "good"}]
+
+    score = 0
+    if amount >= 5e8:
+        score += 10
+    elif amount >= 1e8:
+        score += 7
+    elif amount >= 3e7:
+        score += 5
+    elif amount > 0:
+        score += 3
+
+    if count >= 5:
+        score += 4
+    elif count >= 2:
+        score += 2
+    elif count == 1:
+        score += 1
+
+    latest = _parse_date_only(reduction.get("latest_date"))
+    if latest and (date.today() - latest).days <= 14:
+        score += 2
+
+    score = max(0, min(15, score))
+    kind = "bad" if score >= 10 else ("warn" if score >= 5 else "neutral")
+    desc = f"近 90 天董监高/相关人员减持 {count} 次，估算金额 {amount/1e8:.2f}亿"
+    if reduction.get("latest_date"):
+        desc += f"，最近 {reduction['latest_date']}"
+    return score, [{"score": -score, "desc": desc, "kind": kind}]
+
+
+# ---------------------------------------------------------------------------
 # 行业景气度（行业排名 + 资金流）
 # ---------------------------------------------------------------------------
 
@@ -229,7 +732,7 @@ def _ensure_industries():
     """拉取行业 + 概念资金流数据，按涨幅+净流入排序"""
     global _hot_industries, _hot_concepts, _industry_ts
     with _industry_lock:
-        if _hot_industries and (time.monotonic() - _industry_ts) < _INDUSTRY_TTL:
+        if _industry_ts > 0 and (time.monotonic() - _industry_ts) < _INDUSTRY_TTL:
             return
         try:
             ak = _ak()
@@ -273,6 +776,7 @@ def _ensure_industries():
             _industry_ts = time.monotonic()
             log.info("行业景气度刷新: %d 个行业 / %d 个概念", len(inds), len(cons))
         except Exception as e:
+            _industry_ts = time.monotonic()
             log.warning("行业景气度拉取失败: %s", str(e)[:100])
 
 
@@ -301,8 +805,59 @@ def get_industry_rank(industry_name: str) -> Optional[dict]:
                 "change_pct": ind["change_pct"],
                 "net_inflow": ind.get("net_inflow"),
                 "matched_name": ind["name"],
+                "leader": ind.get("leader"),
+                "leader_pct": ind.get("leader_pct"),
+                "company_count": ind.get("company_count"),
+                "percentile": round(1 - (i / max(len(_hot_industries), 1)), 4),
             }
     return None
+
+
+def _score_industry(industry_name: str) -> tuple[int, Optional[dict], list[dict]]:
+    """Score industry heat independently on a 0-15 scale."""
+    if not industry_name:
+        return 0, None, [{"score": 0, "desc": "行业数据缺失", "kind": "neutral"}]
+    rank = get_industry_rank(industry_name)
+    if not rank:
+        return 0, None, [{"score": 0, "desc": f"行业 {industry_name} 未匹配到景气度排名", "kind": "neutral"}]
+
+    total = max(int(rank.get("total") or 1), 1)
+    r = max(int(rank.get("rank") or total), 1)
+    change_pct = _safe_float(rank.get("change_pct")) or 0.0
+    net_inflow = _safe_float(rank.get("net_inflow"))
+
+    score = 0
+    if r <= 5:
+        score += 8
+    elif r / total <= 0.20:
+        score += 6
+    elif r / total <= 0.50:
+        score += 3
+
+    if change_pct >= 3:
+        score += 4
+    elif change_pct >= 1:
+        score += 3
+    elif change_pct > 0:
+        score += 1
+    elif change_pct <= -2:
+        score -= 2
+
+    if net_inflow is not None:
+        if net_inflow >= 3e8:
+            score += 3
+        elif net_inflow > 0:
+            score += 1
+        elif net_inflow <= -3e8:
+            score -= 2
+
+    score = max(0, min(15, score))
+    kind = "good" if score >= 10 else ("neutral" if score >= 5 else "warn")
+    flow_text = "" if net_inflow is None else f"，净流入 {net_inflow/1e8:+.2f}亿"
+    desc = f"行业 {rank.get('matched_name') or industry_name} 排名 {r}/{total}，涨跌幅 {change_pct:+.2f}%{flow_text}"
+    if rank.get("leader"):
+        desc += f"，领涨 {rank['leader']}"
+    return score, rank, [{"score": score, "desc": desc, "kind": kind}]
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +929,14 @@ def evaluate_fundamental(symbol: str, name: str = "") -> dict:
         info["is_st"] = True
 
     fund_flow = get_fund_flow(symbol)
+    northbound_flow = get_northbound_flow(symbol)
+    research_rating = get_research_rating(symbol)
+    insider_reduction = get_insider_reduction(symbol)
     lhb = get_lhb_record(symbol)
+    industry_score, industry_rank, industry_items = _score_industry(info.get("industry", ""))
+    northbound_score, northbound_items = _score_northbound(northbound_flow)
+    research_score, research_items = _score_research_rating(research_rating)
+    insider_reduction_score, insider_reduction_items = _score_insider_reduction(insider_reduction)
 
     blocks: list[str] = []
 
@@ -396,6 +958,10 @@ def evaluate_fundamental(symbol: str, name: str = "") -> dict:
             blocks.append(f"PE={pe:.0f}（严重亏损）")
         elif pe > 200:
             blocks.append(f"PE={pe:.0f}（估值严重过高）")
+
+    if insider_reduction_score >= 10:
+        amount = _safe_float(insider_reduction.get("total_reduce_amount")) or 0.0
+        blocks.append(f"董监高/相关人员近 90 天大额减持 {amount/1e8:.2f} 亿")
 
     # 龙虎榜负面：跌幅净卖出
     for r in lhb:
@@ -512,10 +1078,22 @@ def evaluate_fundamental(symbol: str, name: str = "") -> dict:
         "hard_blocks": blocks,
         "quality": quality,
         "flow_score": flow_score,
+        "industry_score": industry_score,
+        "northbound_score": northbound_score,
+        "research_score": research_score,
+        "insider_reduction_score": insider_reduction_score,
         "quality_items": quality_items,
         "flow_items": flow_items,
+        "industry_items": industry_items,
+        "northbound_items": northbound_items,
+        "research_items": research_items,
+        "insider_reduction_items": insider_reduction_items,
+        "industry_rank": industry_rank,
         "info": info,
         "fund_flow": fund_flow,
+        "northbound_flow": northbound_flow,
+        "research_rating": research_rating,
+        "insider_reduction": insider_reduction,
         "lhb": lhb,
     }
 
@@ -524,10 +1102,18 @@ def clear_cache():
     """清除所有缓存"""
     global _info_cache, _flow_cache, _lhb_cache, _lhb_ts, _market_flow_cache, _market_flow_ts
     global _hot_industries, _hot_concepts, _industry_ts
+    global _northbound_cache, _northbound_ts
+    global _insider_change_cache, _insider_change_ts
+    global _research_cache
     _info_cache.clear()
     _flow_cache.clear()
+    _research_cache.clear()
     _market_flow_cache = {}
     _market_flow_ts = 0.0
+    _northbound_cache = {}
+    _northbound_ts = 0.0
+    _insider_change_cache = {}
+    _insider_change_ts = 0.0
     _lhb_cache = {}
     _lhb_ts = 0.0
     _hot_industries = []

@@ -1,8 +1,19 @@
 import axios from 'axios'
 
+const API_KEY_STORAGE = 'alphaagent:api_key'
+
 export const http = axios.create({
   baseURL: '/api/v1',
   timeout: 60000,
+})
+
+http.interceptors.request.use(config => {
+  const key = localStorage.getItem(API_KEY_STORAGE)
+  if (key) {
+    config.headers = config.headers || {}
+    config.headers['X-Api-Key'] = key
+  }
+  return config
 })
 
 http.interceptors.response.use(
@@ -12,6 +23,16 @@ http.interceptors.response.use(
     return Promise.reject(new Error(msg))
   }
 )
+
+export function getApiKey() {
+  return localStorage.getItem(API_KEY_STORAGE) || ''
+}
+
+export function setApiKey(key) {
+  const value = String(key || '').trim()
+  if (value) localStorage.setItem(API_KEY_STORAGE, value)
+  else localStorage.removeItem(API_KEY_STORAGE)
+}
 
 export const api = {
   // 行情
@@ -46,6 +67,16 @@ export const api = {
   upsertPosition: (data) => http.post('/positions/', data),
   deletePosition: (symbol) => http.delete(`/positions/${symbol}`),
 
+  // 交易闭环
+  tradingAccount: () => http.get('/trading/account'),
+  tradingPositions: () => http.get('/trading/positions'),
+  tradingOrders: (limit = 100) => http.get('/trading/orders', { params: { limit } }),
+  tradingFills: (limit = 100) => http.get('/trading/fills', { params: { limit } }),
+  tradingSync: (limit = 200) => http.post('/trading/sync', null, { params: { limit }, timeout: 120000 }),
+  tradingPreview: (data) => http.post('/trading/preview', data),
+  tradingPlaceOrder: (data) => http.post('/trading/orders', data),
+  tradingCancelOrder: (orderId) => http.post(`/trading/orders/${orderId}/cancel`),
+
   // 系统
   health: () => http.get('/health'),
   wsStatus: () => http.get('/ws/status'),
@@ -55,6 +86,7 @@ export const api = {
   llmConfigSet: (data) => http.post('/llm/config', data),
   llmConfigReset: () => http.delete('/llm/config'),
   llmTest: (level = 'quick') => http.post('/llm/test', null, { params: { level }, timeout: 120000 }),
+  llmUsage: (params = {}) => http.get('/llm/usage', { params }),
 
   // 大盘扫描器（潜力股）
   scannerScan: (data = {}) => http.post('/scanner/scan', {
@@ -65,6 +97,16 @@ export const api = {
   scannerStrategies: () => http.get('/scanner/strategies'),
   scannerStatus: () => http.get('/scanner/status'),
   scannerClearCache: () => http.delete('/scanner/cache'),
+
+  // 模型进化
+  evolutionSummary: () => http.get('/evolution/summary'),
+  evolutionPredictions: (params = {}) => http.get('/evolution/predictions', { params }),
+  evolutionModels: () => http.get('/evolution/models'),
+  evolutionScanRuns: (params = {}) => http.get('/evolution/scan-runs', { params }),
+  evolutionCompare: (params = {}) => http.get('/evolution/compare', { params }),
+  evolutionValidate: (data = {}) => http.post('/evolution/validate', data, { timeout: 300000 }),
+  evolutionEvolve: (data = {}) => http.post('/evolution/evolve', data),
+  evolutionAutoCycle: () => http.post('/evolution/auto-cycle'),
 }
 
 // WebSocket 工具

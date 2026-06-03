@@ -28,6 +28,9 @@ async def lifespan(_: FastAPI):
     # 启动 WebSocket 后台循环
     from apps.api.app.api.routes.ws import ensure_running
     await ensure_running()
+    # 启动预测到期自动验证循环（默认每天一次，可用环境变量关闭）
+    from apps.api.app.services import evolution_service
+    evolution_service.ensure_validation_loop_running()
     yield
     # 优雅关闭
     # 1. 停止 WS quote_loop
@@ -36,7 +39,12 @@ async def lifespan(_: FastAPI):
         await ws_stop()
     except Exception as e:
         logging.getLogger("quant.main").warning("WebSocket stop failed: %s", e)
-    # 2. 关闭飞书线程池
+    # 2. 停止模型进化验证循环
+    try:
+        await evolution_service.stop_validation_loop()
+    except Exception as e:
+        logging.getLogger("quant.main").warning("Evolution validation stop failed: %s", e)
+    # 3. 关闭飞书线程池
     from apps.api.app.services.feishu_service import shutdown as feishu_shutdown
     try:
         feishu_shutdown()

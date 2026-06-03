@@ -58,6 +58,7 @@ def _migrate_legacy_columns():
         ("positions", "last_alert_at", "DATETIME", None),
         ("positions", "last_alert_kind", "VARCHAR(32)", None),
         ("analysis_cache", "updated_at", "DATETIME", "UPDATE analysis_cache SET updated_at = created_at WHERE updated_at IS NULL"),
+        ("trade_fills", "evolution_recorded_at", "DATETIME", None),
     ]
     with engine.begin() as conn:
         for table, col, coltype, backfill in migrations:
