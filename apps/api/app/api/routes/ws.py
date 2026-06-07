@@ -7,8 +7,9 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 
+from apps.api.app.core.auth import authenticate_api_key, get_current_user
 from apps.api.app.core.config import get_settings
 from apps.api.app.db.session import session_scope
 
@@ -151,8 +152,18 @@ async def stop():
 # WebSocket 端点
 # ---------------------------------------------------------------------------
 
+async def _authenticate_ws(ws: WebSocket) -> bool:
+    try:
+        authenticate_api_key(ws.query_params.get("api_key"), source="api_key query parameter")
+        return True
+    except HTTPException as exc:
+        await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason=str(exc.detail))
+        return False
+
 @router.websocket("/ws/quotes")
 async def ws_quotes(ws: WebSocket):
+    if not await _authenticate_ws(ws):
+        return
     await manager.connect("quotes", ws)
     await ensure_running()
     try:
@@ -164,6 +175,8 @@ async def ws_quotes(ws: WebSocket):
 
 @router.websocket("/ws/alerts")
 async def ws_alerts(ws: WebSocket):
+    if not await _authenticate_ws(ws):
+        return
     await manager.connect("alerts", ws)
     await ensure_running()
     try:
@@ -174,7 +187,7 @@ async def ws_alerts(ws: WebSocket):
 
 
 @router.get("/ws/status")
-async def ws_status():
+async def ws_status(_: object = Depends(get_current_user)):
     return {
         "quotes_clients": manager.count("quotes"),
         "alerts_clients": manager.count("alerts"),

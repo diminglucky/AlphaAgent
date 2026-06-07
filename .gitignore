@@ -11,6 +11,7 @@ backups/
 
 # 包含 API Key 的运行时配置（敏感信息）
 data/llm_runtime.json
+data/runtime_config.json
 data/*.db
 data/*.db-journal
 data/*.db-wal

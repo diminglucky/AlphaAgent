@@ -7,6 +7,7 @@ from apps.api.app.core.auth import (
     AuthenticatedUser,
     UserRole,
     _resolve_role,
+    authenticate_api_key,
     get_current_user,
     require_admin,
     require_trader,
@@ -72,6 +73,21 @@ def test_get_current_user_invalid_key_raises(monkeypatch) -> None:
     with pytest.raises(HTTPException) as exc_info:
         get_current_user(x_api_key="wrong-key")
     assert exc_info.value.status_code == 403
+
+
+def test_settings_defaults_to_auth_enabled_when_env_absent(monkeypatch) -> None:
+    monkeypatch.delenv("QUANT_AUTH_ENABLED", raising=False)
+    settings = Settings()
+    assert settings.auth_enabled is True
+
+
+def test_authenticate_api_key_ignores_empty_default_keys(monkeypatch) -> None:
+    from apps.api.app.core import auth as auth_mod
+
+    monkeypatch.setattr(auth_mod, "get_settings", lambda: Settings(auth_enabled=True))
+    with pytest.raises(HTTPException) as exc_info:
+        authenticate_api_key("")
+    assert exc_info.value.status_code == 401
 
 
 def test_require_trader_and_admin_guards() -> None:

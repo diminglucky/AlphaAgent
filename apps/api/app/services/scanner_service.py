@@ -46,15 +46,16 @@ import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
+import json
 
 from apps.api.app.services import market_service
 from apps.api.app.services import fundamental_service
 
 log = logging.getLogger("quant.scanner")
 
-# 缓存（5 分钟）
+# 缓存（5 分钟）。每个 key 自带时间戳，避免新扫描延长旧参数结果的 TTL。
 _scan_cache: dict = {}
-_scan_ts: float = 0.0
+_scan_ts: float = 0.0  # 兼容旧测试/状态展示；实际 TTL 以 entry["ts"] 为准。
 _CACHE_TTL = 300
 
 # K 线缓存（同一次扫描内复用，TTL 5 分钟，扫描期间避免重复拉取）
@@ -126,6 +127,19 @@ def _score_news_sentiment(news: list[dict]) -> dict:
         "top_negative": negative_events[:3],
         "count": len(news),
     }
+
+
+def _get_cached_scan_result(cache_key: str) -> dict | None:
+    entry = _scan_cache.get(cache_key)
+    if not isinstance(entry, dict) or "value" not in entry:
+        return None
+    try:
+        ts = float(entry.get("ts") or 0.0)
+    except Exception:
+        return None
+    if time.monotonic() - ts >= _CACHE_TTL:
+        return None
+    return dict(entry["value"])
 
 
 def _get_kline_cached(symbol: str) -> list[dict]:
@@ -1033,6 +1047,7 @@ def scan_potential_stocks(
     enable_fundamental: bool = True,
     enable_llm: bool = True,
     llm_top_n: int = 12,
+    target_horizon_days: int | None = None,
     progress_callback=None,
 ) -> dict:
     """三层漏斗扫描：技术海选 → 基本面过滤 → LLM 终审。
@@ -1044,17 +1059,31 @@ def scan_potential_stocks(
         enable_fundamental: 是否启用 Tier-2 基本面过滤
         enable_llm: 是否启用 Tier-3 LLM 终审
         llm_top_n: 进入 Tier-3 的最大数量（每只一次 LLM 调用，控制耗时）
+        target_horizon_days: 按指定周期的上涨概率排序；None 表示自动选择期望收益最佳周期
         progress_callback: 进度回调（可选）
         required_strategies: 必须命中的策略名列表
     """
     global _scan_cache, _scan_ts
     from datetime import date as _date
 
-    cache_key = f"{_date.today()}_top{top_n}_min{min_score}_pool{candidate_pool}_req{required_strategies}_f{enable_fundamental}_l{enable_llm}"
-    if use_cache and _scan_cache.get(cache_key) and (time.monotonic() - _scan_ts < _CACHE_TTL):
-        result = dict(_scan_cache[cache_key])
-        result["cached"] = True
-        return result
+    normalized_horizon = int(target_horizon_days or 0)
+    cache_payload = {
+        "date": _date.today().isoformat(),
+        "top_n": top_n,
+        "min_score": min_score,
+        "candidate_pool": candidate_pool,
+        "filter_params": filter_params or {},
+        "required_strategies": sorted(required_strategies or []),
+        "enable_fundamental": enable_fundamental,
+        "enable_llm": enable_llm,
+        "llm_top_n": llm_top_n,
+        "target_horizon_days": normalized_horizon,
+    }
+    cache_key = json.dumps(cache_payload, ensure_ascii=False, sort_keys=True, default=str)
+    cached_result = _get_cached_scan_result(cache_key) if use_cache else None
+    if cached_result is not None:
+        cached_result["cached"] = True
+        return cached_result
 
     t0 = time.monotonic()
 
@@ -1507,10 +1536,17 @@ def scan_potential_stocks(
                 "rejected": len(rejected),
             })
 
-    # 推荐列表：未被 AI 否决的；保留 rejected 列表给前端显示
-    recommended_list = [r for r in final_results if not r.get("_ai_rejected")][:top_n]
+    # 推荐列表：未被 AI 否决的；保留 rejected 列表给前端显示。
+    # 进化模型必须在 top_n 截断前参与排序，否则“上涨概率更高”的候选可能永远进不了最终列表。
+    recommended_pool = [r for r in final_results if not r.get("_ai_rejected")]
     rejected_list = [r for r in final_results if r.get("_ai_rejected")]
-    final_results = recommended_list
+    reviewed_count = len(recommended_pool) + len(rejected_list)
+
+    final_results, evolution_meta = _rank_recommendations_with_evolution(
+        recommended_pool,
+        top_n,
+        target_horizon_days=target_horizon_days,
+    )
 
     elapsed = round((time.monotonic() - t0) * 1000, 1)
     log.info("scanner: 三层漏斗完成，AI 推荐 %d / AI 否决 %d，耗时 %.0fms",
@@ -1522,7 +1558,7 @@ def scan_potential_stocks(
     # 检测 LLM 实际运行状态（盘点 Tier-3 中实际有多少只用了真 LLM）
     llm_status = "disabled"
     if enable_llm:
-        all_t3 = final_results + rejected_list
+        all_t3 = recommended_pool + rejected_list
         llm_used = [r for r in all_t3 if (r.get("ai_analysis") or {}).get("used_llm")]
         rule_used = [r for r in all_t3 if (r.get("ai_analysis") or {}).get("used_llm") is False]
         if rule_used and not llm_used:
@@ -1532,39 +1568,13 @@ def scan_potential_stocks(
         else:
             llm_status = "ok"
 
-    evolution_meta = {}
-    try:
-        from apps.api.app.services import evolution_service
-        enriched = evolution_service.enrich_scan_results_with_model(final_results)
-        final_results = enriched["results"]
-        evolution_meta = {
-            "model_version_id": enriched.get("model_version_id"),
-            "model_version": enriched.get("model_version"),
-        }
-
-        def _evolution_sort_key(r: dict):
-            ai = r.get("ai_analysis") or {}
-            action = str(ai.get("action") or "BUY").upper()
-            action_rank = 2 if action == "BUY" else (1 if action == "HOLD" else 0)
-            evo = r.get("evolution") or {}
-            return (
-                action_rank,
-                float(evo.get("probability") or 0),
-                float(evo.get("expected_return_pct") or 0),
-                int(r.get("score") or 0),
-            )
-
-        final_results.sort(key=_evolution_sort_key, reverse=True)
-    except Exception as e:
-        log.warning("scanner evolution enrichment failed: %s", e)
-
     output = {
         "scanned": len(all_quotes),
         "candidates": len(candidates),
         "analyzed": len(pool),
         "tier1_count": len(tier1_top),
         "tier2_count": len(tier2_results) if enable_fundamental else None,
-        "tier3_count": (len(final_results) + len(rejected_list)) if enable_llm else None,
+        "tier3_count": reviewed_count if enable_llm else None,
         "results": final_results,
         "rejected_results": rejected_list if enable_llm else [],
         "market_status": market_status,
@@ -1581,6 +1591,7 @@ def scan_potential_stocks(
             "enable_fundamental": enable_fundamental,
             "enable_llm": enable_llm,
             "llm_top_n": llm_top_n,
+            "target_horizon_days": normalized_horizon,
         },
     }
 
@@ -1593,9 +1604,53 @@ def scan_potential_stocks(
     except Exception as e:
         log.warning("scanner evolution record failed: %s", e)
 
-    _scan_cache[cache_key] = output
+    _scan_cache[cache_key] = {"ts": time.monotonic(), "value": output}
     _scan_ts = time.monotonic()
     return output
+
+
+def _rank_recommendations_with_evolution(
+    recommendation_pool: list[dict],
+    top_n: int,
+    *,
+    target_horizon_days: int | None = None,
+) -> tuple[list[dict], dict]:
+    """Enrich and rank the full recommendation pool before final truncation."""
+    if not recommendation_pool:
+        return [], {}
+
+    ranked = list(recommendation_pool)
+    evolution_meta: dict = {}
+    try:
+        from apps.api.app.services import evolution_service
+
+        enriched = evolution_service.enrich_scan_results_with_model(
+            ranked,
+            target_horizon_days=target_horizon_days,
+        )
+        ranked = enriched["results"]
+        evolution_meta = {
+            "model_version_id": enriched.get("model_version_id"),
+            "model_version": enriched.get("model_version"),
+        }
+        ranked.sort(key=_evolution_sort_key, reverse=True)
+    except Exception as e:
+        log.warning("scanner evolution enrichment failed: %s", e)
+
+    return ranked[:top_n], evolution_meta
+
+
+def _evolution_sort_key(r: dict) -> tuple:
+    ai = r.get("ai_analysis") or {}
+    action = str(ai.get("action") or "BUY").upper()
+    action_rank = 2 if action == "BUY" else (1 if action == "HOLD" else 0)
+    evo = r.get("evolution") or {}
+    return (
+        action_rank,
+        float(evo.get("probability") or 0),
+        float(evo.get("expected_return_pct") or 0),
+        int(r.get("score") or 0),
+    )
 
 
 def _compute_market_status(all_quotes: list[dict]) -> dict:

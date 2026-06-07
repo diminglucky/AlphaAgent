@@ -6,10 +6,11 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
 from apps.api.app.core.auth import get_current_user, require_admin
+from apps.api.app.core.runtime_config import clear_runtime_section, get_runtime_config, update_runtime_section
 from apps.api.app.db.session import get_db
 from apps.api.app.services import evolution_service
 
@@ -25,6 +26,111 @@ class ValidateReq(BaseModel):
 class EvolveReq(BaseModel):
     min_samples: Optional[int] = Field(default=None, ge=1, le=10000)
     promote: bool = False
+
+
+class EvolutionConfigUpdate(BaseModel):
+    validate_interval_seconds: Optional[int] = Field(default=None, ge=0, le=604800)
+    validate_initial_delay_seconds: Optional[int] = Field(default=None, ge=0, le=86400)
+    validate_limit: Optional[int] = Field(default=None, ge=1, le=5000)
+    validate_time: Optional[str] = Field(default=None, max_length=16)
+    failure_alert_enabled: Optional[bool] = None
+    failure_alert_cooldown_seconds: Optional[int] = Field(default=None, ge=0, le=604800)
+    auto_scan_enabled: Optional[bool] = None
+    auto_scan_interval_seconds: Optional[int] = Field(default=None, ge=0, le=604800)
+    auto_scan_top_n: Optional[int] = Field(default=None, ge=1, le=200)
+    auto_scan_min_score: Optional[int] = Field(default=None, ge=0, le=100)
+    auto_scan_candidate_pool: Optional[int] = Field(default=None, ge=1, le=1000)
+    auto_scan_enable_fundamental: Optional[bool] = None
+    auto_scan_enable_llm: Optional[bool] = None
+    auto_scan_llm_top_n: Optional[int] = Field(default=None, ge=1, le=50)
+    auto_scan_target_horizon_days: Optional[int] = Field(default=None, ge=0, le=60)
+    auto_evolve_enabled: Optional[bool] = None
+    auto_evolve_min_samples: Optional[int] = Field(default=None, ge=1, le=100000)
+    auto_promote_min_success_rate: Optional[float] = Field(default=None, ge=0, le=1)
+    auto_promote_min_avg_return_pct: Optional[float] = Field(default=None, ge=-100, le=100)
+    auto_promote_max_brier_score: Optional[float] = Field(default=None, ge=0, le=1)
+    auto_promote_max_calibration_error: Optional[float] = Field(default=None, ge=0, le=1)
+    auto_walk_forward_min_samples: Optional[int] = Field(default=None, ge=1, le=100000)
+    auto_walk_forward_min_dates: Optional[int] = Field(default=None, ge=1, le=100000)
+    auto_walk_forward_min_profitable_folds: Optional[float] = Field(default=None, ge=0, le=1)
+    auto_walk_forward_return_tolerance: Optional[float] = Field(default=None, ge=0, le=1)
+    auto_walk_forward_consistency_tolerance: Optional[float] = Field(default=None, ge=0, le=1)
+    auto_walk_forward_drawdown_tolerance: Optional[float] = Field(default=None, ge=0, le=1)
+    auto_rollback_enabled: Optional[bool] = None
+    auto_rollback_min_samples: Optional[int] = Field(default=None, ge=1, le=100000)
+    auto_rollback_min_success_rate: Optional[float] = Field(default=None, ge=0, le=1)
+    auto_rollback_min_avg_return_pct: Optional[float] = Field(default=None, ge=-100, le=100)
+    auto_rollback_max_brier_score: Optional[float] = Field(default=None, ge=0, le=1)
+
+    @field_validator("validate_time")
+    @classmethod
+    def _validate_time(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        raw = str(value).strip()
+        if not raw:
+            return ""
+        parts = raw.split(":")
+        if len(parts) != 2:
+            raise ValueError("validate_time must be HH:MM")
+        try:
+            hour = int(parts[0])
+            minute = int(parts[1])
+        except ValueError as exc:
+            raise ValueError("validate_time must be HH:MM") from exc
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError("validate_time must be HH:MM")
+        return f"{hour:02d}:{minute:02d}"
+
+
+_CONFIG_KEY_MAP = {
+    "validate_interval_seconds": "evolution_validate_interval_seconds",
+    "validate_initial_delay_seconds": "evolution_validate_initial_delay_seconds",
+    "validate_limit": "evolution_validate_limit",
+    "validate_time": "evolution_validate_time",
+    "failure_alert_enabled": "evolution_failure_alert_enabled",
+    "failure_alert_cooldown_seconds": "evolution_failure_alert_cooldown_seconds",
+    "auto_scan_enabled": "evolution_auto_scan_enabled",
+    "auto_scan_interval_seconds": "evolution_auto_scan_interval_seconds",
+    "auto_scan_top_n": "evolution_auto_scan_top_n",
+    "auto_scan_min_score": "evolution_auto_scan_min_score",
+    "auto_scan_candidate_pool": "evolution_auto_scan_candidate_pool",
+    "auto_scan_enable_fundamental": "evolution_auto_scan_enable_fundamental",
+    "auto_scan_enable_llm": "evolution_auto_scan_enable_llm",
+    "auto_scan_llm_top_n": "evolution_auto_scan_llm_top_n",
+    "auto_scan_target_horizon_days": "evolution_auto_scan_target_horizon_days",
+    "auto_evolve_enabled": "evolution_auto_evolve_enabled",
+    "auto_evolve_min_samples": "evolution_auto_evolve_min_samples",
+    "auto_promote_min_success_rate": "evolution_auto_promote_min_success_rate",
+    "auto_promote_min_avg_return_pct": "evolution_auto_promote_min_avg_return_pct",
+    "auto_promote_max_brier_score": "evolution_auto_promote_max_brier_score",
+    "auto_promote_max_calibration_error": "evolution_auto_promote_max_calibration_error",
+    "auto_walk_forward_min_samples": "evolution_auto_walk_forward_min_samples",
+    "auto_walk_forward_min_dates": "evolution_auto_walk_forward_min_dates",
+    "auto_walk_forward_min_profitable_folds": "evolution_auto_walk_forward_min_profitable_folds",
+    "auto_walk_forward_return_tolerance": "evolution_auto_walk_forward_return_tolerance",
+    "auto_walk_forward_consistency_tolerance": "evolution_auto_walk_forward_consistency_tolerance",
+    "auto_walk_forward_drawdown_tolerance": "evolution_auto_walk_forward_drawdown_tolerance",
+    "auto_rollback_enabled": "evolution_auto_rollback_enabled",
+    "auto_rollback_min_samples": "evolution_auto_rollback_min_samples",
+    "auto_rollback_min_success_rate": "evolution_auto_rollback_min_success_rate",
+    "auto_rollback_min_avg_return_pct": "evolution_auto_rollback_min_avg_return_pct",
+    "auto_rollback_max_brier_score": "evolution_auto_rollback_max_brier_score",
+}
+
+
+def _config_view() -> dict:
+    raw_runtime = get_runtime_config().get("evolution") or {}
+    runtime = raw_runtime if isinstance(raw_runtime, dict) else {}
+    short_runtime = {
+        short_key: runtime[settings_key]
+        for short_key, settings_key in _CONFIG_KEY_MAP.items()
+        if settings_key in runtime
+    }
+    return {
+        "effective": evolution_service.validation_loop_status(),
+        "runtime_override": short_runtime,
+    }
 
 
 @router.get("/summary")
@@ -114,3 +220,36 @@ def evolve(
 def auto_cycle(_: object = Depends(require_admin), db: Session = Depends(get_db)):
     """手动触发一次受控自动进化周期：质量门槛达标才晋升，变差可回滚。"""
     return evolution_service.auto_evolve_cycle(db=db)
+
+
+@router.post("/auto-scan")
+async def auto_scan(_: object = Depends(require_admin)):
+    """手动触发一次自动采样扫描，用于生成新的待验证预测样本。"""
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return await loop.run_in_executor(pool, evolution_service.run_auto_scan_once)
+
+
+@router.get("/config")
+def get_config(_: object = Depends(get_current_user)):
+    """查看自动验证/自动进化当前生效配置。"""
+    return _config_view()
+
+
+@router.post("/config")
+async def update_config(payload: EvolutionConfigUpdate, _: object = Depends(require_admin)):
+    """更新自动进化配置并重启后台循环，使调度参数立即生效。"""
+    values = payload.model_dump(exclude_none=True)
+    update_runtime_section(
+        "evolution",
+        {_CONFIG_KEY_MAP[key]: value for key, value in values.items()},
+    )
+    await evolution_service.restart_background_loops()
+    return _config_view()
+
+
+@router.delete("/config")
+async def reset_config(_: object = Depends(require_admin)):
+    clear_runtime_section("evolution")
+    await evolution_service.restart_background_loops()
+    return _config_view()

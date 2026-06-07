@@ -7,7 +7,7 @@ from datetime import datetime
 
 import httpx
 
-from apps.api.app.core.config import get_settings
+from apps.api.app.core.config import get_feishu_webhook_url
 
 log = logging.getLogger("quant.feishu")
 
@@ -35,8 +35,8 @@ def send_feishu(title: str, content: str, color: str = "blue") -> bool:
     发送飞书卡片消息（异步 fire-and-forget）。
     返回值仅表示「已提交到发送队列」，实际网络请求在后台线程执行。
     """
-    settings = get_settings()
-    if not settings.feishu_webhook_url:
+    webhook_url = get_feishu_webhook_url()
+    if not webhook_url:
         log.debug("飞书 webhook 未配置，跳过发送")
         return False
 
@@ -68,7 +68,7 @@ def send_feishu(title: str, content: str, color: str = "blue") -> bool:
     }
 
     # fire-and-forget 提交到后台线程
-    _feishu_pool.submit(_do_send, payload, title, settings.feishu_webhook_url)
+    _feishu_pool.submit(_do_send, payload, title, webhook_url)
     return True
 
 
@@ -121,4 +121,3 @@ def shutdown():
     """优雅关闭飞书发送线程池"""
     log.info("正在关闭飞书消息发送线程池...")
     _feishu_pool.shutdown(wait=True)
-

@@ -2,7 +2,7 @@
 
 > 项目：AlphaAgent (A股智能助手)  
 > 仓库：`git@github.com:diminglucky/AlphaAgent.git`  
-> 当前 HEAD：`aa650f8`
+> 当前 HEAD：以 `git log -1 --oneline` 为准
 
 本文档记录项目结构、设计决策、已修复问题、运维注意事项和后续路线。新接手的开发者读完这份文档应该能在 30 分钟内上手。
 
@@ -204,13 +204,21 @@ Agent.vue 同时监听 3 个生命周期：
 - 每次扫描写入 `scan_runs`
 - 每只推荐股生成 3 / 5 / 10 / 20 日预测样本，写入 `stock_predictions`
 - 每条预测包含当时价格、目标涨幅、止损比例、上涨概率、特征快照和原始推荐结果
+- Scanner 可选择“自动最佳 / 3 / 5 / 10 / 20 日”目标周期；进化模型会在最终 `top_n` 截断前对完整推荐池排序，避免高上涨概率股票被早期排序截掉
+- Scanner 缓存键包含 `llm_top_n`、目标周期、策略和过滤参数，避免调参后误命中旧结果
 - `/evolution/validate` 在预测到期后拉取 K 线，判断是否先触发目标价或止损，写入 `prediction_outcomes`
 - `/evolution/evolve` 基于已验证样本计算命中率、平均收益、Brier score、校准误差，并生成候选模型；`promote=true` 时切换为 active，后续扫描立即使用新权重
-- FastAPI lifespan 会启动自动验证循环，默认每日运行一次；`QUANT_EVOLUTION_VALIDATE_INTERVAL_SECONDS=0` 可关闭
-- 自动验证循环会先调用 `record_trade_fills()`：BUY 成交会转成执行预测样本，SELL 成交会提前结算同账户同股票的未验证执行预测，直接写入“真实退出是否赚钱”的 outcome
+- FastAPI lifespan 会启动自动验证循环，默认每日运行一次；`QUANT_EVOLUTION_VALIDATE_INTERVAL_SECONDS=0` 可关闭；`QUANT_EVOLUTION_VALIDATE_TIME=HH:MM` 可按服务器本地时间每天固定触发
+- FastAPI lifespan 也支持自动采样循环；`QUANT_EVOLUTION_AUTO_SCAN_ENABLED=true` 后会按 `QUANT_EVOLUTION_AUTO_SCAN_INTERVAL_SECONDS` 定时运行 Scanner，自动写入新的 scan run 和 pending prediction 样本
+- 自动采样默认关闭，且 `QUANT_EVOLUTION_AUTO_SCAN_ENABLE_LLM=false` 默认不跑 LLM，避免后台任务产生不可控耗时和费用；可在“模型进化”控制台保存运行时参数并重启后台循环
+- `/evolution/auto-scan` 可手动触发一次同样的自动采样流程，用于立即产生新预测样本并检查最近一次采样状态
+- 自动验证循环会先调用 `record_trade_fills()`：BUY 成交会转成执行预测样本，SELL 成交会按同账户同股票 FIFO 买入 fill 组和卖出数量结算未验证执行预测，直接写入“真实退出是否赚钱”的 outcome
 - 自动验证循环会继续调用受控 `auto_evolve_cycle()`：样本量、命中率、平均收益、Brier score、校准误差全部达标才自动晋升；新模型表现跌破回滚阈值时自动恢复父版本
 - `/evolution/auto-cycle` 可手动触发同一套受控自动进化检查；决策会写入 `evolution_runs`，状态包括 `auto_blocked` / `auto_promoted` / `auto_rolled_back`
-- 自动进化阈值可用环境变量配置：`QUANT_EVOLUTION_AUTO_EVOLVE_MIN_SAMPLES`、`QUANT_EVOLUTION_AUTO_PROMOTE_MIN_SUCCESS_RATE`、`QUANT_EVOLUTION_AUTO_PROMOTE_MIN_AVG_RETURN_PCT`、`QUANT_EVOLUTION_AUTO_PROMOTE_MAX_BRIER_SCORE`、`QUANT_EVOLUTION_AUTO_PROMOTE_MAX_CALIBRATION_ERROR`
+- `/evolution/config` 支持查看/保存运行时自动验证、失败告警、自动采样和自动进化阈值；保存后会重启后台循环并立即生效，运行时配置落盘到 `data/runtime_config.json`
+- 后台自动验证/进化、自动采样失败时可通过飞书发送失败告警；`QUANT_EVOLUTION_FAILURE_ALERT_ENABLED=true` 默认开启，`QUANT_EVOLUTION_FAILURE_ALERT_COOLDOWN_SECONDS=3600` 按失败类型冷却，避免数据源故障时刷屏
+- 自动采样参数可用环境变量配置：`QUANT_EVOLUTION_AUTO_SCAN_ENABLED`、`QUANT_EVOLUTION_AUTO_SCAN_INTERVAL_SECONDS`、`QUANT_EVOLUTION_AUTO_SCAN_TOP_N`、`QUANT_EVOLUTION_AUTO_SCAN_MIN_SCORE`、`QUANT_EVOLUTION_AUTO_SCAN_CANDIDATE_POOL`、`QUANT_EVOLUTION_AUTO_SCAN_ENABLE_FUNDAMENTAL`、`QUANT_EVOLUTION_AUTO_SCAN_ENABLE_LLM`、`QUANT_EVOLUTION_AUTO_SCAN_LLM_TOP_N`、`QUANT_EVOLUTION_AUTO_SCAN_TARGET_HORIZON_DAYS`
+- 自动进化阈值也可用环境变量配置：`QUANT_EVOLUTION_AUTO_EVOLVE_MIN_SAMPLES`、`QUANT_EVOLUTION_AUTO_PROMOTE_MIN_SUCCESS_RATE`、`QUANT_EVOLUTION_AUTO_PROMOTE_MIN_AVG_RETURN_PCT`、`QUANT_EVOLUTION_AUTO_PROMOTE_MAX_BRIER_SCORE`、`QUANT_EVOLUTION_AUTO_PROMOTE_MAX_CALIBRATION_ERROR`
 - 自动回滚阈值可用环境变量配置：`QUANT_EVOLUTION_AUTO_ROLLBACK_MIN_SAMPLES`、`QUANT_EVOLUTION_AUTO_ROLLBACK_MIN_SUCCESS_RATE`、`QUANT_EVOLUTION_AUTO_ROLLBACK_MIN_AVG_RETURN_PCT`、`QUANT_EVOLUTION_AUTO_ROLLBACK_MAX_BRIER_SCORE`
 - `/evolution/compare` 默认比较最近两次扫描，返回新增、连续推荐和掉队股票
 - LLMClient 会记录 provider 返回的 token usage，`/llm/usage` 返回最近调用、token 和可配置价格估算；价格通过 `QUANT_LLM_INPUT_COST_PER_MILLION_TOKENS` / `QUANT_LLM_OUTPUT_COST_PER_MILLION_TOKENS` 配置
@@ -507,7 +515,7 @@ Scanner 扫描结果保存到 `localStorage['scanner:last_result_v1']`：
 ### 7.3 飞书提醒
 
 1. **没收到提醒**
-   - 检查 `.env` 的 `QUANT_FEISHU_WEBHOOK_URL`
+   - 优先检查设置页的飞书 Webhook 运行时配置；也可检查 `.env` 的 `QUANT_FEISHU_WEBHOOK_URL`
    - 试用 `POST /api/v1/notify/test`
    - 看后台日志的 `飞书消息发送成功 / 失败`
 
@@ -531,18 +539,18 @@ Scanner 扫描结果保存到 `localStorage['scanner:last_result_v1']`：
 
 ### 8.1 API Key 保护
 
-- `data/llm_runtime.json` 文件权限 0600（已自动设置）
-- `.gitignore` 已排除 `data/llm_runtime.json` 和 `data/*.db*`
+- `data/llm_runtime.json` 和 `data/runtime_config.json` 文件权限 0600（已自动设置）
+- `.gitignore` 已排除 `data/llm_runtime.json`、`data/runtime_config.json` 和 `data/*.db*`
 - **千万不要**把 .env 或 data/ 提交到 git
 
 ### 8.2 飞书 Webhook
 
 - Webhook URL 包含 token，泄露后任何人都能发消息
-- 建议把 webhook URL 也通过设置页配置（当前是 .env，可改进为运行时配置）
+- Webhook URL 支持通过设置页运行时配置，接口只返回脱敏预览，不返回原文
 
 ### 8.3 认证
 
-默认 `QUANT_AUTH_ENABLED=false`，所有 API 公开访问。生产环境应设为 `true` 并配置 `QUANT_*_API_KEY`。
+代码默认 `QUANT_AUTH_ENABLED=true`。本地开发如需无鉴权，必须在 `.env` 显式设置 `QUANT_AUTH_ENABLED=false`。生产环境应配置强随机 `QUANT_*_API_KEY`，并把 CORS 收敛到真实前端域名。
 
 ---
 
@@ -553,18 +561,18 @@ Scanner 扫描结果保存到 `localStorage['scanner:last_result_v1']`：
 ### 高优先级
 
 1. **LLM Cost 精细化**：当前已记录真实 token usage，并支持按环境变量估算费用；后续可按 provider/model 自动维护价格表
-2. **自动定时验证增强**：当前已默认每日验证到期预测，后续可在前端配置周期、验证时间和失败告警
+2. **自动定时验证增强**：当前已默认每日验证到期预测，且可在前端配置验证周期、固定验证时间、失败告警冷却和进化阈值；后续可补交易日历感知与节假日跳过
 3. **历史扫描结果对比增强**：当前已支持最近两次扫描对比，后续可做任意日期/模型版本对比
 4. **QMT 实盘验收**：当前主 API 已支持转发和手动同步 QMT Gateway，`XtQuantBackend` 已适配真实 `xtquant` 下单、撤单、订单、持仓和资金查询；后续需要在 Windows + QMT/miniQMT 物理机做模拟盘/小额实盘验收，并按真实返回字段校准状态映射
 
 ### 中优先级
 
 5. **风控增强**：当前已接入 A 股规则、ST 拦截、单股仓位和日成交额限制；后续补行业集中度、真实交易日历、停牌/退市数据和 QMT 可卖数量实时预览
-6. **扫描进度细化**：Scanner 已接 `/scanner/ws/scan`，后续可继续显示更细的候选池数量、LLM token 和单股耗时
+6. **扫描进度细化**：Scanner 已接 `/scanner/ws/scan` 且 WebSocket 会携带 API key 查询参数；后续可继续显示更细的候选池数量、LLM token 和单股耗时
 7. **行业关联增强**：当前已显示所属行业、行业排名和景气分；后续可补概念板块关联和同业对比列表
 8. **北向资金增强**：当前已接入 5 日北向增减持排行；后续可加入连续多日明细趋势和外资持股占比历史分位
 9. **研报增强**：当前已接入近 30 天研报评级；后续可分析目标价上调/下调和盈利预测变化趋势
-10. **交易复盘入模增强**：当前 BUY 成交会转成 evolution 执行样本，SELL 成交会结算执行预测；后续需要补 FIFO 数量匹配、部分卖出、止盈止损原因和持仓周期归因
+10. **交易复盘入模增强**：当前 BUY 成交会转成 evolution 执行样本，SELL 成交会按 FIFO 买入 fill 组和部分卖出数量结算执行预测；后续需要补止盈止损原因、交易计划执行情况和更细的持仓周期归因
 
 ### 低优先级
 

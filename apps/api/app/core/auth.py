@@ -33,34 +33,38 @@ class AuthenticatedUser:
 
 def _resolve_role(api_key: str) -> Optional[UserRole]:
     settings = get_settings()
-    if api_key == settings.admin_api_key:
+    if settings.admin_api_key and api_key == settings.admin_api_key:
         return UserRole.ADMIN
-    if api_key == settings.trader_api_key:
+    if settings.trader_api_key and api_key == settings.trader_api_key:
         return UserRole.TRADER
-    if api_key == settings.viewer_api_key:
+    if settings.viewer_api_key and api_key == settings.viewer_api_key:
         return UserRole.VIEWER
     return None
 
 
-def get_current_user(x_api_key: Optional[str] = Header(default=None)) -> AuthenticatedUser:
+def authenticate_api_key(api_key: Optional[str], *, source: str = "X-Api-Key") -> AuthenticatedUser:
     settings = get_settings()
     if not settings.auth_enabled:
         return AuthenticatedUser(api_key="anonymous", role=UserRole.ADMIN)
 
-    if not x_api_key:
+    if not api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"code": "MISSING_API_KEY", "message": "X-Api-Key header is required"},
+            detail={"code": "MISSING_API_KEY", "message": f"{source} is required"},
         )
 
-    role = _resolve_role(x_api_key)
+    role = _resolve_role(api_key)
     if role is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "INVALID_API_KEY", "message": "Invalid or expired API key"},
         )
 
-    return AuthenticatedUser(api_key=x_api_key, role=role)
+    return AuthenticatedUser(api_key=api_key, role=role)
+
+
+def get_current_user(x_api_key: Optional[str] = Header(default=None)) -> AuthenticatedUser:
+    return authenticate_api_key(x_api_key)
 
 
 def require_trader(user: AuthenticatedUser = Depends(get_current_user)) -> AuthenticatedUser:

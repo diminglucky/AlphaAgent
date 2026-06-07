@@ -82,7 +82,7 @@
         <template #title>
           <span class="collapse-title">⚙️ 扫描参数</span>
           <span class="collapse-summary">
-            top_n={{ params.top_n }} · min_score={{ params.min_score }} · pool={{ params.candidate_pool }}
+            top_n={{ params.top_n }} · min_score={{ params.min_score }} · pool={{ params.candidate_pool }} · {{ targetHorizonLabel(params.target_horizon_days) }}
           </span>
         </template>
         <div class="params-row">
@@ -130,6 +130,16 @@
               controls-position="right"
               :disabled="!params.enable_llm"
             />
+          </div>
+          <div class="param-item">
+            <span class="param-label">进化目标周期</span>
+            <el-select v-model="params.target_horizon_days" size="small" style="width:132px">
+              <el-option :value="0" label="自动最佳" />
+              <el-option :value="3" label="3 日概率" />
+              <el-option :value="5" label="5 日概率" />
+              <el-option :value="10" label="10 日概率" />
+              <el-option :value="20" label="20 日概率" />
+            </el-select>
           </div>
           <div class="param-item">
             <el-switch v-model="params.enable_fundamental" size="small" />
@@ -341,7 +351,7 @@
 
         <div v-if="stock.evolution" class="evo-row">
           <div class="evo-pill primary">
-            <span>进化模型概率</span>
+            <span>{{ evolutionModeLabel(stock.evolution) }}</span>
             <b>{{ stock.evolution.probability_pct }}%</b>
           </div>
           <div class="evo-pill">
@@ -1147,7 +1157,7 @@ import {
   RadarComponent,
 } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
-import { api } from '../api.js'
+import { api, buildWebSocketUrl } from '../api.js'
 
 use([
   RadarChart,
@@ -1184,6 +1194,7 @@ const params = reactive({
   enable_fundamental: true,
   enable_llm: true,
   llm_top_n: 10,
+  target_horizon_days: 0,
 })
 
 // 维度满分配置
@@ -1271,6 +1282,17 @@ function fmtSavedAt(ts) {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
+function targetHorizonLabel(days) {
+  return Number(days || 0) > 0 ? `${days}日概率优先` : '自动最佳周期'
+}
+
+function evolutionModeLabel(evo) {
+  if (!evo) return '进化模型概率'
+  if (evo.ranking_mode === 'requested_horizon') return `${evo.best_horizon_days}日上涨概率`
+  if (evo.ranking_mode === 'nearest_requested_horizon') return `近似${evo.best_horizon_days}日概率`
+  return '进化模型概率'
+}
+
 onMounted(async () => {
   // 先恢复上次扫描结果（即时显示，无需等接口）
   _loadCachedResult()
@@ -1343,8 +1365,7 @@ async function runScan(forceRefresh = false) {
 
 function scanWithWebSocket(payload) {
   return new Promise((resolve, reject) => {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-    const ws = new WebSocket(`${proto}://${location.host}/api/v1/scanner/ws/scan`)
+    const ws = new WebSocket(buildWebSocketUrl('/api/v1/scanner/ws/scan'))
     _scanWs = ws
     let settled = false
     const timeout = setTimeout(() => {

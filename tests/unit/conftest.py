@@ -21,16 +21,24 @@ def _isolate_llm_runtime_config(tmp_path, monkeypatch):
     that assumed fallback behaviour suddenly hitting the network.
     """
     monkeypatch.setenv("QUANT_LLM_CONFIG_PATH", str(tmp_path / "llm.json"))
+    monkeypatch.setenv("QUANT_RUNTIME_CONFIG_PATH", str(tmp_path / "runtime.json"))
+    monkeypatch.setenv("QUANT_AUTH_ENABLED", "false")
     # Also clear any cached override that prior tests / imports may have set.
     from libs.llm_analyst import runtime_config as rc
+    from apps.api.app.core import config as config_mod
+    from apps.api.app.core import runtime_config as app_rc
     rc._OVERRIDE = None
     rc._OVERRIDE_MTIME = 0.0
+    config_mod.reset_settings_cache()
+    app_rc.reset_runtime_config_cache()
     # Clear any provider env vars that might short-circuit the fallback path.
     for var in ("QUANT_LLM_PROVIDER", "QUANT_LLM_API_KEY", "QUANT_LLM_MODEL"):
         monkeypatch.delenv(var, raising=False)
     yield
     rc._OVERRIDE = None
     rc._OVERRIDE_MTIME = 0.0
+    config_mod.reset_settings_cache()
+    app_rc.reset_runtime_config_cache()
 
 
 def _make_session() -> tuple[Session, "Engine"]:

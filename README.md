@@ -98,13 +98,16 @@ npm install
 
 ```bash
 QUANT_DATABASE_URL=sqlite:///./var/quant.db
-QUANT_AUTH_ENABLED=false      # 单机使用关闭认证
+QUANT_AUTH_ENABLED=false      # 仅本地单机开发关闭；代码默认开启认证
 QUANT_LLM_PROVIDER=deepseek    # 或 openai / qwen / ollama / keyword（不用 LLM）
 # 飞书可选
 QUANT_FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/xxx
 ```
 
 LLM API Key 推荐**通过网页**配置（运行时持久化到 `data/llm_runtime.json`，文件权限 0600）。
+飞书 Webhook、自动采样参数、固定验证时间、失败告警冷却和自动进化阈值也可在网页运行时保存，持久化到 `data/runtime_config.json`，文件权限 0600。后台自动采样默认关闭，开启后会定时运行 Scanner 并产生待验证预测样本；自动采样 LLM 默认关闭以控制成本。无人值守验证/采样失败可通过飞书告警，默认按失败类型冷却 3600 秒。
+
+生产部署不要关闭认证；配置 `QUANT_ADMIN_API_KEY`、`QUANT_TRADER_API_KEY`、`QUANT_VIEWER_API_KEY`，并把 `QUANT_CORS_ORIGINS` 收敛到实际前端域名。
 
 ### 4. 启动
 

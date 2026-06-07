@@ -24,7 +24,7 @@ npm install
 
 ```bash
 QUANT_DATABASE_URL=sqlite:///./var/quant.db
-QUANT_AUTH_ENABLED=false
+QUANT_AUTH_ENABLED=false  # 仅本地开发；代码默认开启认证
 QUANT_LLM_PROVIDER=keyword
 QUANT_FEISHU_WEBHOOK_URL=
 ```
@@ -36,7 +36,10 @@ QUANT_AUTH_ENABLED=true
 QUANT_ADMIN_API_KEY=<strong-admin-key>
 QUANT_TRADER_API_KEY=<strong-trader-key>
 QUANT_VIEWER_API_KEY=<strong-viewer-key>
+QUANT_CORS_ORIGINS=https://your-domain.example
 ```
+
+LLM、飞书 Webhook、自动采样参数、固定验证时间、失败告警冷却和自动进化阈值可在网页「设置 / 模型进化」中运行时保存；运行时配置写入 `data/runtime_config.json`，不要提交到 git。自动采样默认关闭，开启后会定时运行 Scanner 生成待验证样本，LLM 终审默认仍关闭以控制成本。无人值守验证/采样失败可通过飞书告警，默认按失败类型冷却 3600 秒。
 
 ## 启动服务
 

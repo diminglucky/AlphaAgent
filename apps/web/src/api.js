@@ -74,12 +74,18 @@ export const api = {
   tradingFills: (limit = 100) => http.get('/trading/fills', { params: { limit } }),
   tradingSync: (limit = 200) => http.post('/trading/sync', null, { params: { limit }, timeout: 120000 }),
   tradingPreview: (data) => http.post('/trading/preview', data),
+  tradingRebalancePlan: (data) => http.post('/trading/rebalance-plan', data, { timeout: 600000 }),
   tradingPlaceOrder: (data) => http.post('/trading/orders', data),
   tradingCancelOrder: (orderId) => http.post(`/trading/orders/${orderId}/cancel`),
 
   // 系统
   health: () => http.get('/health'),
   wsStatus: () => http.get('/ws/status'),
+  notifyStatus: () => http.get('/notify/status'),
+  notifyConfig: () => http.get('/notify/config'),
+  notifyConfigSet: (data) => http.post('/notify/config', data),
+  notifyConfigReset: () => http.delete('/notify/config'),
+  notifyTest: (data) => http.post('/notify/test', data),
 
   // LLM 配置（运行时热更新，无需重启）
   llmConfig: () => http.get('/llm/config'),
@@ -107,12 +113,22 @@ export const api = {
   evolutionValidate: (data = {}) => http.post('/evolution/validate', data, { timeout: 300000 }),
   evolutionEvolve: (data = {}) => http.post('/evolution/evolve', data),
   evolutionAutoCycle: () => http.post('/evolution/auto-cycle'),
+  evolutionAutoScan: () => http.post('/evolution/auto-scan', null, { timeout: 600000 }),
+  evolutionConfig: () => http.get('/evolution/config'),
+  evolutionConfigSet: (data = {}) => http.post('/evolution/config', data),
+  evolutionConfigReset: () => http.delete('/evolution/config'),
+}
+
+function appendApiKey(url) {
+  const key = getApiKey()
+  if (!key) return url
+  return `${url}${url.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(key)}`
 }
 
 // WebSocket 工具
 export function openStream(topic, onMessage) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-  const url = `${proto}://${location.host}/api/v1/ws/${topic}`
+  const url = appendApiKey(`${proto}://${location.host}/api/v1/ws/${topic}`)
   let ws = null
   let closed = false
   let retryMs = 2000
@@ -133,4 +149,10 @@ export function openStream(topic, onMessage) {
 
   connect()
   return () => { closed = true; ws?.close() }
+}
+
+export function buildWebSocketUrl(path) {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const normalized = path.startsWith('/') ? path : `/api/v1/${path}`
+  return appendApiKey(`${proto}://${location.host}${normalized}`)
 }

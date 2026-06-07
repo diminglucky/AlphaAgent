@@ -29,9 +29,18 @@ from apps.api.app.db.models import (
 )
 from apps.api.app.db.session import session_scope
 from apps.api.app.services import market_service
+from libs.quant_core.models import MarketBar
+from libs.recommendations.signal_validator import validate_signal_quality
+from libs.research.backtest import BacktestConfig
+from libs.research.walk_forward import WalkForwardConfig, WalkForwardResult, WalkForwardValidator
 
 log = logging.getLogger("quant.evolution")
 _validation_task: asyncio.Task | None = None
+_validation_last_run: dict[str, Any] | None = None
+_auto_scan_task: asyncio.Task | None = None
+_auto_scan_last_run: dict[str, Any] | None = None
+_failure_alert_last_sent_at: dict[str, datetime] = {}
+_failure_alert_last_event: dict[str, Any] | None = None
 
 DEFAULT_MODEL_NAME = "scanner-evolution"
 DEFAULT_MODEL_VERSION = "rule-v1"
@@ -56,6 +65,16 @@ DEFAULT_MODEL_CONFIG: dict[str, Any] = {
     "horizon_bias": {"3": 0.0, "5": 0.0, "10": 0.0, "20": 0.0},
     "min_samples_to_evolve": 30,
 }
+AUTO_EVOLVE_HOLDOUT_RATIO = 0.2
+AUTO_EVOLVE_MIN_HOLDOUT_SAMPLES = 1
+AUTO_EVOLVE_MIN_SIGNAL_IC = 0.03
+AUTO_EVOLVE_MIN_SIGNAL_WIN_RATE = 0.52
+AUTO_EVOLVE_WALK_FORWARD_MIN_SAMPLES = 12
+AUTO_EVOLVE_WALK_FORWARD_MIN_DATES = 12
+AUTO_EVOLVE_WALK_FORWARD_MIN_PROFITABLE_FOLDS = 0.50
+AUTO_EVOLVE_WALK_FORWARD_RETURN_TOLERANCE = 0.001
+AUTO_EVOLVE_WALK_FORWARD_CONSISTENCY_TOLERANCE = 0.02
+AUTO_EVOLVE_WALK_FORWARD_DRAWDOWN_TOLERANCE = 0.03
 
 
 def _now() -> datetime:
@@ -80,6 +99,126 @@ def _f(v: Any, default: float = 0.0) -> float:
         return n
     except Exception:
         return default
+
+
+def _walk_forward_runtime_params(settings: Any | None = None) -> dict[str, Any]:
+    if settings is None:
+        from apps.api.app.core.config import get_evolution_settings
+
+        settings = get_evolution_settings()
+    return {
+        "min_samples": max(1, int(getattr(settings, "evolution_auto_walk_forward_min_samples", AUTO_EVOLVE_WALK_FORWARD_MIN_SAMPLES))),
+        "min_dates": max(1, int(getattr(settings, "evolution_auto_walk_forward_min_dates", AUTO_EVOLVE_WALK_FORWARD_MIN_DATES))),
+        "min_profitable_folds": _clamp(_f(getattr(settings, "evolution_auto_walk_forward_min_profitable_folds", AUTO_EVOLVE_WALK_FORWARD_MIN_PROFITABLE_FOLDS)), 0.0, 1.0),
+        "return_tolerance": _clamp(_f(getattr(settings, "evolution_auto_walk_forward_return_tolerance", AUTO_EVOLVE_WALK_FORWARD_RETURN_TOLERANCE)), 0.0, 1.0),
+        "consistency_tolerance": _clamp(_f(getattr(settings, "evolution_auto_walk_forward_consistency_tolerance", AUTO_EVOLVE_WALK_FORWARD_CONSISTENCY_TOLERANCE)), 0.0, 1.0),
+        "drawdown_tolerance": _clamp(_f(getattr(settings, "evolution_auto_walk_forward_drawdown_tolerance", AUTO_EVOLVE_WALK_FORWARD_DRAWDOWN_TOLERANCE)), 0.0, 1.0),
+    }
+
+
+def _failure_alert_runtime_params(settings: Any | None = None) -> dict[str, Any]:
+    if settings is None:
+        from apps.api.app.core.config import get_evolution_settings
+
+        settings = get_evolution_settings()
+    return {
+        "enabled": bool(getattr(settings, "evolution_failure_alert_enabled", True)),
+        "cooldown_seconds": max(
+            0,
+            int(getattr(settings, "evolution_failure_alert_cooldown_seconds", 3600) or 0),
+        ),
+    }
+
+
+def _compact_failure_context(context: dict[str, Any] | None) -> dict[str, Any]:
+    if not context:
+        return {}
+    allowed = {
+        "limit",
+        "interval_seconds",
+        "validate_time",
+        "scan_run_id",
+        "results",
+        "predictions_created",
+        "llm_status",
+        "params",
+    }
+    return {key: value for key, value in context.items() if key in allowed}
+
+
+def _notify_evolution_failure(
+    failure_type: str,
+    error: Any,
+    *,
+    context: dict[str, Any] | None = None,
+    settings: Any | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Send a rate-limited operator alert for unattended evolution failures."""
+    global _failure_alert_last_event
+
+    params = _failure_alert_runtime_params(settings)
+    timestamp = now or _now()
+    compact_context = _compact_failure_context(context)
+    event: dict[str, Any] = {
+        "type": failure_type,
+        "error": str(error)[:500],
+        "created_at": timestamp.isoformat(),
+        "enabled": params["enabled"],
+        "cooldown_seconds": params["cooldown_seconds"],
+        "context": compact_context,
+    }
+    if not params["enabled"]:
+        event["alert_status"] = "disabled"
+        _failure_alert_last_event = event
+        return event
+
+    last_sent = _failure_alert_last_sent_at.get(failure_type)
+    cooldown = int(params["cooldown_seconds"])
+    if last_sent and cooldown > 0:
+        next_allowed = last_sent + timedelta(seconds=cooldown)
+        if timestamp < next_allowed:
+            event.update({
+                "alert_status": "suppressed",
+                "last_sent_at": last_sent.isoformat(),
+                "next_allowed_at": next_allowed.isoformat(),
+            })
+            _failure_alert_last_event = event
+            return event
+
+    from apps.api.app.services import feishu_service
+
+    label_map = {
+        "validation_cycle": "自动验证/进化",
+        "auto_scan": "自动采样",
+        "auto_scan_loop": "自动采样循环",
+    }
+    label = label_map.get(failure_type, failure_type)
+    context_lines = "\n".join(
+        f"- {key}: {value}" for key, value in compact_context.items()
+    ) or "- 无"
+    try:
+        sent = feishu_service.send_feishu(
+            f"AlphaAgent {label}失败",
+            (
+                f"**任务：** {label}\n"
+                f"**错误：** {event['error']}\n"
+                f"**时间：** {timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"**上下文：**\n{context_lines}"
+            ),
+            color="red",
+        )
+    except Exception as exc:
+        log.warning("evolution failure alert dispatch failed: %s", exc)
+        sent = False
+    event.update({
+        "alert_status": "sent" if sent else "not_configured",
+        "sent_at": timestamp.isoformat() if sent else None,
+    })
+    if sent:
+        _failure_alert_last_sent_at[failure_type] = timestamp
+    _failure_alert_last_event = event
+    return event
 
 
 def _jsonable(value: Any) -> Any:
@@ -176,63 +315,103 @@ def _stop_loss_pct(stock: dict, config: dict) -> float:
     return round(_f(config.get("stop_loss_pct"), 8.0), 2)
 
 
+def _estimate_from_features(
+    *,
+    features: dict,
+    config: dict,
+    action: str,
+    stop_loss: float,
+    plan_expected: float,
+    horizon_days: int,
+) -> dict:
+    weights = config.get("weights") or DEFAULT_MODEL_CONFIG["weights"]
+    weight_total = sum(abs(_f(v)) for v in weights.values()) or 1.0
+    weighted = sum(_f(features.get(k)) * _f(v) for k, v in weights.items()) / weight_total
+
+    action = str(action or "BUY").upper()
+    action_adj = 0.06 if action == "BUY" else (0.02 if action == "HOLD" else -0.08)
+    trend_adj = _clamp(_f(features.get("ret_5d")) / 100.0, -0.04, 0.05)
+    vol_ratio = _f(features.get("vol_ratio"))
+    volume_adj = 0.02 if 1.2 <= vol_ratio <= 3.5 else (-0.03 if vol_ratio > 5 else 0.0)
+    base_prob = _clamp(0.26 + weighted * 0.58 + action_adj + trend_adj + volume_adj, 0.08, 0.92)
+
+    targets = config.get("targets") or DEFAULT_MODEL_CONFIG["targets"]
+    horizon_bias = config.get("horizon_bias") or {}
+    target = _f(targets.get(str(horizon_days)), 3.0)
+    if horizon_days <= 3:
+        horizon_adj = _f(features.get("momentum")) * 0.04 + _f(features.get("volume")) * 0.02 - 0.03
+    elif horizon_days <= 10:
+        horizon_adj = _f(features.get("technical")) * 0.03 + _f(features.get("strategy")) * 0.02
+    else:
+        horizon_adj = (
+            _f(features.get("fundamental")) * 0.03
+            + _f(features.get("flow")) * 0.015
+            + _f(features.get("industry")) * 0.02
+            + _f(features.get("northbound")) * 0.02
+            + _f(features.get("research")) * 0.015
+            - _f(features.get("reduction_risk")) * 0.04
+            - 0.01
+        )
+    probability = _clamp(base_prob + horizon_adj + _f(horizon_bias.get(str(horizon_days))), 0.05, 0.95)
+    expected_return = probability * target - (1.0 - probability) * stop_loss
+    if plan_expected > 0:
+        expected_return = expected_return * 0.7 + plan_expected * min(horizon_days / 10.0, 1.0) * 0.3
+    return {
+        "horizon_days": horizon_days,
+        "target_return_pct": round(target, 2),
+        "stop_loss_pct": round(stop_loss, 2),
+        "probability": round(probability, 4),
+        "expected_return_pct": round(expected_return, 4),
+        "features": features,
+    }
+
+
 def estimate_predictions(stock: dict, config: dict | None = None) -> list[dict]:
     """Estimate per-horizon probabilities for one scanner result."""
     cfg = config or DEFAULT_MODEL_CONFIG
     features = _extract_features(stock)
-    weights = cfg.get("weights") or DEFAULT_MODEL_CONFIG["weights"]
-    weight_total = sum(abs(_f(v)) for v in weights.values()) or 1.0
-    weighted = sum(features.get(k, 0.0) * _f(v) for k, v in weights.items()) / weight_total
 
     ai = stock.get("ai_analysis") or {}
     action = str(ai.get("action") or "BUY").upper()
-    action_adj = 0.06 if action == "BUY" else (0.02 if action == "HOLD" else -0.08)
-    trend_adj = _clamp(features["ret_5d"] / 100.0, -0.04, 0.05)
-    volume_adj = 0.02 if 1.2 <= features["vol_ratio"] <= 3.5 else (-0.03 if features["vol_ratio"] > 5 else 0.0)
-    base_prob = _clamp(0.26 + weighted * 0.58 + action_adj + trend_adj + volume_adj, 0.08, 0.92)
-
     horizons = [int(h) for h in (cfg.get("horizons") or DEFAULT_MODEL_CONFIG["horizons"])]
-    targets = cfg.get("targets") or DEFAULT_MODEL_CONFIG["targets"]
-    horizon_bias = cfg.get("horizon_bias") or {}
     stop_loss = _stop_loss_pct(stock, cfg)
     plan_expected = _f((stock.get("trade_plan") or {}).get("expected_return_pct"))
-
-    estimates: list[dict] = []
-    for h in horizons:
-        h_key = str(h)
-        target = _f(targets.get(h_key), 3.0)
-        # 短周期更依赖动量，长周期更依赖基本面和趋势延续。
-        if h <= 3:
-            horizon_adj = features["momentum"] * 0.04 + features["volume"] * 0.02 - 0.03
-        elif h <= 10:
-            horizon_adj = features["technical"] * 0.03 + features["strategy"] * 0.02
-        else:
-            horizon_adj = (
-                features["fundamental"] * 0.03
-                + features["flow"] * 0.015
-                + features["industry"] * 0.02
-                + features["northbound"] * 0.02
-                + features["research"] * 0.015
-                - features["reduction_risk"] * 0.04
-                - 0.01
-            )
-        probability = _clamp(base_prob + horizon_adj + _f(horizon_bias.get(h_key)), 0.05, 0.95)
-        expected_return = probability * target - (1.0 - probability) * stop_loss
-        if plan_expected > 0:
-            expected_return = expected_return * 0.7 + plan_expected * min(h / 10.0, 1.0) * 0.3
-        estimates.append({
-            "horizon_days": h,
-            "target_return_pct": round(target, 2),
-            "stop_loss_pct": round(stop_loss, 2),
-            "probability": round(probability, 4),
-            "expected_return_pct": round(expected_return, 4),
-            "features": features,
-        })
-
-    return estimates
+    return [
+        _estimate_from_features(
+            features=features,
+            config=cfg,
+            action=action,
+            stop_loss=stop_loss,
+            plan_expected=plan_expected,
+            horizon_days=h,
+        )
+        for h in horizons
+    ]
 
 
-def enrich_scan_results_with_model(results: list[dict], db: Session | None = None) -> dict:
+def _select_estimate_for_ranking(
+    estimates: list[dict],
+    *,
+    target_horizon_days: int | None = None,
+) -> tuple[dict | None, str]:
+    if not estimates:
+        return None, "none"
+    if target_horizon_days:
+        target = int(target_horizon_days)
+        exact = next((e for e in estimates if int(e["horizon_days"]) == target), None)
+        if exact:
+            return exact, "requested_horizon"
+        closest = min(estimates, key=lambda e: abs(int(e["horizon_days"]) - target), default=None)
+        if closest:
+            return closest, "nearest_requested_horizon"
+    return max(estimates, key=lambda x: (x["expected_return_pct"], x["probability"]), default=None), "best_expected_return"
+
+
+def enrich_scan_results_with_model(
+    results: list[dict],
+    db: Session | None = None,
+    target_horizon_days: int | None = None,
+) -> dict:
     """Attach active model probabilities to scanner results."""
     with _ctx(db) as session:
         model = ensure_active_model(session)
@@ -241,11 +420,16 @@ def enrich_scan_results_with_model(results: list[dict], db: Session | None = Non
         for stock in results or []:
             item = dict(stock)
             estimates = estimate_predictions(item, cfg)
-            best = max(estimates, key=lambda x: (x["expected_return_pct"], x["probability"]), default=None)
+            best, ranking_mode = _select_estimate_for_ranking(
+                estimates,
+                target_horizon_days=target_horizon_days,
+            )
             if best:
                 item["evolution"] = {
                     "model_version_id": model.id,
                     "model_version": model.version,
+                    "ranking_mode": ranking_mode,
+                    "requested_horizon_days": target_horizon_days,
                     "best_horizon_days": best["horizon_days"],
                     "target_return_pct": best["target_return_pct"],
                     "stop_loss_pct": best["stop_loss_pct"],
@@ -447,6 +631,9 @@ def _record_sell_fill_outcomes(
         return 0
     account_id = order.account_id if order else ""
     broker = order.broker if order else ""
+    remaining_sell_qty = max(int(fill.quantity or 0), 0)
+    if remaining_sell_qty <= 0:
+        return 0
     candidates = (
         session.query(StockPredictionORM)
         .filter(
@@ -459,6 +646,7 @@ def _record_sell_fill_outcomes(
         .all()
     )
     recorded = 0
+    fill_matches: dict[str, dict[str, int]] = {}
     for pred in candidates:
         raw = pred.raw_result or {}
         if raw.get("source") != "trade_fill":
@@ -466,6 +654,29 @@ def _record_sell_fill_outcomes(
         if account_id and raw.get("account_id") and raw.get("account_id") != account_id:
             continue
         if broker and raw.get("broker") and raw.get("broker") != broker:
+            continue
+        buy_fill_id = raw.get("fill_id")
+        buy_qty = max(int(_f(raw.get("quantity"))), 0)
+        if buy_qty <= 0:
+            continue
+        match_key = str(buy_fill_id or f"prediction:{pred.id}")
+        match = fill_matches.get(match_key)
+        if match is None:
+            if remaining_sell_qty <= 0:
+                break
+            remaining_before = _remaining_buy_fill_quantity(session, pred, buy_fill_id=buy_fill_id, buy_quantity=buy_qty)
+            matched_qty = min(remaining_sell_qty, remaining_before)
+            match = {
+                "matched_qty": matched_qty,
+                "remaining_before": remaining_before,
+                "remaining_after": remaining_before - matched_qty,
+            }
+            fill_matches[match_key] = match
+            remaining_sell_qty -= matched_qty
+        else:
+            matched_qty = match["matched_qty"]
+            remaining_before = match["remaining_before"]
+        if matched_qty <= 0:
             continue
         start = _f(pred.price_at_prediction)
         if start <= 0:
@@ -496,10 +707,15 @@ def _record_sell_fill_outcomes(
         outcome.bars_checked = holding_days
         outcome.details = {
             "source": "trade_exit",
-            "buy_fill_id": raw.get("fill_id"),
+            "buy_fill_id": buy_fill_id,
             "sell_fill_id": fill.id,
             "sell_order_id": fill.order_id,
             "sell_price": round(fill.price, 4),
+            "buy_quantity": buy_qty,
+            "sell_quantity": int(fill.quantity or 0),
+            "matched_quantity": matched_qty,
+            "remaining_before": remaining_before,
+            "remaining_after": match["remaining_after"],
             "holding_days": holding_days,
             "target_return_pct": pred.target_return_pct,
             "stop_loss_pct": pred.stop_loss_pct,
@@ -511,6 +727,39 @@ def _record_sell_fill_outcomes(
         pred.validated_at = outcome.validated_at
         recorded += 1
     return recorded
+
+
+def _remaining_buy_fill_quantity(
+    session: Session,
+    pred: StockPredictionORM,
+    *,
+    buy_fill_id: Any,
+    buy_quantity: int,
+) -> int:
+    if buy_fill_id in (None, ""):
+        return max(buy_quantity, 0)
+    matched = 0
+    seen_sell_fills: set[str] = set()
+    for row in (
+        session.query(PredictionOutcomeORM.details)
+        .filter(
+            PredictionOutcomeORM.symbol == pred.symbol,
+            PredictionOutcomeORM.model_version_id == pred.model_version_id,
+        )
+        .all()
+    ):
+        details = row[0] or {}
+        if details.get("source") != "trade_exit":
+            continue
+        if str(details.get("buy_fill_id")) != str(buy_fill_id):
+            continue
+        sell_fill_key = str(details.get("sell_fill_id") or "")
+        if sell_fill_key and sell_fill_key in seen_sell_fills:
+            continue
+        if sell_fill_key:
+            seen_sell_fills.add(sell_fill_key)
+        matched += int(_f(details.get("matched_quantity")))
+    return max(buy_quantity - matched, 0)
 
 
 def _estimates_for_trade_fill(fill: TradeFillORM, config: dict) -> list[dict]:
@@ -704,25 +953,252 @@ async def _validation_loop(
     interval_seconds: int,
     initial_delay_seconds: int,
     limit: int,
+    validate_time: str = "",
 ) -> None:
-    if initial_delay_seconds > 0:
+    if not validate_time and initial_delay_seconds > 0:
         await asyncio.sleep(initial_delay_seconds)
     while True:
+        if validate_time:
+            await asyncio.sleep(_seconds_until_daily_time(validate_time))
         try:
-            trade_result = await asyncio.to_thread(record_trade_fills, limit=limit)
+            cycle_summary = await asyncio.to_thread(run_validation_cycle_once, limit=limit)
+            trade_result = cycle_summary.get("trade_result") or {}
             if trade_result.get("predictions_created"):
                 log.info("evolution trade fill record: %s", trade_result)
-            result = await asyncio.to_thread(validate_predictions, limit=limit)
+            result = cycle_summary.get("validation_result") or {}
             if result.get("checked"):
                 log.info("evolution auto validation: %s", result)
-            cycle_result = await asyncio.to_thread(auto_evolve_cycle)
+            cycle_result = cycle_summary.get("auto_cycle_result") or {}
             if cycle_result.get("status") not in {"disabled", "insufficient_data"}:
                 log.info("evolution auto cycle: %s", cycle_result)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             log.warning("evolution auto validation failed: %s", e, exc_info=True)
+            _notify_evolution_failure(
+                "validation_cycle",
+                e,
+                context={
+                    "limit": limit,
+                    "interval_seconds": interval_seconds,
+                    "validate_time": validate_time,
+                },
+            )
+        if not validate_time:
+            await asyncio.sleep(interval_seconds)
+
+
+def _normalize_validate_time(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parts = raw.split(":")
+    if len(parts) != 2:
+        return ""
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except ValueError:
+        return ""
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return ""
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _seconds_until_daily_time(validate_time: str, now: datetime | None = None) -> float:
+    normalized = _normalize_validate_time(validate_time)
+    if not normalized:
+        return 0.0
+    current = now or datetime.now()
+    hour, minute = [int(part) for part in normalized.split(":")]
+    target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= current:
+        target += timedelta(days=1)
+    return max(0.0, (target - current).total_seconds())
+
+
+def _compact_auto_cycle_result(result: dict) -> dict:
+    if not isinstance(result, dict):
+        return {"status": "unknown"}
+    compact = {
+        "status": result.get("status"),
+        "evaluated_predictions": result.get("evaluated_predictions"),
+        "min_samples": result.get("min_samples"),
+        "reasons": result.get("reasons") or [],
+    }
+    active_model = result.get("active_model") or {}
+    previous_model = result.get("previous_model") or {}
+    if active_model.get("version"):
+        compact["active_model_version"] = active_model.get("version")
+    if previous_model.get("version"):
+        compact["previous_model_version"] = previous_model.get("version")
+    return {k: v for k, v in compact.items() if v not in (None, [])}
+
+
+def run_validation_cycle_once(*, limit: int) -> dict:
+    """Run one unattended validation/evolution pass and store a compact status."""
+    global _validation_last_run
+    started_at = _now()
+    try:
+        trade_result = record_trade_fills(limit=limit)
+        validation_result = validate_predictions(limit=limit)
+        cycle_result = auto_evolve_cycle()
+        summary = {
+            "ok": True,
+            "started_at": started_at.isoformat(),
+            "finished_at": _now().isoformat(),
+            "limit": limit,
+            "trade_result": trade_result,
+            "validation_result": validation_result,
+            "auto_cycle_result": _compact_auto_cycle_result(cycle_result),
+        }
+        _validation_last_run = summary
+        return summary
+    except Exception as exc:
+        summary = {
+            "ok": False,
+            "started_at": started_at.isoformat(),
+            "finished_at": _now().isoformat(),
+            "limit": limit,
+            "error": str(exc),
+        }
+        _validation_last_run = summary
+        raise
+
+
+def _auto_scan_params_from_settings(settings: Any) -> dict:
+    target_horizon = int(getattr(settings, "evolution_auto_scan_target_horizon_days", 0) or 0)
+    return {
+        "top_n": int(getattr(settings, "evolution_auto_scan_top_n", 20)),
+        "min_score": int(getattr(settings, "evolution_auto_scan_min_score", 50)),
+        "candidate_pool": int(getattr(settings, "evolution_auto_scan_candidate_pool", 100)),
+        "use_cache": False,
+        "enable_fundamental": bool(getattr(settings, "evolution_auto_scan_enable_fundamental", True)),
+        "enable_llm": bool(getattr(settings, "evolution_auto_scan_enable_llm", False)),
+        "llm_top_n": int(getattr(settings, "evolution_auto_scan_llm_top_n", 8)),
+        "target_horizon_days": target_horizon or None,
+    }
+
+
+def run_auto_scan_once() -> dict:
+    """Run one scanner sampling pass for continuous model evolution."""
+    global _auto_scan_last_run
+    from apps.api.app.core.config import get_evolution_settings
+    from apps.api.app.services import scanner_service
+
+    settings = get_evolution_settings()
+    params = _auto_scan_params_from_settings(settings)
+    started_at = _now()
+    try:
+        output = scanner_service.scan_potential_stocks(**params)
+        result = {
+            "ok": not bool(output.get("error")),
+            "started_at": started_at.isoformat(),
+            "finished_at": _now().isoformat(),
+            "params": params,
+            "scan_run_id": output.get("scan_run_id"),
+            "results": len(output.get("results") or []),
+            "predictions_created": (output.get("evolution") or {}).get("predictions_created", 0),
+            "llm_status": output.get("llm_status"),
+            "error": output.get("error"),
+        }
+    except Exception as e:
+        result = {
+            "ok": False,
+            "started_at": started_at.isoformat(),
+            "finished_at": _now().isoformat(),
+            "params": params,
+            "error": str(e),
+        }
+    _auto_scan_last_run = result
+    return result
+
+
+async def _auto_scan_loop(
+    *,
+    interval_seconds: int,
+    initial_delay_seconds: int,
+) -> None:
+    if initial_delay_seconds > 0:
+        await asyncio.sleep(initial_delay_seconds)
+    while True:
+        try:
+            result = await asyncio.to_thread(run_auto_scan_once)
+            if result.get("ok"):
+                log.info("evolution auto scan: %s", result)
+            else:
+                log.warning("evolution auto scan failed: %s", result)
+                _notify_evolution_failure(
+                    "auto_scan",
+                    result.get("error") or "unknown auto scan failure",
+                    context=result,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("evolution auto scan loop failed: %s", e, exc_info=True)
+            _notify_evolution_failure(
+                "auto_scan_loop",
+                e,
+                context={"interval_seconds": interval_seconds},
+            )
         await asyncio.sleep(interval_seconds)
+
+
+def ensure_auto_scan_loop_running(
+    *,
+    interval_seconds: int | None = None,
+    initial_delay_seconds: int | None = None,
+) -> bool:
+    """Start automatic scanner sampling loop when enabled."""
+    global _auto_scan_task
+    if _auto_scan_task and not _auto_scan_task.done():
+        return True
+
+    from apps.api.app.core.config import get_evolution_settings
+
+    settings = get_evolution_settings()
+    if not settings.evolution_auto_scan_enabled:
+        log.info("evolution auto scan disabled")
+        return False
+    interval = int(
+        interval_seconds
+        if interval_seconds is not None
+        else settings.evolution_auto_scan_interval_seconds
+    )
+    if interval <= 0:
+        log.info("evolution auto scan interval disabled")
+        return False
+    initial_delay = int(
+        initial_delay_seconds
+        if initial_delay_seconds is not None
+        else settings.evolution_validate_initial_delay_seconds
+    )
+    _auto_scan_task = asyncio.create_task(
+        _auto_scan_loop(
+            interval_seconds=interval,
+            initial_delay_seconds=max(0, initial_delay),
+        )
+    )
+    return True
+
+
+async def stop_auto_scan_loop() -> None:
+    global _auto_scan_task
+    if not _auto_scan_task:
+        return
+    _auto_scan_task.cancel()
+    try:
+        await _auto_scan_task
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _auto_scan_task = None
+
+
+async def restart_auto_scan_loop() -> bool:
+    await stop_auto_scan_loop()
+    return ensure_auto_scan_loop_running()
 
 
 def ensure_validation_loop_running(
@@ -736,8 +1212,8 @@ def ensure_validation_loop_running(
     if _validation_task and not _validation_task.done():
         return True
 
-    from apps.api.app.core.config import get_settings
-    settings = get_settings()
+    from apps.api.app.core.config import get_evolution_settings
+    settings = get_evolution_settings()
     interval = int(interval_seconds if interval_seconds is not None else settings.evolution_validate_interval_seconds)
     if interval <= 0:
         log.info("evolution auto validation disabled")
@@ -748,11 +1224,13 @@ def ensure_validation_loop_running(
         else settings.evolution_validate_initial_delay_seconds
     )
     run_limit = int(limit if limit is not None else settings.evolution_validate_limit)
+    validate_time = _normalize_validate_time(getattr(settings, "evolution_validate_time", ""))
     _validation_task = asyncio.create_task(
         _validation_loop(
             interval_seconds=interval,
             initial_delay_seconds=max(0, initial_delay),
             limit=max(1, run_limit),
+            validate_time=validate_time,
         )
     )
     return True
@@ -771,6 +1249,71 @@ async def stop_validation_loop() -> None:
         _validation_task = None
 
 
+async def restart_validation_loop() -> bool:
+    await stop_validation_loop()
+    return ensure_validation_loop_running()
+
+
+async def restart_background_loops() -> dict:
+    validation_running = await restart_validation_loop()
+    auto_scan_running = await restart_auto_scan_loop()
+    return {
+        "validation_running": validation_running,
+        "auto_scan_running": auto_scan_running,
+    }
+
+
+def validation_loop_status() -> dict:
+    from apps.api.app.core.config import get_evolution_settings
+
+    settings = get_evolution_settings()
+    validate_time = _normalize_validate_time(getattr(settings, "evolution_validate_time", ""))
+    validate_schedule = "disabled"
+    if settings.evolution_validate_interval_seconds > 0:
+        validate_schedule = "daily_time" if validate_time else "interval"
+    failure_alert = _failure_alert_runtime_params(settings)
+    return {
+        "running": _validation_task is not None and not _validation_task.done(),
+        "auto_scan_running": _auto_scan_task is not None and not _auto_scan_task.done(),
+        "validation_last_run": _validation_last_run,
+        "auto_scan_last_run": _auto_scan_last_run,
+        "failure_alert_last_event": _failure_alert_last_event,
+        "failure_alert_enabled": failure_alert["enabled"],
+        "failure_alert_cooldown_seconds": failure_alert["cooldown_seconds"],
+        "validate_interval_seconds": settings.evolution_validate_interval_seconds,
+        "validate_initial_delay_seconds": settings.evolution_validate_initial_delay_seconds,
+        "validate_limit": settings.evolution_validate_limit,
+        "validate_time": validate_time,
+        "validate_schedule": validate_schedule,
+        "auto_scan_enabled": settings.evolution_auto_scan_enabled,
+        "auto_scan_interval_seconds": settings.evolution_auto_scan_interval_seconds,
+        "auto_scan_top_n": settings.evolution_auto_scan_top_n,
+        "auto_scan_min_score": settings.evolution_auto_scan_min_score,
+        "auto_scan_candidate_pool": settings.evolution_auto_scan_candidate_pool,
+        "auto_scan_enable_fundamental": settings.evolution_auto_scan_enable_fundamental,
+        "auto_scan_enable_llm": settings.evolution_auto_scan_enable_llm,
+        "auto_scan_llm_top_n": settings.evolution_auto_scan_llm_top_n,
+        "auto_scan_target_horizon_days": settings.evolution_auto_scan_target_horizon_days,
+        "auto_evolve_enabled": settings.evolution_auto_evolve_enabled,
+        "auto_evolve_min_samples": settings.evolution_auto_evolve_min_samples,
+        "auto_promote_min_success_rate": settings.evolution_auto_promote_min_success_rate,
+        "auto_promote_min_avg_return_pct": settings.evolution_auto_promote_min_avg_return_pct,
+        "auto_promote_max_brier_score": settings.evolution_auto_promote_max_brier_score,
+        "auto_promote_max_calibration_error": settings.evolution_auto_promote_max_calibration_error,
+        "auto_walk_forward_min_samples": settings.evolution_auto_walk_forward_min_samples,
+        "auto_walk_forward_min_dates": settings.evolution_auto_walk_forward_min_dates,
+        "auto_walk_forward_min_profitable_folds": settings.evolution_auto_walk_forward_min_profitable_folds,
+        "auto_walk_forward_return_tolerance": settings.evolution_auto_walk_forward_return_tolerance,
+        "auto_walk_forward_consistency_tolerance": settings.evolution_auto_walk_forward_consistency_tolerance,
+        "auto_walk_forward_drawdown_tolerance": settings.evolution_auto_walk_forward_drawdown_tolerance,
+        "auto_rollback_enabled": settings.evolution_auto_rollback_enabled,
+        "auto_rollback_min_samples": settings.evolution_auto_rollback_min_samples,
+        "auto_rollback_min_success_rate": settings.evolution_auto_rollback_min_success_rate,
+        "auto_rollback_min_avg_return_pct": settings.evolution_auto_rollback_min_avg_return_pct,
+        "auto_rollback_max_brier_score": settings.evolution_auto_rollback_max_brier_score,
+    }
+
+
 def _metric_pairs(session: Session, model_version_id: int | None = None) -> list[tuple[StockPredictionORM, PredictionOutcomeORM]]:
     q = session.query(PredictionOutcomeORM)
     if model_version_id is not None:
@@ -784,8 +1327,30 @@ def _metric_pairs(session: Session, model_version_id: int | None = None) -> list
     return pairs
 
 
-def _compute_metrics_from_pairs(pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]]) -> dict:
-    if not pairs:
+def _metric_rows_from_pairs(
+    pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]],
+    *,
+    probability_resolver=None,
+) -> list[dict]:
+    rows = []
+    for pred, out in pairs:
+        probability = _clamp(
+            probability_resolver(pred, out) if probability_resolver else pred.probability,
+            0.0,
+            1.0,
+        )
+        rows.append({
+            "horizon_days": int(pred.horizon_days),
+            "probability": probability,
+            "success": bool(out.success),
+            "close_return_pct": _f(out.close_return_pct),
+            "max_return_pct": _f(out.max_return_pct),
+        })
+    return rows
+
+
+def _compute_metrics_from_rows(rows: list[dict]) -> dict:
+    if not rows:
         return {
             "sample_count": 0,
             "success_rate": 0.0,
@@ -796,31 +1361,31 @@ def _compute_metrics_from_pairs(pairs: list[tuple[StockPredictionORM, Prediction
             "by_horizon": [],
         }
 
-    actual = [1.0 if out.success else 0.0 for pred, out in pairs]
-    probs = [_clamp(pred.probability, 0.0, 1.0) for pred, out in pairs]
-    returns = [out.close_return_pct for pred, out in pairs]
-    max_returns = [out.max_return_pct for pred, out in pairs]
+    actual = [1.0 if row["success"] else 0.0 for row in rows]
+    probs = [_clamp(row["probability"], 0.0, 1.0) for row in rows]
+    returns = [row["close_return_pct"] for row in rows]
+    max_returns = [row["max_return_pct"] for row in rows]
     success_rate = mean(actual)
     brier = mean([(p - a) ** 2 for p, a in zip(probs, actual)])
     cal = abs(mean(probs) - success_rate)
 
     by_horizon = []
-    for horizon in sorted({pred.horizon_days for pred, out in pairs}):
-        h_pairs = [(pred, out) for pred, out in pairs if pred.horizon_days == horizon]
-        h_actual = [1.0 if out.success else 0.0 for pred, out in h_pairs]
-        h_probs = [_clamp(pred.probability, 0.0, 1.0) for pred, out in h_pairs]
+    for horizon in sorted({row["horizon_days"] for row in rows}):
+        h_rows = [row for row in rows if row["horizon_days"] == horizon]
+        h_actual = [1.0 if row["success"] else 0.0 for row in h_rows]
+        h_probs = [_clamp(row["probability"], 0.0, 1.0) for row in h_rows]
         by_horizon.append({
             "horizon_days": horizon,
-            "sample_count": len(h_pairs),
+            "sample_count": len(h_rows),
             "success_rate": round(mean(h_actual), 4),
-            "avg_return_pct": round(mean([out.close_return_pct for pred, out in h_pairs]), 4),
-            "avg_max_return_pct": round(mean([out.max_return_pct for pred, out in h_pairs]), 4),
+            "avg_return_pct": round(mean([row["close_return_pct"] for row in h_rows]), 4),
+            "avg_max_return_pct": round(mean([row["max_return_pct"] for row in h_rows]), 4),
             "brier_score": round(mean([(p - a) ** 2 for p, a in zip(h_probs, h_actual)]), 4),
             "calibration_error": round(abs(mean(h_probs) - mean(h_actual)), 4),
         })
 
     return {
-        "sample_count": len(pairs),
+        "sample_count": len(rows),
         "success_rate": round(success_rate, 4),
         "avg_return_pct": round(mean(returns), 4),
         "avg_max_return_pct": round(mean(max_returns), 4),
@@ -828,6 +1393,10 @@ def _compute_metrics_from_pairs(pairs: list[tuple[StockPredictionORM, Prediction
         "calibration_error": round(cal, 4),
         "by_horizon": by_horizon,
     }
+
+
+def _compute_metrics_from_pairs(pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]]) -> dict:
+    return _compute_metrics_from_rows(_metric_rows_from_pairs(pairs))
 
 
 def compute_metrics(db: Session | None = None, model_version_id: int | None = None) -> dict:
@@ -880,6 +1449,429 @@ def _rollback_gate(metrics: dict, thresholds: dict) -> tuple[bool, list[str]]:
     return bool(reasons), reasons
 
 
+def _pair_time_key(pair: tuple[StockPredictionORM, PredictionOutcomeORM]) -> tuple:
+    pred, out = pair
+    return (
+        out.validated_at or pred.validated_at or pred.predicted_at or _now(),
+        pred.predicted_at or _now(),
+        int(pred.id or 0),
+    )
+
+
+def _split_train_holdout_pairs(
+    pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]],
+    *,
+    holdout_ratio: float = AUTO_EVOLVE_HOLDOUT_RATIO,
+    min_holdout: int = AUTO_EVOLVE_MIN_HOLDOUT_SAMPLES,
+) -> tuple[list[tuple[StockPredictionORM, PredictionOutcomeORM]], list[tuple[StockPredictionORM, PredictionOutcomeORM]]]:
+    if len(pairs) < 2:
+        return list(pairs), []
+    ordered = sorted(pairs, key=_pair_time_key)
+    holdout_size = max(min_holdout, int(round(len(ordered) * holdout_ratio)))
+    holdout_size = min(holdout_size, len(ordered) - 1)
+    if holdout_size <= 0:
+        return ordered, []
+    return ordered[:-holdout_size], ordered[-holdout_size:]
+
+
+def _estimate_prediction_for_config(pred: StockPredictionORM, config: dict) -> dict:
+    features = pred.features or {}
+    return _estimate_from_features(
+        features=features,
+        config=config or DEFAULT_MODEL_CONFIG,
+        action=str(pred.action or "BUY").upper(),
+        stop_loss=_f(pred.stop_loss_pct, _f((config or {}).get("stop_loss_pct"), 8.0)),
+        plan_expected=_f((pred.trade_plan or {}).get("expected_return_pct")),
+        horizon_days=int(pred.horizon_days or 0),
+    )
+
+
+def _estimate_prediction_probability_for_config(pred: StockPredictionORM, config: dict) -> float:
+    estimate = _estimate_prediction_for_config(pred, config)
+    return _f(estimate.get("probability"), 0.5)
+
+
+def _metrics_for_pairs_with_config(
+    pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]],
+    config: dict,
+) -> dict:
+    return _compute_metrics_from_rows(
+        _metric_rows_from_pairs(
+            pairs,
+            probability_resolver=lambda pred, out: _estimate_prediction_probability_for_config(pred, config),
+        )
+    )
+
+
+def _compute_signal_quality_for_pairs(
+    pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]],
+    config: dict,
+) -> dict:
+    if not pairs:
+        return {
+            "sample_count": 0,
+            "ready": False,
+            "mean_ic": None,
+            "mean_win_rate": None,
+            "by_horizon": [],
+        }
+
+    by_horizon: list[dict] = []
+    for horizon in sorted({int(pred.horizon_days or 0) for pred, out in pairs}):
+        h_pairs = [(pred, out) for pred, out in pairs if int(pred.horizon_days or 0) == horizon]
+        signal_scores: list[float] = []
+        forward_returns: list[float] = []
+        for pred, out in h_pairs:
+            estimate = _estimate_prediction_for_config(pred, config)
+            signal_scores.append(_f(estimate.get("expected_return_pct")))
+            forward_returns.append(_f(out.close_return_pct))
+        result = validate_signal_quality(signal_scores, forward_returns)
+        by_horizon.append({
+            "horizon_days": horizon,
+            "sample_count": result.n_observations,
+            "ic": None if result.ic_1d is None else round(result.ic_1d, 4),
+            "win_rate": None if result.win_rate_1d is None else round(result.win_rate_1d, 4),
+            "avg_return_when_positive": None if result.avg_return_when_positive_1d is None else round(result.avg_return_when_positive_1d, 4),
+            "avg_return_when_negative": None if result.avg_return_when_negative_1d is None else round(result.avg_return_when_negative_1d, 4),
+            "long_short_spread": None if result.long_short_spread_1d is None else round(result.long_short_spread_1d, 4),
+            "useful": result.is_useful_1d,
+        })
+
+    meaningful_rows = [row for row in by_horizon if int(row["sample_count"] or 0) >= 4]
+    valid_ic_rows = [row for row in meaningful_rows if row["ic"] is not None]
+    valid_wr_rows = [row for row in meaningful_rows if row["win_rate"] is not None]
+
+    def _weighted_mean(rows: list[dict], key: str) -> float | None:
+        total = sum(int(row["sample_count"] or 0) for row in rows)
+        if total <= 0:
+            return None
+        return round(sum(_f(row[key]) * int(row["sample_count"] or 0) for row in rows) / total, 4)
+
+    return {
+        "sample_count": len(pairs),
+        "ready": bool(valid_ic_rows or valid_wr_rows),
+        "mean_ic": _weighted_mean(valid_ic_rows, "ic"),
+        "mean_win_rate": _weighted_mean(valid_wr_rows, "win_rate"),
+        "meaningful_horizon_count": len(meaningful_rows),
+        "useful_horizon_count": sum(1 for row in by_horizon if row["useful"]),
+        "by_horizon": by_horizon,
+    }
+
+
+def _candidate_holdout_gate(candidate_metrics: dict, baseline_metrics: dict) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    if _f(candidate_metrics.get("brier_score"), 1.0) > _f(baseline_metrics.get("brier_score"), 1.0):
+        reasons.append(
+            f"candidate holdout brier_score {_f(candidate_metrics.get('brier_score'), 1.0):.4f} > "
+            f"active {_f(baseline_metrics.get('brier_score'), 1.0):.4f}"
+        )
+    if _f(candidate_metrics.get("calibration_error"), 1.0) > _f(baseline_metrics.get("calibration_error"), 1.0):
+        reasons.append(
+            f"candidate holdout calibration_error {_f(candidate_metrics.get('calibration_error'), 1.0):.4f} > "
+            f"active {_f(baseline_metrics.get('calibration_error'), 1.0):.4f}"
+        )
+    return not reasons, reasons
+
+
+def _candidate_signal_quality_gate(candidate_quality: dict, baseline_quality: dict) -> tuple[bool, list[str]]:
+    if not candidate_quality.get("ready"):
+        return True, []
+
+    reasons: list[str] = []
+    candidate_ic = candidate_quality.get("mean_ic")
+    baseline_ic = baseline_quality.get("mean_ic")
+    candidate_wr = candidate_quality.get("mean_win_rate")
+    baseline_wr = baseline_quality.get("mean_win_rate")
+
+    if candidate_ic is not None and candidate_ic < AUTO_EVOLVE_MIN_SIGNAL_IC:
+        reasons.append(
+            f"candidate signal ic {_f(candidate_ic):.4f} < {AUTO_EVOLVE_MIN_SIGNAL_IC:.4f}"
+        )
+    if candidate_wr is not None and candidate_wr < AUTO_EVOLVE_MIN_SIGNAL_WIN_RATE:
+        reasons.append(
+            f"candidate signal win_rate {_f(candidate_wr):.4f} < {AUTO_EVOLVE_MIN_SIGNAL_WIN_RATE:.4f}"
+        )
+    if baseline_ic is not None and candidate_ic is not None and candidate_ic < baseline_ic:
+        reasons.append(
+            f"candidate signal ic {_f(candidate_ic):.4f} < active {_f(baseline_ic):.4f}"
+        )
+    if baseline_wr is not None and candidate_wr is not None and candidate_wr < baseline_wr:
+        reasons.append(
+            f"candidate signal win_rate {_f(candidate_wr):.4f} < active {_f(baseline_wr):.4f}"
+        )
+    return not reasons, reasons
+
+
+def _replay_symbol_for_prediction(pred: StockPredictionORM) -> str:
+    return f"{pred.symbol}#prediction:{pred.id or 0}"
+
+
+def _pair_entry_date(pred: StockPredictionORM, out: PredictionOutcomeORM) -> datetime:
+    return pred.predicted_at or out.validated_at or pred.validated_at or _now()
+
+
+def _bars_for_replay_pair(
+    pred: StockPredictionORM,
+    out: PredictionOutcomeORM,
+) -> list[MarketBar]:
+    start = _f(out.start_price) or _f(pred.price_at_prediction)
+    if start <= 0:
+        return []
+    end = _f(out.end_price) or start * (1 + _f(out.close_return_pct) / 100.0)
+    if end <= 0:
+        return []
+
+    symbol = _replay_symbol_for_prediction(pred)
+    entry_day = _pair_entry_date(pred, out).date()
+    bars_checked = int(out.bars_checked or pred.horizon_days or 1)
+    horizon = max(1, bars_checked)
+    max_price = max(_f(out.max_price), start, end)
+    min_price = min(_f(out.min_price, start), start, end)
+
+    bars: list[MarketBar] = []
+    prev_close = start
+    mid_idx = max(1, horizon // 2)
+    for idx in range(horizon + 1):
+        ratio = idx / horizon
+        close = start + (end - start) * ratio
+        open_price = start if idx == 0 else prev_close
+        high = max(open_price, close)
+        low = min(open_price, close)
+        if idx == mid_idx:
+            high = max(high, max_price)
+            low = min(low, min_price)
+        bars.append(MarketBar(
+            symbol=symbol,
+            trade_date=entry_day + timedelta(days=idx),
+            open=round(open_price, 4),
+            high=round(high, 4),
+            low=round(low, 4),
+            close=round(close, 4),
+            volume=100_000,
+            amount=round(close * 100_000, 2),
+            turnover_rate=0.5,
+            adj_type="qfq",
+            data_source="evolution_replay",
+        ))
+        prev_close = close
+    return bars
+
+
+def _replay_data_for_pairs(
+    pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]],
+) -> tuple[dict[str, list[MarketBar]], list[tuple[StockPredictionORM, PredictionOutcomeORM]]]:
+    data: dict[str, list[MarketBar]] = {}
+    usable_pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]] = []
+    for pred, out in sorted(pairs, key=_pair_time_key):
+        bars = _bars_for_replay_pair(pred, out)
+        if not bars:
+            continue
+        data[_replay_symbol_for_prediction(pred)] = bars
+        usable_pairs.append((pred, out))
+    return data, usable_pairs
+
+
+def _prediction_is_tradeable_for_config(pred: StockPredictionORM, config: dict) -> bool:
+    if str(pred.action or "BUY").upper() != "BUY":
+        return False
+    estimate = _estimate_prediction_for_config(pred, config)
+    probability = _f(estimate.get("probability"))
+    expected_return = _f(estimate.get("expected_return_pct"))
+    return probability >= 0.55 or expected_return > 0
+
+
+def _replay_strategy_factory(
+    pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]],
+    config: dict,
+):
+    entries_by_date: dict[Any, list[str]] = {}
+    exits_by_date: dict[Any, list[str]] = {}
+    for pred, out in pairs:
+        if not _prediction_is_tradeable_for_config(pred, config):
+            continue
+        symbol = _replay_symbol_for_prediction(pred)
+        entry_day = _pair_entry_date(pred, out).date()
+        horizon = max(1, int(out.bars_checked or pred.horizon_days or 1))
+        exit_day = entry_day + timedelta(days=horizon)
+        entries_by_date.setdefault(entry_day, []).append(symbol)
+        exits_by_date.setdefault(exit_day, []).append(symbol)
+
+    def factory():
+        opened: set[str] = set()
+
+        def strategy(trade_date, current_data):
+            actions: list[tuple[str, str]] = []
+            for symbol in exits_by_date.get(trade_date, []):
+                if symbol in opened:
+                    actions.append((symbol, "SELL"))
+                    opened.remove(symbol)
+            for symbol in entries_by_date.get(trade_date, []):
+                if symbol in current_data and symbol not in opened:
+                    actions.append((symbol, "BUY"))
+                    opened.add(symbol)
+            return actions
+
+        return strategy
+
+    return factory
+
+
+def _walk_forward_config_for_replay(
+    unique_dates: int,
+    params: dict[str, Any] | None = None,
+) -> WalkForwardConfig | None:
+    p = params or _walk_forward_runtime_params()
+    if unique_dates < int(p["min_dates"]):
+        return None
+    in_sample = max(10, min(60, unique_dates // 2))
+    remaining = unique_dates - in_sample
+    if remaining < 2:
+        return None
+    oos = max(1, min(20, remaining // 2))
+    if unique_dates < in_sample + oos * 2:
+        return None
+    return WalkForwardConfig(
+        in_sample_bars=in_sample,
+        oos_bars=oos,
+        step_bars=oos,
+        min_folds=2,
+        backtest_config=BacktestConfig(
+            initial_capital=1_000_000.0,
+            max_position_size=0.15,
+            max_positions=20,
+        ),
+    )
+
+
+def _walk_forward_result_to_dict(result: WalkForwardResult) -> dict:
+    fold_trades = [int(fold.metrics.total_trades or 0) for fold in result.folds]
+    return {
+        "n_folds": result.n_folds,
+        "oos_total_return_mean": round(result.oos_total_return_mean, 6),
+        "oos_sharpe_mean": round(result.oos_sharpe_mean, 6),
+        "oos_max_drawdown_mean": round(result.oos_max_drawdown_mean, 6),
+        "oos_win_rate_mean": round(result.oos_win_rate_mean, 6),
+        "oos_profit_factor_mean": round(result.oos_profit_factor_mean, 6),
+        "pct_profitable_folds": round(result.pct_profitable_folds, 6),
+        "consistency_score": round(result.consistency_score, 6),
+        "total_trades": sum(fold_trades),
+        "folds": [
+            {
+                "fold_idx": fold.fold_idx,
+                "oos_start": fold.oos_start.isoformat(),
+                "oos_end": fold.oos_end.isoformat(),
+                "total_return": round(fold.metrics.total_return, 6),
+                "max_drawdown": round(fold.metrics.max_drawdown, 6),
+                "win_rate": round(fold.metrics.win_rate, 6),
+                "total_trades": int(fold.metrics.total_trades or 0),
+            }
+            for fold in result.folds
+        ],
+    }
+
+
+def _walk_forward_validation_for_pairs(
+    pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]],
+    *,
+    baseline_config: dict,
+    candidate_config: dict,
+    runtime_params: dict[str, Any] | None = None,
+) -> dict:
+    params = runtime_params or _walk_forward_runtime_params()
+    data, usable_pairs = _replay_data_for_pairs(pairs)
+    unique_dates = len({bar.trade_date for bars in data.values() for bar in bars})
+    cfg = _walk_forward_config_for_replay(unique_dates, params)
+    base = {
+        "ready": False,
+        "sample_count": len(usable_pairs),
+        "unique_dates": unique_dates,
+    }
+    if len(usable_pairs) < int(params["min_samples"]) or cfg is None:
+        return {
+            **base,
+            "reason": "insufficient_walk_forward_history",
+            "min_samples": int(params["min_samples"]),
+            "min_unique_dates": int(params["min_dates"]),
+        }
+
+    validator = WalkForwardValidator(cfg)
+    try:
+        baseline = validator.run(data, _replay_strategy_factory(usable_pairs, baseline_config))
+        candidate = validator.run(data, _replay_strategy_factory(usable_pairs, candidate_config))
+    except ValueError as exc:
+        return {**base, "reason": str(exc)}
+
+    return {
+        **base,
+        "ready": True,
+        "config": {
+            "in_sample_bars": cfg.in_sample_bars,
+            "oos_bars": cfg.oos_bars,
+            "step_bars": cfg.step_bars,
+            "min_folds": cfg.min_folds,
+        },
+        "thresholds": {
+            "min_samples": int(params["min_samples"]),
+            "min_dates": int(params["min_dates"]),
+            "min_profitable_folds": _f(params["min_profitable_folds"]),
+            "return_tolerance": _f(params["return_tolerance"]),
+            "consistency_tolerance": _f(params["consistency_tolerance"]),
+            "drawdown_tolerance": _f(params["drawdown_tolerance"]),
+        },
+        "baseline": _walk_forward_result_to_dict(baseline),
+        "candidate": _walk_forward_result_to_dict(candidate),
+    }
+
+
+def _candidate_walk_forward_gate(
+    validation: dict,
+    runtime_params: dict[str, Any] | None = None,
+) -> tuple[bool, list[str]]:
+    params = runtime_params or _walk_forward_runtime_params()
+    if not validation.get("ready"):
+        return True, []
+
+    baseline = validation.get("baseline") or {}
+    candidate = validation.get("candidate") or {}
+    reasons: list[str] = []
+    if int(candidate.get("total_trades") or 0) <= 0:
+        reasons.append("candidate walk-forward generated no trades")
+    if _f(candidate.get("pct_profitable_folds")) < _f(params["min_profitable_folds"]):
+        reasons.append(
+            f"candidate walk-forward profitable_folds {_f(candidate.get('pct_profitable_folds')):.4f} < "
+            f"{_f(params['min_profitable_folds']):.4f}"
+        )
+    if _f(candidate.get("oos_total_return_mean")) < -_f(params["return_tolerance"]):
+        reasons.append(
+            f"candidate walk-forward return {_f(candidate.get('oos_total_return_mean')):.4f} < 0"
+        )
+    if (
+        _f(candidate.get("oos_total_return_mean")) + _f(params["return_tolerance"])
+        < _f(baseline.get("oos_total_return_mean"))
+    ):
+        reasons.append(
+            f"candidate walk-forward return {_f(candidate.get('oos_total_return_mean')):.4f} < "
+            f"active {_f(baseline.get('oos_total_return_mean')):.4f}"
+        )
+    if (
+        _f(candidate.get("consistency_score")) + _f(params["consistency_tolerance"])
+        < _f(baseline.get("consistency_score"))
+    ):
+        reasons.append(
+            f"candidate walk-forward consistency {_f(candidate.get('consistency_score')):.4f} < "
+            f"active {_f(baseline.get('consistency_score')):.4f}"
+        )
+    if (
+        _f(candidate.get("oos_max_drawdown_mean"))
+        > _f(baseline.get("oos_max_drawdown_mean")) + _f(params["drawdown_tolerance"])
+    ):
+        reasons.append(
+            f"candidate walk-forward drawdown {_f(candidate.get('oos_max_drawdown_mean')):.4f} > "
+            f"active {_f(baseline.get('oos_max_drawdown_mean')):.4f}"
+        )
+    return not reasons, reasons
+
+
 def _promote_candidate(
     session: Session,
     *,
@@ -889,6 +1881,7 @@ def _promote_candidate(
     thresholds: dict,
     reasons: list[str],
     source: str,
+    summary_extra: dict | None = None,
 ) -> None:
     active.status = "retired"
     active.metrics = metrics
@@ -912,6 +1905,7 @@ def _promote_candidate(
             "thresholds": thresholds,
             "reasons": reasons,
             "candidate_version": candidate.version,
+            **(summary_extra or {}),
         },
     ))
 
@@ -960,9 +1954,9 @@ def _rollback_active_model(
 
 def auto_evolve_cycle(db: Session | None = None) -> dict:
     """Run the safe automatic evolution cycle: rollback, then promote/generate."""
-    from apps.api.app.core.config import get_settings
+    from apps.api.app.core.config import get_evolution_settings
 
-    settings = get_settings()
+    settings = get_evolution_settings()
     if not settings.evolution_auto_evolve_enabled:
         return {"status": "disabled"}
 
@@ -970,6 +1964,16 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
         active = ensure_active_model(session)
         pairs = _metric_pairs(session, active.id)
         active_metrics = _compute_metrics_from_pairs(pairs)
+        train_pairs, holdout_pairs = _split_train_holdout_pairs(pairs)
+        train_metrics = _compute_metrics_from_pairs(train_pairs)
+        holdout_baseline_metrics = _metrics_for_pairs_with_config(
+            holdout_pairs,
+            active.config or DEFAULT_MODEL_CONFIG,
+        )
+        holdout_baseline_signal_quality = _compute_signal_quality_for_pairs(
+            holdout_pairs,
+            active.config or DEFAULT_MODEL_CONFIG,
+        )
 
         if (
             settings.evolution_auto_rollback_enabled
@@ -1000,6 +2004,20 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
                 "min_samples": min_samples,
                 "evaluated_predictions": len(pairs),
                 "metrics": active_metrics,
+                "train_sample_count": len(train_pairs),
+                "holdout_sample_count": len(holdout_pairs),
+                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+            }
+        if not train_pairs or not holdout_pairs:
+            return {
+                "status": "insufficient_data",
+                "min_samples": min_samples,
+                "evaluated_predictions": len(pairs),
+                "metrics": active_metrics,
+                "train_sample_count": len(train_pairs),
+                "holdout_sample_count": len(holdout_pairs),
+                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                "reason": "need_train_and_holdout_samples",
             }
 
         thresholds = {
@@ -1022,6 +2040,9 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
                 summary={
                     "source": "auto_evolve",
                     "metrics": active_metrics,
+                    "train_metrics": train_metrics,
+                    "holdout_baseline_metrics": holdout_baseline_metrics,
+                    "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
                     "thresholds": thresholds,
                     "reasons": reasons,
                 },
@@ -1031,8 +2052,146 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
                 "status": "auto_blocked",
                 "evaluated_predictions": len(pairs),
                 "metrics": active_metrics,
+                "train_metrics": train_metrics,
+                "holdout_baseline_metrics": holdout_baseline_metrics,
+                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
                 "thresholds": thresholds,
                 "reasons": reasons,
+            }
+
+        candidate_config = _adjust_weights(active.config or DEFAULT_MODEL_CONFIG, train_pairs)
+        candidate_holdout_metrics = _metrics_for_pairs_with_config(
+            holdout_pairs,
+            candidate_config,
+        )
+        candidate_signal_quality = _compute_signal_quality_for_pairs(
+            holdout_pairs,
+            candidate_config,
+        )
+        walk_forward_validation = _walk_forward_validation_for_pairs(
+            pairs,
+            baseline_config=active.config or DEFAULT_MODEL_CONFIG,
+            candidate_config=candidate_config,
+        )
+        walk_forward_allowed, walk_forward_reasons = _candidate_walk_forward_gate(walk_forward_validation)
+        holdout_allowed, holdout_reasons = _candidate_holdout_gate(
+            candidate_holdout_metrics,
+            holdout_baseline_metrics,
+        )
+        if not holdout_allowed:
+            session.add(EvolutionRunORM(
+                model_version_id=active.id,
+                status="auto_blocked",
+                evaluated_predictions=len(pairs),
+                success_rate=active_metrics["success_rate"],
+                avg_return_pct=active_metrics["avg_return_pct"],
+                brier_score=active_metrics["brier_score"],
+                calibration_error=active_metrics["calibration_error"],
+                promoted=False,
+                summary={
+                    "source": "auto_evolve",
+                    "metrics": active_metrics,
+                    "train_metrics": train_metrics,
+                    "holdout_baseline_metrics": holdout_baseline_metrics,
+                    "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                    "candidate_holdout_metrics": candidate_holdout_metrics,
+                    "candidate_signal_quality": candidate_signal_quality,
+                    "walk_forward_validation": walk_forward_validation,
+                    "thresholds": thresholds,
+                    "reasons": holdout_reasons,
+                },
+            ))
+            session.flush()
+            return {
+                "status": "auto_blocked",
+                "evaluated_predictions": len(pairs),
+                "metrics": active_metrics,
+                "train_metrics": train_metrics,
+                "holdout_baseline_metrics": holdout_baseline_metrics,
+                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                "candidate_holdout_metrics": candidate_holdout_metrics,
+                "candidate_signal_quality": candidate_signal_quality,
+                "walk_forward_validation": walk_forward_validation,
+                "thresholds": thresholds,
+                "reasons": holdout_reasons,
+            }
+        signal_quality_allowed, signal_quality_reasons = _candidate_signal_quality_gate(
+            candidate_signal_quality,
+            holdout_baseline_signal_quality,
+        )
+        if not signal_quality_allowed:
+            session.add(EvolutionRunORM(
+                model_version_id=active.id,
+                status="auto_blocked",
+                evaluated_predictions=len(pairs),
+                success_rate=active_metrics["success_rate"],
+                avg_return_pct=active_metrics["avg_return_pct"],
+                brier_score=active_metrics["brier_score"],
+                calibration_error=active_metrics["calibration_error"],
+                promoted=False,
+                summary={
+                    "source": "auto_evolve",
+                    "metrics": active_metrics,
+                    "train_metrics": train_metrics,
+                    "holdout_baseline_metrics": holdout_baseline_metrics,
+                    "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                    "candidate_holdout_metrics": candidate_holdout_metrics,
+                    "candidate_signal_quality": candidate_signal_quality,
+                    "walk_forward_validation": walk_forward_validation,
+                    "thresholds": thresholds,
+                    "reasons": signal_quality_reasons,
+                },
+            ))
+            session.flush()
+            return {
+                "status": "auto_blocked",
+                "evaluated_predictions": len(pairs),
+                "metrics": active_metrics,
+                "train_metrics": train_metrics,
+                "holdout_baseline_metrics": holdout_baseline_metrics,
+                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                "candidate_holdout_metrics": candidate_holdout_metrics,
+                "candidate_signal_quality": candidate_signal_quality,
+                "walk_forward_validation": walk_forward_validation,
+                "thresholds": thresholds,
+                "reasons": signal_quality_reasons,
+            }
+        if not walk_forward_allowed:
+            session.add(EvolutionRunORM(
+                model_version_id=active.id,
+                status="auto_blocked",
+                evaluated_predictions=len(pairs),
+                success_rate=active_metrics["success_rate"],
+                avg_return_pct=active_metrics["avg_return_pct"],
+                brier_score=active_metrics["brier_score"],
+                calibration_error=active_metrics["calibration_error"],
+                promoted=False,
+                summary={
+                    "source": "auto_evolve",
+                    "metrics": active_metrics,
+                    "train_metrics": train_metrics,
+                    "holdout_baseline_metrics": holdout_baseline_metrics,
+                    "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                    "candidate_holdout_metrics": candidate_holdout_metrics,
+                    "candidate_signal_quality": candidate_signal_quality,
+                    "walk_forward_validation": walk_forward_validation,
+                    "thresholds": thresholds,
+                    "reasons": walk_forward_reasons,
+                },
+            ))
+            session.flush()
+            return {
+                "status": "auto_blocked",
+                "evaluated_predictions": len(pairs),
+                "metrics": active_metrics,
+                "train_metrics": train_metrics,
+                "holdout_baseline_metrics": holdout_baseline_metrics,
+                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                "candidate_holdout_metrics": candidate_holdout_metrics,
+                "candidate_signal_quality": candidate_signal_quality,
+                "walk_forward_validation": walk_forward_validation,
+                "thresholds": thresholds,
+                "reasons": walk_forward_reasons,
             }
 
         candidate = (
@@ -1042,7 +2201,6 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
             .first()
         )
         if candidate is None:
-            candidate_config = _adjust_weights(active.config or DEFAULT_MODEL_CONFIG, pairs)
             candidate = ModelVersionORM(
                 name=active.name,
                 version=_next_version(active.version),
@@ -1054,6 +2212,9 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
             )
             session.add(candidate)
             session.flush()
+        else:
+            candidate.config = candidate_config
+            candidate.metrics = active_metrics
 
         _promote_candidate(
             session,
@@ -1063,6 +2224,14 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
             thresholds=thresholds,
             reasons=[],
             source="auto_evolve",
+            summary_extra={
+                "train_metrics": train_metrics,
+                "holdout_baseline_metrics": holdout_baseline_metrics,
+                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                "candidate_holdout_metrics": candidate_holdout_metrics,
+                "candidate_signal_quality": candidate_signal_quality,
+                "walk_forward_validation": walk_forward_validation,
+            },
         )
         session.flush()
         return {
@@ -1071,6 +2240,12 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
             "active_model": _model_to_dict(candidate),
             "previous_model": _model_to_dict(active),
             "metrics": active_metrics,
+            "train_metrics": train_metrics,
+            "holdout_baseline_metrics": holdout_baseline_metrics,
+            "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+            "candidate_holdout_metrics": candidate_holdout_metrics,
+            "candidate_signal_quality": candidate_signal_quality,
+            "walk_forward_validation": walk_forward_validation,
             "thresholds": thresholds,
         }
 
@@ -1287,6 +2462,16 @@ def evolve_model(
         active = ensure_active_model(session)
         pairs = _metric_pairs(session, active.id)
         metrics = _compute_metrics_from_pairs(pairs)
+        train_pairs, holdout_pairs = _split_train_holdout_pairs(pairs)
+        train_metrics = _compute_metrics_from_pairs(train_pairs)
+        holdout_baseline_metrics = _metrics_for_pairs_with_config(
+            holdout_pairs,
+            active.config or DEFAULT_MODEL_CONFIG,
+        )
+        holdout_baseline_signal_quality = _compute_signal_quality_for_pairs(
+            holdout_pairs,
+            active.config or DEFAULT_MODEL_CONFIG,
+        )
         threshold = int(min_samples or (active.config or DEFAULT_MODEL_CONFIG).get("min_samples_to_evolve", 30))
 
         if len(pairs) < threshold:
@@ -1299,7 +2484,13 @@ def evolve_model(
                 brier_score=metrics["brier_score"],
                 calibration_error=metrics["calibration_error"],
                 promoted=False,
-                summary={"reason": f"validated samples {len(pairs)} < min_samples {threshold}", "metrics": metrics},
+                summary={
+                    "reason": f"validated samples {len(pairs)} < min_samples {threshold}",
+                    "metrics": metrics,
+                    "train_metrics": train_metrics,
+                    "holdout_baseline_metrics": holdout_baseline_metrics,
+                    "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                },
             )
             session.add(run)
             session.flush()
@@ -1308,22 +2499,79 @@ def evolve_model(
                 "min_samples": threshold,
                 "evaluated_predictions": len(pairs),
                 "metrics": metrics,
+                "train_metrics": train_metrics,
+                "holdout_baseline_metrics": holdout_baseline_metrics,
+                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
                 "evolution_run_id": run.id,
             }
+        if not train_pairs or not holdout_pairs:
+            run = EvolutionRunORM(
+                model_version_id=active.id,
+                status="insufficient_data",
+                evaluated_predictions=len(pairs),
+                success_rate=metrics["success_rate"],
+                avg_return_pct=metrics["avg_return_pct"],
+                brier_score=metrics["brier_score"],
+                calibration_error=metrics["calibration_error"],
+                promoted=False,
+                summary={
+                    "reason": "need_train_and_holdout_samples",
+                    "metrics": metrics,
+                    "train_metrics": train_metrics,
+                    "holdout_baseline_metrics": holdout_baseline_metrics,
+                    "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                },
+            )
+            session.add(run)
+            session.flush()
+            return {
+                "status": "insufficient_data",
+                "min_samples": threshold,
+                "evaluated_predictions": len(pairs),
+                "metrics": metrics,
+                "train_metrics": train_metrics,
+                "holdout_baseline_metrics": holdout_baseline_metrics,
+                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                "evolution_run_id": run.id,
+                "reason": "need_train_and_holdout_samples",
+            }
 
-        candidate_config = _adjust_weights(active.config or DEFAULT_MODEL_CONFIG, pairs)
+        candidate_config = _adjust_weights(active.config or DEFAULT_MODEL_CONFIG, train_pairs)
+        candidate_holdout_metrics = _metrics_for_pairs_with_config(
+            holdout_pairs,
+            candidate_config,
+        )
+        candidate_signal_quality = _compute_signal_quality_for_pairs(
+            holdout_pairs,
+            candidate_config,
+        )
+        holdout_allowed, holdout_reasons = _candidate_holdout_gate(
+            candidate_holdout_metrics,
+            holdout_baseline_metrics,
+        )
+        signal_quality_allowed, signal_quality_reasons = _candidate_signal_quality_gate(
+            candidate_signal_quality,
+            holdout_baseline_signal_quality,
+        )
+        walk_forward_validation = _walk_forward_validation_for_pairs(
+            pairs,
+            baseline_config=active.config or DEFAULT_MODEL_CONFIG,
+            candidate_config=candidate_config,
+        )
+        walk_forward_allowed, walk_forward_reasons = _candidate_walk_forward_gate(walk_forward_validation)
+        promote_allowed = promote and holdout_allowed and signal_quality_allowed and walk_forward_allowed
         version = _next_version(active.version)
         candidate = ModelVersionORM(
             name=active.name,
             version=version,
-            status="active" if promote else "candidate",
+            status="active" if promote_allowed else "candidate",
             parent_id=active.id,
             config=candidate_config,
             metrics=metrics,
             note="由历史预测验证结果自动校准生成",
-            activated_at=_now() if promote else None,
+            activated_at=_now() if promote_allowed else None,
         )
-        if promote:
+        if promote_allowed:
             active.status = "retired"
         active.metrics = metrics
         session.add(candidate)
@@ -1339,9 +2587,21 @@ def evolve_model(
             avg_return_pct=metrics["avg_return_pct"],
             brier_score=metrics["brier_score"],
             calibration_error=metrics["calibration_error"],
-            promoted=promote,
+            promoted=promote_allowed,
             summary={
                 "metrics": metrics,
+                "train_metrics": train_metrics,
+                "holdout_baseline_metrics": holdout_baseline_metrics,
+                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                "candidate_holdout_metrics": candidate_holdout_metrics,
+                "candidate_signal_quality": candidate_signal_quality,
+                "holdout_passed": holdout_allowed,
+                "holdout_reasons": holdout_reasons,
+                "signal_quality_passed": signal_quality_allowed,
+                "signal_quality_reasons": signal_quality_reasons,
+                "walk_forward_validation": walk_forward_validation,
+                "walk_forward_passed": walk_forward_allowed,
+                "walk_forward_reasons": walk_forward_reasons,
                 "old_weights": (active.config or {}).get("weights", {}),
                 "new_weights": candidate_config.get("weights", {}),
                 "horizon_bias": candidate_config.get("horizon_bias", {}),
@@ -1352,11 +2612,23 @@ def evolve_model(
 
         return {
             "status": "completed",
-            "promoted": promote,
+            "promoted": promote_allowed,
             "evolution_run_id": run.id,
-            "active_model": _model_to_dict(candidate if promote else active),
+            "active_model": _model_to_dict(candidate if promote_allowed else active),
             "candidate_model": _model_to_dict(candidate),
             "metrics": metrics,
+            "train_metrics": train_metrics,
+            "holdout_baseline_metrics": holdout_baseline_metrics,
+            "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+            "candidate_holdout_metrics": candidate_holdout_metrics,
+            "candidate_signal_quality": candidate_signal_quality,
+            "holdout_passed": holdout_allowed,
+            "holdout_reasons": holdout_reasons,
+            "signal_quality_passed": signal_quality_allowed,
+            "signal_quality_reasons": signal_quality_reasons,
+            "walk_forward_validation": walk_forward_validation,
+            "walk_forward_passed": walk_forward_allowed,
+            "walk_forward_reasons": walk_forward_reasons,
         }
 
 

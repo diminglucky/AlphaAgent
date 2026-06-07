@@ -41,3 +41,19 @@ def test_test_endpoint_dispatches_to_feishu_service(monkeypatch):
     body = r.json()
     assert body["ok"] is True
     assert calls["payload"] == ("x", "y", "blue")
+
+
+def test_config_endpoint_persists_runtime_webhook_without_leaking_secret():
+    webhook = "https://open.feishu.cn/open-apis/bot/v2/hook/super-secret-token"
+
+    r = client.post("/api/v1/notify/config", json={"webhook_url": webhook})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["feishu"]["configured"] is True
+    assert body["feishu"]["source"] == "runtime"
+    assert "super-secret-token" not in str(body)
+
+    fetched = client.get("/api/v1/notify/config")
+    assert fetched.status_code == 200
+    assert fetched.json()["feishu"]["runtime_override"]["webhook_url_set"] is True

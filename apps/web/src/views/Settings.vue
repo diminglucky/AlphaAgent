@@ -191,16 +191,36 @@
       </div>
 
       <div class="config-guide">
-        <p>飞书机器人 Webhook 需要在 <code>.env</code> 文件中配置（暂不支持前端修改）：</p>
+        <p>飞书机器人 Webhook 支持运行时保存，立即生效且不需要重启服务：</p>
         <ol>
           <li>在飞书群中点击右上角「设置」→「群机器人」→「添加机器人」</li>
           <li>选择「自定义机器人」，复制 Webhook 地址</li>
-          <li>在项目根目录 <code>.env</code> 文件中设置：</li>
+          <li>粘贴到下面输入框保存。生产环境也可以继续使用 <code>QUANT_FEISHU_WEBHOOK_URL</code> 作为默认值。</li>
         </ol>
-        <pre>QUANT_FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/你的token</pre>
       </div>
 
+      <el-form label-width="100px">
+        <el-form-item label="Webhook">
+          <el-input
+            v-model="feishuForm.webhook_url"
+            type="password"
+            show-password
+            placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
+            clearable
+          />
+          <div class="field-hint">
+            当前来源：{{ feishuConfig.source || 'none' }}；当前值：{{ feishuConfig.webhook_url_preview || '未设置' }}
+          </div>
+        </el-form-item>
+      </el-form>
+
       <div class="card-actions">
+        <el-button type="primary" :loading="savingFeishu" @click="saveFeishuConfig">
+          保存飞书配置
+        </el-button>
+        <el-button plain :loading="savingFeishu" @click="resetFeishuConfig">
+          重置为环境变量
+        </el-button>
         <el-button type="primary" :loading="testingFeishu" @click="testFeishu">
           📲 发送测试消息
         </el-button>
@@ -259,7 +279,7 @@ defineOptions({ name: 'Settings' })
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
-import { api, http, getApiKey, setApiKey } from '../api.js'
+import { api, getApiKey, setApiKey } from '../api.js'
 
 const health = ref({ llm_configured: false, feishu_configured: false, market_provider: 'akshare' })
 const wsStatus = ref({ loop_running: false, quotes_clients: 0, alerts_clients: 0 })
@@ -269,10 +289,13 @@ const presets = ref({})
 const saving = ref(false)
 const testing = ref(false)
 const testingFeishu = ref(false)
+const savingFeishu = ref(false)
 const testResult = ref(null)
 const feishuResult = ref(null)
 const apiKeyInput = ref(getApiKey())
 const apiKeyConfigured = ref(Boolean(apiKeyInput.value))
+const feishuConfig = ref({})
+const feishuForm = ref({ webhook_url: '' })
 
 const llmForm = ref({
   provider: 'deepseek',
@@ -319,15 +342,17 @@ function applyPreset(key) {
 
 async function loadStatus() {
   try {
-    const [h, ws, llm] = await Promise.all([
+    const [h, ws, llm, notifyCfg] = await Promise.all([
       api.health(),
       api.wsStatus(),
       api.llmConfig(),
+      api.notifyConfig(),
     ])
     health.value = h
     wsStatus.value = ws
     llmStatus.value = llm.effective || {}
     presets.value = llm.presets || {}
+    feishuConfig.value = notifyCfg.feishu || {}
 
     // 用当前生效配置填充表单（api_key 不回填，保持空）
     const eff = llm.effective || {}
@@ -413,12 +438,46 @@ async function testFeishu() {
   testingFeishu.value = true
   feishuResult.value = null
   try {
-    await http.post('/notify/test', { title: '测试消息', content: '飞书机器人配置成功！来自 AlphaAgent。' })
+    await api.notifyTest({ title: '测试消息', content: '飞书机器人配置成功！来自 AlphaAgent。' })
     feishuResult.value = { ok: true, msg: '✓ 发送成功' }
   } catch (e) {
     feishuResult.value = { ok: false, msg: '✗ 发送失败：' + e.message }
   } finally {
     testingFeishu.value = false
+  }
+}
+
+async function saveFeishuConfig() {
+  if (!feishuForm.value.webhook_url?.trim()) {
+    ElMessage.warning('请填写飞书 Webhook URL')
+    return
+  }
+  savingFeishu.value = true
+  try {
+    const result = await api.notifyConfigSet({ webhook_url: feishuForm.value.webhook_url.trim() })
+    feishuConfig.value = result.feishu || {}
+    health.value.feishu_configured = Boolean(feishuConfig.value.configured)
+    feishuForm.value.webhook_url = ''
+    ElMessage.success('飞书配置已保存，立即生效')
+  } catch (e) {
+    ElMessage.error('保存飞书配置失败：' + e.message)
+  } finally {
+    savingFeishu.value = false
+  }
+}
+
+async function resetFeishuConfig() {
+  savingFeishu.value = true
+  try {
+    const result = await api.notifyConfigReset()
+    feishuConfig.value = result.feishu || {}
+    health.value.feishu_configured = Boolean(feishuConfig.value.configured)
+    feishuForm.value.webhook_url = ''
+    ElMessage.success('已重置为环境变量配置')
+  } catch (e) {
+    ElMessage.error('重置失败：' + e.message)
+  } finally {
+    savingFeishu.value = false
   }
 }
 

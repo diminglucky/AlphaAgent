@@ -7,9 +7,10 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-from fastapi import APIRouter, Body, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Body, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel
 
+from apps.api.app.core.auth import authenticate_api_key, get_current_user, require_admin, require_trader
 from apps.api.app.services import scanner_service
 
 log = logging.getLogger("quant.scanner.route")
@@ -26,10 +27,11 @@ class ScanReq(BaseModel):
     enable_fundamental: bool = True
     enable_llm: bool = True
     llm_top_n: int = 12
+    target_horizon_days: Optional[int] = None
 
 
 @router.post("/scan")
-async def scan_potential(req: Optional[ScanReq] = Body(default=None)):
+async def scan_potential(req: Optional[ScanReq] = Body(default=None), _: object = Depends(require_trader)):
     """扫描全市场，返回有上涨潜力的股票（三层漏斗）"""
     if req is None:
         req = ScanReq()
@@ -47,6 +49,7 @@ async def scan_potential(req: Optional[ScanReq] = Body(default=None)):
                 enable_fundamental=req.enable_fundamental,
                 enable_llm=req.enable_llm,
                 llm_top_n=req.llm_top_n,
+                target_horizon_days=req.target_horizon_days,
             ),
         )
     return result
@@ -55,6 +58,16 @@ async def scan_potential(req: Optional[ScanReq] = Body(default=None)):
 @router.websocket("/ws/scan")
 async def ws_scan(ws: WebSocket):
     """带进度推送的扫描接口（实时显示三层漏斗进度）"""
+    try:
+        user = authenticate_api_key(ws.query_params.get("api_key"), source="api_key query parameter")
+        if not user.is_trader:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "INSUFFICIENT_ROLE", "message": "Trader or Admin role required"},
+            )
+    except HTTPException as exc:
+        await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason=str(exc.detail))
+        return
     await ws.accept()
     try:
         # 客户端先发参数
@@ -97,6 +110,7 @@ async def ws_scan(ws: WebSocket):
                     enable_fundamental=req.enable_fundamental,
                     enable_llm=req.enable_llm,
                     llm_top_n=req.llm_top_n,
+                    target_horizon_days=req.target_horizon_days,
                     progress_callback=_progress,
                 ),
             )
@@ -126,20 +140,21 @@ async def ws_scan(ws: WebSocket):
 
 
 @router.get("/strategies")
-def list_strategies():
+def list_strategies(_: object = Depends(get_current_user)):
     """返回所有可用的经典策略"""
     return scanner_service.get_strategy_list()
 
 
 @router.get("/status")
-def scanner_status():
+def scanner_status(_: object = Depends(get_current_user)):
     return {
         "cache_keys": list(scanner_service._scan_cache.keys()),
+        "cache_count": len(scanner_service._scan_cache),
         "cached": bool(scanner_service._scan_cache),
     }
 
 
 @router.delete("/cache")
-def clear_scanner_cache():
+def clear_scanner_cache(_: object = Depends(require_admin)):
     scanner_service.clear_cache()
     return {"ok": True, "message": "缓存已清除"}
