@@ -122,6 +122,106 @@ def _limit_pct(code: str, name: str) -> float:
     return 0.10
 
 
+def _provider_name() -> str:
+    try:
+        from apps.api.app.core.config import get_settings
+
+        return str(get_settings().market_data_provider or "").strip().lower()
+    except Exception:
+        return "akshare"
+
+
+def _is_mock_provider() -> bool:
+    return _provider_name() == "mock"
+
+
+def _mock_stock_map():
+    from libs.market_data.universe import UNIVERSE
+
+    return {stock.symbol: stock for stock in UNIVERSE}
+
+
+def _mock_quote_for_stock(stock) -> dict:
+    from libs.market_data.universe import generate_bars
+
+    bars = generate_bars(stock, days=90)
+    if not bars:
+        return {}
+    last = bars[-1]
+    prev = bars[-2] if len(bars) >= 2 else last
+    trade_date, open_, high, low, close, volume, amount, turnover_rate = last
+    prev_close = float(prev[4]) or float(close)
+    change = round(float(close) - prev_close, 2)
+    change_pct = round(change / prev_close * 100, 2) if prev_close else 0.0
+    code = _to_code(stock.symbol)
+    limit_pct = _limit_pct(code, stock.name)
+    return {
+        "symbol": stock.symbol,
+        "name": stock.name,
+        "price": round(float(close), 2),
+        "change": change,
+        "change_pct": change_pct,
+        "volume": int(volume),
+        "turnover": float(amount),
+        "high": float(high),
+        "low": float(low),
+        "open": float(open_),
+        "prev_close": round(prev_close, 2),
+        "limit_up": round(prev_close * (1 + limit_pct), 2),
+        "limit_down": round(prev_close * (1 - limit_pct), 2),
+        "limit_pct": limit_pct,
+        "amplitude": round((float(high) - float(low)) / prev_close * 100, 2) if prev_close else 0.0,
+        "turnover_rate": float(turnover_rate),
+        "pe_ratio": 0,
+        "pb_ratio": 0,
+        "market_cap": 0,
+        "timestamp": f"{trade_date.isoformat()}T15:00:00",
+    }
+
+
+def _ensure_mock_market_cache() -> None:
+    from libs.market_data.universe import UNIVERSE
+
+    with _market_lock:
+        if _market_cache:
+            return
+        _market_cache.update({
+            _to_code(stock.symbol): quote
+            for stock in UNIVERSE
+            if (quote := _mock_quote_for_stock(stock))
+        })
+
+
+def _mock_kline(symbol: str, period: str = "daily", count: int = 120) -> list[dict]:
+    from libs.market_data.universe import generate_bars
+
+    stock = _mock_stock_map().get(symbol)
+    if stock is None:
+        return []
+    bars = generate_bars(stock, days=max(count + 40, 90))
+    rows = [
+        {
+            "date": d.isoformat(),
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+            "amount": amount,
+            "change_pct": round((close - bars[idx - 1][4]) / bars[idx - 1][4] * 100, 2)
+            if idx > 0 and bars[idx - 1][4] else 0,
+            "turnover_rate": turnover_rate,
+            "is_today": False,
+        }
+        for idx, (d, open_, high, low, close, volume, amount, turnover_rate) in enumerate(bars)
+    ]
+    if period == "weekly":
+        return rows[-min(count, len(rows))::5] or rows[-min(count, len(rows)):]
+    if period == "monthly":
+        return rows[-min(count, len(rows))::20] or rows[-min(count, len(rows)):]
+    return rows[-min(count, len(rows)):]
+
+
 # ---------------------------------------------------------------------------
 # 精准行情刷新（自选股专用，3秒）
 # ---------------------------------------------------------------------------
@@ -357,6 +457,10 @@ def _market_refresh_loop():
 def ensure_cache_running():
     """启动两个后台缓存线程"""
     global _precise_thread, _market_thread
+    if _is_mock_provider():
+        _ensure_mock_market_cache()
+        log.info("mock 行情缓存已加载，共 %d 只", len(_market_cache))
+        return
 
     if _precise_thread is None or not _precise_thread.is_alive():
         _precise_thread = threading.Thread(
@@ -385,6 +489,10 @@ def get_realtime_quotes(symbols: list[str]) -> list[dict]:
     """获取批量行情：优先精准缓存，回退全市场缓存"""
     if not symbols:
         return []
+    if _is_mock_provider():
+        _ensure_mock_market_cache()
+        quote_map = {q["symbol"]: q for q in get_all_quotes_snapshot()}
+        return [dict(quote_map[symbol]) for symbol in symbols if symbol in quote_map]
     # 确保这些 symbol 被精准跟踪
     register_symbols(symbols)
 
@@ -411,6 +519,11 @@ def get_realtime_quotes(symbols: list[str]) -> list[dict]:
 
 def get_single_quote(symbol: str) -> Optional[dict]:
     """获取单股行情。临时查询不会进入精准跟踪集合。"""
+    if _is_mock_provider():
+        _ensure_mock_market_cache()
+        stock = _mock_stock_map().get(symbol)
+        return _mock_quote_for_stock(stock) if stock else None
+
     # 临时查询：不进精准集合，避免大量扫描后 URL 过长
     register_symbols([symbol], persistent=False)
 
@@ -471,6 +584,9 @@ def get_all_quotes_snapshot() -> list[dict]:
 
 def get_kline(symbol: str, period: str = "daily", count: int = 120) -> list[dict]:
     """获取K线，腾讯接口（稳定）+ 今日实时K线"""
+    if _is_mock_provider():
+        return _mock_kline(symbol, period=period, count=count)
+
     ak = _ak()
     code = _to_code(symbol)
     exchange = "sh" if code.startswith(("6", "9")) else "sz"
@@ -596,6 +712,17 @@ def _resample_kline(df, freq: str):
 # ---------------------------------------------------------------------------
 
 def search_stocks(keyword: str) -> list[dict]:
+    if _is_mock_provider():
+        raw = keyword.strip().upper()
+        result = []
+        for stock in _mock_stock_map().values():
+            code = _to_code(stock.symbol)
+            if raw in code or raw in stock.name.upper() or raw in stock.industry.upper():
+                result.append({"symbol": stock.symbol, "name": stock.name, "code": code})
+                if len(result) >= 20:
+                    break
+        return result
+
     ak = _ak()
     try:
         df = ak.stock_info_a_code_name()
@@ -616,6 +743,21 @@ def search_stocks(keyword: str) -> list[dict]:
 
 
 def get_stock_news(symbol: str, count: int = 10) -> list[dict]:
+    if _is_mock_provider():
+        stock = _mock_stock_map().get(symbol)
+        if not stock:
+            return []
+        return [
+            {
+                "title": f"{stock.name} mock 行情样本：趋势 {stock.trend:+.4f}",
+                "content": f"{stock.name} 属于{stock.industry}行业；当前为本地 mock 数据，用于无网络演示和自动化测试。",
+                "source": "AlphaAgent Mock",
+                "time": "2026-04-25 15:00:00",
+                "url": "",
+            }
+            for _ in range(max(0, min(count, 3)))
+        ]
+
     ak = _ak()
     code = _to_code(symbol)
     try:

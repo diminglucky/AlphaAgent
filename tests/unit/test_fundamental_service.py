@@ -248,3 +248,24 @@ def test_get_insider_reduction_detects_recent_sells(monkeypatch) -> None:
     assert score >= 9
     assert items[0]["score"] < 0
     assert "减持 1 次" in items[0]["desc"]
+
+
+def test_mock_provider_fundamental_pipeline_does_not_use_external_akshare(monkeypatch) -> None:
+    fundamental_service.clear_cache()
+    monkeypatch.setattr(fundamental_service, "_provider_name", lambda: "mock")
+    monkeypatch.setattr(
+        fundamental_service,
+        "_ak",
+        lambda: (_ for _ in ()).throw(AssertionError("akshare should not be used in mock mode")),
+    )
+
+    result = fundamental_service.evaluate_fundamental("300750.SZ", "宁德时代")
+
+    assert result["info"]["industry"] == "电池"
+    assert result["fund_flow"]["_partial"] is False
+    assert result["northbound_flow"]["_partial"] is False
+    assert result["research_rating"]["_partial"] is False
+    assert result["insider_reduction"]["_partial"] is False
+    assert result["industry_rank"]
+    assert isinstance(fundamental_service.get_hot_industries(top_n=5), list)
+    assert isinstance(fundamental_service.get_lhb_record("300750.SZ"), list)

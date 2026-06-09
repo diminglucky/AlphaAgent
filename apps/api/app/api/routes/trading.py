@@ -24,6 +24,21 @@ class OrderReq(BaseModel):
     reason: str = ""
 
 
+class RebalancePlanReq(BaseModel):
+    top_n: int = Field(8, ge=1, le=30)
+    min_score: int = Field(60, ge=0, le=100)
+    candidate_pool: int = Field(30, ge=1, le=300)
+    enable_fundamental: bool = True
+    enable_llm: bool = False
+    llm_top_n: int = Field(8, ge=1, le=20)
+    target_horizon_days: int | None = Field(default=None, ge=0, le=60)
+    weighting_scheme: str = Field(
+        "risk_adjusted",
+        pattern="^(signal_proportional|equal_weight|inverse_volatility|risk_adjusted)$",
+    )
+    use_cache: bool = True
+
+
 @router.get("/account")
 def get_account(_: object = Depends(get_current_user), db: Session = Depends(get_db)):
     return trading_service.get_account(db)
@@ -57,6 +72,26 @@ def preview_order(req: OrderReq, _: object = Depends(require_trader), db: Sessio
         side=req.side,
         quantity=req.quantity,
         price=req.price,
+    )
+
+
+@router.post("/rebalance-plan")
+def rebalance_plan(
+    req: RebalancePlanReq,
+    _: object = Depends(require_trader),
+    db: Session = Depends(get_db),
+):
+    return trading_service.generate_rebalance_plan(
+        db,
+        top_n=req.top_n,
+        min_score=req.min_score,
+        candidate_pool=req.candidate_pool,
+        enable_fundamental=req.enable_fundamental,
+        enable_llm=req.enable_llm,
+        llm_top_n=req.llm_top_n,
+        target_horizon_days=req.target_horizon_days,
+        weighting_scheme=req.weighting_scheme,
+        use_cache=req.use_cache,
     )
 
 

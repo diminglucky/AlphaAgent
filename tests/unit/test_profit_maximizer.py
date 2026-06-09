@@ -155,7 +155,7 @@ _SAMPLE_LLM_REPLY = """## 📊 作战计划
   ],
   "sell_actions": [
     {"symbol": "600519.SH", "action": "REDUCE_HALF", "urgency": "medium",
-     "current_pnl": 0.047, "reason": "权重 54% 超风控 30%"}
+     "current_pnl": 0.047, "reason": "权重 54% 超风控 15%"}
   ],
   "watch_list": [
     {"symbol": "000858.SZ", "warning": "approaching_resistance", "reason": "RSI 73.6"}

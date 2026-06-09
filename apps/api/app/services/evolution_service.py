@@ -10,6 +10,7 @@ import copy
 import json
 import logging
 import math
+from collections import Counter
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from statistics import mean
@@ -75,6 +76,38 @@ AUTO_EVOLVE_WALK_FORWARD_MIN_PROFITABLE_FOLDS = 0.50
 AUTO_EVOLVE_WALK_FORWARD_RETURN_TOLERANCE = 0.001
 AUTO_EVOLVE_WALK_FORWARD_CONSISTENCY_TOLERANCE = 0.02
 AUTO_EVOLVE_WALK_FORWARD_DRAWDOWN_TOLERANCE = 0.03
+FEATURE_LABELS = {
+    "technical": "技术形态",
+    "fundamental": "基本面质量",
+    "flow": "资金流",
+    "industry": "行业强度",
+    "northbound": "北向资金",
+    "research": "研报关注",
+    "reduction_risk": "减持风险",
+    "ai": "AI 置信度",
+    "strategy": "策略共振",
+    "volume": "量能",
+    "momentum": "动量",
+    "risk": "风险质量",
+}
+ERROR_TYPE_LABELS = {
+    "none": "无明显错误",
+    "target_too_aggressive": "目标过高",
+    "stop_loss_hit": "回撤/止损风险",
+    "timing_horizon_mismatch": "节奏或周期错配",
+    "overconfident_false_positive": "高置信误判",
+    "weak_signal_quality": "信号质量不足",
+    "false_positive": "方向误判",
+}
+VERDICT_LABELS = {
+    "hit_target": "达到目标",
+    "profitable_but_target_missed": "有收益但未达目标",
+    "stopped_out": "触及止损",
+    "gain_faded": "冲高回落",
+    "high_confidence_failure": "高置信失败",
+    "failed_no_edge": "缺少有效优势",
+    "false_positive": "上涨判断失败",
+}
 
 
 def _now() -> datetime:
@@ -224,6 +257,309 @@ def _notify_evolution_failure(
 def _jsonable(value: Any) -> Any:
     """Make nested scanner payloads safe for SQLAlchemy JSON on SQLite."""
     return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _prediction_model_config(session: Session, pred: StockPredictionORM) -> dict:
+    model = session.get(ModelVersionORM, pred.model_version_id) if pred.model_version_id else None
+    return copy.deepcopy((model.config if model else None) or DEFAULT_MODEL_CONFIG)
+
+
+def _feature_contributions(
+    pred: StockPredictionORM,
+    config: dict | None = None,
+    *,
+    limit: int = 8,
+) -> list[dict]:
+    """Explain which model factors supported or warned against a prediction."""
+    cfg = config or DEFAULT_MODEL_CONFIG
+    weights = cfg.get("weights") or DEFAULT_MODEL_CONFIG["weights"]
+    features = pred.features or {}
+    rows: list[dict] = []
+    for key, raw_weight in weights.items():
+        weight = _f(raw_weight)
+        value = _clamp(_f(features.get(key)), 0.0, 1.0)
+        if weight >= 0:
+            support_score = value * abs(weight)
+            risk_score = (1.0 - value) * abs(weight) if key == "risk" else 0.0
+            direction = "support" if support_score >= risk_score else "missing_support"
+        else:
+            support_score = (1.0 - value) * abs(weight)
+            risk_score = value * abs(weight)
+            direction = "risk" if risk_score > support_score else "support"
+        rows.append({
+            "key": key,
+            "label": FEATURE_LABELS.get(key, key),
+            "value": round(value, 4),
+            "weight": round(weight, 4),
+            "net_score": round(value * weight, 4),
+            "support_score": round(support_score, 4),
+            "risk_score": round(risk_score, 4),
+            "direction": direction,
+        })
+    rows.sort(key=lambda row: max(abs(row["support_score"]), abs(row["risk_score"])), reverse=True)
+    return rows[: max(1, limit)]
+
+
+def _cause(factor: str, severity: float, message: str, evidence: dict | None = None) -> dict:
+    return {
+        "factor": factor,
+        "severity": round(_clamp(severity, 0.0, 1.0), 4),
+        "message": message,
+        "evidence": evidence or {},
+    }
+
+
+def _adjustment(action: str, scope: str, message: str, priority: str = "medium") -> dict:
+    return {
+        "action": action,
+        "scope": scope,
+        "priority": priority,
+        "message": message,
+    }
+
+
+def _diagnose_prediction_outcome(
+    pred: StockPredictionORM,
+    outcome: PredictionOutcomeORM,
+    *,
+    config: dict | None = None,
+) -> dict:
+    """Create a human-readable and machine-readable post-mortem for one prediction."""
+    probability = _clamp(_f(pred.probability), 0.0, 1.0)
+    realized = _f(outcome.close_return_pct)
+    expected = _f(pred.expected_return_pct)
+    target = _f(pred.target_return_pct)
+    stop_loss = abs(_f(pred.stop_loss_pct))
+    max_return = _f(outcome.max_return_pct)
+    max_drawdown = _f(outcome.max_drawdown_pct)
+    horizon = int(pred.horizon_days or outcome.horizon_days or 0)
+    direction_correct = realized > 0
+    target_hit = bool(outcome.hit_target)
+    stop_hit = bool(outcome.hit_stop)
+    expectation_gap = realized - expected
+    target_gap = realized - target
+    fade_from_high = max_return - realized
+    contributions = _feature_contributions(pred, config, limit=8)
+
+    if target_hit and bool(outcome.success):
+        verdict = "hit_target"
+        error_type = "none"
+    elif direction_correct:
+        verdict = "profitable_but_target_missed"
+        error_type = "target_too_aggressive"
+    elif stop_hit or (stop_loss > 0 and max_drawdown <= -stop_loss * 0.75):
+        verdict = "stopped_out"
+        error_type = "stop_loss_hit"
+    elif max_return > 0 and fade_from_high >= max(2.0, target * 0.5):
+        verdict = "gain_faded"
+        error_type = "timing_horizon_mismatch"
+    elif probability >= 0.65:
+        verdict = "high_confidence_failure"
+        error_type = "overconfident_false_positive"
+    elif probability < 0.55:
+        verdict = "failed_no_edge"
+        error_type = "weak_signal_quality"
+    else:
+        verdict = "false_positive"
+        error_type = "false_positive"
+
+    root_causes: list[dict] = []
+    lessons: list[str] = []
+    adjustments: list[dict] = []
+    feature_penalties: list[dict] = []
+    feature_rewards: list[dict] = []
+    horizon_bias_delta = 0.0
+
+    if error_type == "none":
+        top_driver = next((row for row in contributions if row["support_score"] > 0), None)
+        if top_driver:
+            root_causes.append(_cause(
+                "effective_signal",
+                min(1.0, top_driver["support_score"] * 8),
+                f"{top_driver['label']} 是本次预测的主要有效信号。",
+                {"feature": top_driver["key"], "value": top_driver["value"]},
+            ))
+            feature_rewards.append({
+                "key": top_driver["key"],
+                "label": top_driver["label"],
+                "suggested_delta": 0.01,
+                "reason": "validated_success_driver",
+            })
+        lessons.append(f"{horizon}日预测达到目标，当前周期的信号组合可以保留并继续积累样本。")
+        adjustments.append(_adjustment(
+            "reinforce_success_pattern",
+            f"horizon:{horizon}",
+            "保留本次有效特征组合，但等待更多样本后再大幅增权。",
+            "low",
+        ))
+        horizon_bias_delta = 0.005
+    elif error_type == "target_too_aggressive":
+        severity = _clamp((target - realized) / max(abs(target), 1.0), 0.0, 1.0)
+        root_causes.append(_cause(
+            "target_setting",
+            severity,
+            f"方向判断正确，但{horizon}日目标收益偏高，收盘收益未达到目标。",
+            {
+                "target_return_pct": round(target, 4),
+                "close_return_pct": round(realized, 4),
+                "max_return_pct": round(max_return, 4),
+            },
+        ))
+        lessons.append("预测抓到了上涨方向，但目标收益或持有周期需要更贴近真实波动。")
+        adjustments.append(_adjustment(
+            "lower_or_stage_target",
+            f"horizon:{horizon}",
+            f"下调{horizon}日目标收益，或把冲高未达标样本按“方向命中但目标过高”单独校准。",
+        ))
+    elif error_type == "stop_loss_hit":
+        severity = _clamp(abs(max_drawdown) / max(stop_loss, 1.0), 0.0, 1.0)
+        root_causes.append(_cause(
+            "drawdown_risk",
+            severity,
+            "预测后的最大回撤接近或触及止损，风险过滤不足。",
+            {
+                "max_drawdown_pct": round(max_drawdown, 4),
+                "stop_loss_pct": round(stop_loss, 4),
+            },
+        ))
+        risk_rows = [
+            row for row in contributions
+            if (row["key"] == "reduction_risk" and row["value"] >= 0.35)
+            or (row["key"] == "risk" and row["value"] <= 0.55)
+        ]
+        for row in risk_rows[:2]:
+            feature_penalties.append({
+                "key": row["key"],
+                "label": row["label"],
+                "suggested_delta": -0.02 if row["weight"] >= 0 else -0.01,
+                "reason": "underestimated_drawdown_risk",
+            })
+        lessons.append("这类失败优先说明风险没有被足够惩罚，而不是简单提高买入信号权重。")
+        adjustments.append(_adjustment(
+            "increase_risk_penalty",
+            "features:risk",
+            "提高减持风险、低风险质量、过大回撤样本的惩罚权重。",
+            "high",
+        ))
+        horizon_bias_delta = -0.01
+    elif error_type == "timing_horizon_mismatch":
+        root_causes.append(_cause(
+            "timing",
+            _clamp(fade_from_high / max(abs(target), 1.0), 0.0, 1.0),
+            "预测期内曾经上涨，但收盘验证时收益回落，持有周期或退出规则不匹配。",
+            {
+                "max_return_pct": round(max_return, 4),
+                "close_return_pct": round(realized, 4),
+                "fade_from_high_pct": round(fade_from_high, 4),
+            },
+        ))
+        lessons.append("信号可能更适合短周期验证，或需要加入“冲高后保护收益”的评估方式。")
+        adjustments.append(_adjustment(
+            "shift_horizon_or_add_exit_rule",
+            f"horizon:{horizon}",
+            "降低当前周期权重，比较更短周期是否更适合这类信号。",
+        ))
+        horizon_bias_delta = -0.008
+    else:
+        misleading = [
+            row for row in contributions
+            if row["weight"] > 0 and row["value"] >= 0.55
+        ][:3]
+        if misleading:
+            labels = "、".join(row["label"] for row in misleading)
+            root_causes.append(_cause(
+                "misleading_positive_factors",
+                _clamp(probability, 0.0, 1.0),
+                f"{labels} 给出了较强正向贡献，但真实走势没有兑现。",
+                {"features": [{"key": row["key"], "value": row["value"]} for row in misleading]},
+            ))
+            for row in misleading:
+                feature_penalties.append({
+                    "key": row["key"],
+                    "label": row["label"],
+                    "suggested_delta": -0.015,
+                    "reason": "false_positive_contributor",
+                })
+        if probability >= 0.65:
+            root_causes.append(_cause(
+                "overconfidence",
+                probability,
+                "模型给出了较高上涨概率，但结果为负收益，概率校准偏乐观。",
+                {"probability": round(probability, 4), "close_return_pct": round(realized, 4)},
+            ))
+            lessons.append("高置信失败要优先用于概率校准，降低类似特征组合的置信度。")
+            adjustments.append(_adjustment(
+                "lower_confidence_for_pattern",
+                f"horizon:{horizon}",
+                "降低类似高置信失败样本的概率输出，并检查主导正向因子是否过拟合。",
+                "high",
+            ))
+        else:
+            lessons.append("低置信失败说明信号本身优势不足，应提高入选门槛或等待更多确认。")
+            adjustments.append(_adjustment(
+                "raise_signal_threshold",
+                "scanner",
+                "提高最低概率/预期收益阈值，减少弱信号进入推荐池。",
+            ))
+        horizon_bias_delta = -0.01 if probability >= 0.65 else -0.004
+
+    if expectation_gap < -2.0 and error_type != "none":
+        root_causes.append(_cause(
+            "expectation_gap",
+            _clamp(abs(expectation_gap) / 10.0, 0.0, 1.0),
+            "真实收益显著低于模型预期收益，预期收益估计偏乐观。",
+            {
+                "expected_return_pct": round(expected, 4),
+                "close_return_pct": round(realized, 4),
+                "gap_pct": round(expectation_gap, 4),
+            },
+        ))
+
+    if not root_causes:
+        root_causes.append(_cause(
+            "insufficient_evidence",
+            0.2,
+            "单条样本不足以稳定归因，需要结合更多同类样本判断。",
+        ))
+    if not lessons:
+        lessons.append("该样本应进入同类错误聚合，等待更多样本后再调整模型。")
+    if not adjustments:
+        adjustments.append(_adjustment(
+            "collect_more_samples",
+            f"horizon:{horizon}",
+            "继续收集同类预测结果，避免单样本过度调整。",
+            "low",
+        ))
+
+    return {
+        "verdict": verdict,
+        "verdict_label": VERDICT_LABELS.get(verdict, verdict),
+        "error_type": error_type,
+        "error_type_label": ERROR_TYPE_LABELS.get(error_type, error_type),
+        "direction_correct": direction_correct,
+        "target_hit": target_hit,
+        "stop_hit": stop_hit,
+        "probability": round(probability, 4),
+        "probability_pct": round(probability * 100.0, 2),
+        "expected_return_pct": round(expected, 4),
+        "realized_return_pct": round(realized, 4),
+        "max_return_pct": round(max_return, 4),
+        "max_drawdown_pct": round(max_drawdown, 4),
+        "expectation_gap_pct": round(expectation_gap, 4),
+        "target_gap_pct": round(target_gap, 4),
+        "fade_from_high_pct": round(fade_from_high, 4),
+        "root_causes": root_causes,
+        "lessons": lessons,
+        "recommended_adjustments": adjustments,
+        "feature_contributions": contributions,
+        "model_feedback": {
+            "probability_error": round(probability - (1.0 if bool(outcome.success) else 0.0), 4),
+            "return_error_pct": round(expectation_gap, 4),
+            "horizon_bias_delta": round(horizon_bias_delta, 4),
+            "feature_penalties": feature_penalties,
+            "feature_rewards": feature_rewards,
+        },
+    }
 
 
 def ensure_active_model(db: Session) -> ModelVersionORM:
@@ -405,6 +741,187 @@ def _select_estimate_for_ranking(
         if closest:
             return closest, "nearest_requested_horizon"
     return max(estimates, key=lambda x: (x["expected_return_pct"], x["probability"]), default=None), "best_expected_return"
+
+
+def _normalize_symbol_list(symbols: list[str] | tuple[str, ...] | None, *, limit: int) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in symbols or []:
+        symbol = str(raw or "").strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        out.append(symbol)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _recent_prediction_symbols(session: Session, *, limit: int = 20) -> list[str]:
+    rows = (
+        session.query(StockPredictionORM.symbol)
+        .order_by(StockPredictionORM.predicted_at.desc(), StockPredictionORM.id.desc())
+        .limit(max(1, limit * 20))
+        .all()
+    )
+    return _normalize_symbol_list([row[0] for row in rows], limit=limit)
+
+
+def _has_historical_replay_prediction(
+    session: Session,
+    *,
+    symbol: str,
+    model_id: int,
+    horizon_days: int,
+    predicted_at: datetime,
+) -> bool:
+    candidates = (
+        session.query(StockPredictionORM.raw_result)
+        .filter(
+            StockPredictionORM.symbol == symbol,
+            StockPredictionORM.model_version_id == model_id,
+            StockPredictionORM.horizon_days == horizon_days,
+            StockPredictionORM.predicted_at == predicted_at,
+        )
+        .all()
+    )
+    return any((row[0] or {}).get("source") == "historical_replay" for row in candidates)
+
+
+def _historical_replay_audit(
+    *,
+    requested_min_gap_days: int,
+    effective_min_gap_days: int,
+    max_horizon_days: int,
+    target_horizons: list[int],
+    sample_limit: int,
+    bars_count: int,
+) -> dict:
+    return {
+        "mode": "historical_replay",
+        "horizon_unit": "trading_bars",
+        "target_horizons": target_horizons,
+        "requested_bars_count": bars_count,
+        "samples_per_symbol": sample_limit,
+        "anti_leakage": {
+            "uses_future_features": False,
+            "feature_window": "only bars up to and including prediction_bar_date",
+            "outcome_window": "bars strictly after prediction_bar_date",
+            "label_overlap_guard": "effective_min_gap_days >= max_horizon_days",
+            "requested_min_gap_days": requested_min_gap_days,
+            "effective_min_gap_days": effective_min_gap_days,
+            "max_horizon_days": max_horizon_days,
+        },
+        "limitations": [
+            "历史回放用于加速模型校准，不代表真实未来收益承诺。",
+            "同一天不同预测周期仍共享同一个预测截面，应结合真实到期样本继续验证。",
+            "历史 K 线无法完整模拟公告、停牌、流动性冲击和真实下单滑点。",
+        ],
+    }
+
+
+def _sorted_valid_bars(bars: list[dict]) -> list[dict]:
+    dated = [(dt, b) for b in bars or [] if (dt := _bar_date(b)) is not None and _f(b.get("close")) > 0]
+    dated.sort(key=lambda item: item[0])
+    return [b for _, b in dated]
+
+
+def _mean_or_zero(values: list[float]) -> float:
+    clean = [v for v in values if v > 0]
+    return mean(clean) if clean else 0.0
+
+
+def _ret_pct_from_window(bars: list[dict], idx: int, days: int) -> float:
+    if idx - days < 0:
+        return 0.0
+    prev = _f(bars[idx - days].get("close"))
+    current = _f(bars[idx].get("close"))
+    if prev <= 0 or current <= 0:
+        return 0.0
+    return (current - prev) / prev * 100.0
+
+
+def _historical_stock_from_bars(
+    *,
+    symbol: str,
+    name: str,
+    bars: list[dict],
+    idx: int,
+) -> dict:
+    current = bars[idx]
+    close = _f(current.get("close"))
+    high = _f(current.get("high")) or close
+    low = _f(current.get("low")) or close
+    start = max(0, idx - 20)
+    window = bars[start : idx + 1]
+    prev_window = bars[max(0, idx - 20) : idx] or window
+    ret_5d = _ret_pct_from_window(bars, idx, 5)
+    ret_20d = _ret_pct_from_window(bars, idx, 20)
+    volumes = [_f(b.get("volume")) for b in prev_window]
+    avg_volume = _mean_or_zero(volumes)
+    volume = _f(current.get("volume"))
+    vol_ratio = volume / avg_volume if avg_volume > 0 and volume > 0 else 1.0
+    high_20 = max([_f(b.get("high")) or _f(b.get("close")) for b in window] or [high])
+    low_20 = min([_f(b.get("low")) or _f(b.get("close")) for b in window] or [low])
+    avg_close_20 = _mean_or_zero([_f(b.get("close")) for b in window])
+    trend_vs_ma = (close - avg_close_20) / avg_close_20 * 100.0 if avg_close_20 > 0 else 0.0
+    range_position = (close - low_20) / (high_20 - low_20) if high_20 > low_20 else 0.5
+    breakout_bonus = 8.0 if high_20 > 0 and close >= high_20 * 0.985 else 0.0
+    volume_score = _clamp((vol_ratio - 0.6) / 2.4, 0.0, 1.0) * 20.0
+    momentum_score = _clamp((ret_5d + 6.0) / 18.0, 0.0, 1.0) * 15.0
+    technical_score = _clamp(
+        48.0
+        + ret_5d * 2.0
+        + ret_20d * 0.8
+        + trend_vs_ma * 1.1
+        + (range_position - 0.5) * 14.0
+        + breakout_bonus
+        + min(max(vol_ratio - 1.0, -0.5), 2.0) * 5.0,
+        15.0,
+        95.0,
+    )
+    action = "BUY" if technical_score >= 55 else "HOLD"
+    confidence = int(_clamp(technical_score + abs(ret_5d) * 0.8, 35.0, 90.0))
+    stop_loss = close * 0.94 if close > 0 else 0.0
+    expected_return = _clamp(ret_5d * 0.35 + ret_20d * 0.12 + (vol_ratio - 1.0) * 1.2, -4.0, 10.0)
+    return {
+        "symbol": symbol,
+        "name": name or symbol,
+        "price": round(close, 4),
+        "change_pct": round(_f(current.get("change_pct")) or _ret_pct_from_window(bars, idx, 1), 4),
+        "score": int(round(technical_score)),
+        "dim_scores": {
+            "volume": round(volume_score, 4),
+            "momentum": round(momentum_score, 4),
+        },
+        "indicators": {
+            "ret_5d": round(ret_5d, 4),
+            "ret_20d": round(ret_20d, 4),
+            "vol_ratio": round(vol_ratio, 4),
+        },
+        "strategies": [{"name": "历史回放动量"}] if technical_score >= 55 else [],
+        "fundamental": {
+            "quality": 12,
+            "flow_score": 12,
+            "industry_score": 8,
+            "northbound_score": 7,
+            "research_score": 6,
+            "insider_reduction_score": 3,
+        },
+        "ai_analysis": {
+            "action": action,
+            "confidence": confidence,
+            "risk_level": "中" if technical_score >= 45 else "高",
+        },
+        "trade_plan": {
+            "entry_low": round(close * 0.99, 4),
+            "entry_mid": round(close, 4),
+            "stop_loss": round(stop_loss, 4),
+            "expected_return_pct": round(expected_return, 4),
+            "source": "historical_replay",
+        },
+        "raw_bar": _jsonable(current),
+    }
 
 
 def enrich_scan_results_with_model(
@@ -720,6 +1237,11 @@ def _record_sell_fill_outcomes(
             "target_return_pct": pred.target_return_pct,
             "stop_loss_pct": pred.stop_loss_pct,
         }
+        outcome.details["diagnosis"] = _diagnose_prediction_outcome(
+            pred,
+            outcome,
+            config=_prediction_model_config(session, pred),
+        )
         outcome.validated_at = _now()
         if existing is None:
             session.add(outcome)
@@ -827,15 +1349,14 @@ def _future_bars_for_prediction(pred: StockPredictionORM, bars: list[dict], forc
     return []
 
 
-def _validate_one_prediction(
+def _build_outcome_from_future_bars(
     session: Session,
     pred: StockPredictionORM,
     *,
-    force: bool = False,
+    future: list[dict],
+    details_extra: dict | None = None,
+    validated_at: datetime | None = None,
 ) -> PredictionOutcomeORM | None:
-    count = max(80, pred.horizon_days + 40)
-    bars = market_service.get_kline(pred.symbol, period="daily", count=count) or []
-    future = _future_bars_for_prediction(pred, bars, force)
     if not future:
         return None
 
@@ -894,18 +1415,36 @@ def _validate_one_prediction(
     outcome.hit_stop = hit_stop
     outcome.bars_checked = len(future)
     outcome.details = {
+        **(details_extra or {}),
         "target_price": round(target_price, 4),
         "stop_price": round(stop_price, 4),
         "hit_target_day": None if hit_target_idx is None else hit_target_idx + 1,
         "hit_stop_day": None if hit_stop_idx is None else hit_stop_idx + 1,
     }
-    outcome.validated_at = _now()
+    outcome.details["diagnosis"] = _diagnose_prediction_outcome(
+        pred,
+        outcome,
+        config=_prediction_model_config(session, pred),
+    )
+    outcome.validated_at = validated_at or _now()
     if existing is None:
         session.add(outcome)
 
     pred.status = "validated"
     pred.validated_at = outcome.validated_at
     return outcome
+
+
+def _validate_one_prediction(
+    session: Session,
+    pred: StockPredictionORM,
+    *,
+    force: bool = False,
+) -> PredictionOutcomeORM | None:
+    count = max(80, pred.horizon_days + 40)
+    bars = market_service.get_kline(pred.symbol, period="daily", count=count) or []
+    future = _future_bars_for_prediction(pred, bars, force)
+    return _build_outcome_from_future_bars(session, pred, future=future)
 
 
 def validate_predictions(
@@ -945,6 +1484,233 @@ def validate_predictions(
             "validated": validated,
             "skipped": skipped,
             "errors": errors,
+        }
+
+
+def backfill_historical_predictions(
+    *,
+    symbols: list[str] | None = None,
+    symbol_limit: int = 10,
+    bars_count: int = 260,
+    samples_per_symbol: int = 6,
+    horizon_days: int | None = None,
+    min_gap_days: int = 5,
+    db: Session | None = None,
+) -> dict:
+    """Create immediately validated replay samples from historical K-line windows."""
+    with _ctx(db) as session:
+        model = ensure_active_model(session)
+        cfg = model.config or DEFAULT_MODEL_CONFIG
+        selected_symbols = _normalize_symbol_list(symbols, limit=symbol_limit)
+        if not selected_symbols:
+            selected_symbols = _recent_prediction_symbols(session, limit=symbol_limit)
+        if not selected_symbols:
+            return {
+                "ok": False,
+                "reason": "no_symbols",
+                "symbols": [],
+                "created_predictions": 0,
+                "validated_predictions": 0,
+            }
+
+        horizons = [int(h) for h in (cfg.get("horizons") or DEFAULT_MODEL_CONFIG["horizons"])]
+        if horizon_days:
+            requested_horizon = int(horizon_days)
+            target_horizons = [requested_horizon] if requested_horizon in horizons else []
+        else:
+            target_horizons = horizons
+        if not target_horizons:
+            return {
+                "ok": False,
+                "reason": "unsupported_horizon",
+                "symbols": selected_symbols,
+                "supported_horizons": horizons,
+                "requested_horizon_days": horizon_days,
+                "created_predictions": 0,
+                "validated_predictions": 0,
+            }
+        max_horizon = max(target_horizons or horizons or [20])
+        min_history = max(25, max_horizon + 20)
+        sample_limit = max(1, min(samples_per_symbol, 50))
+        requested_min_gap = max(1, min_gap_days)
+        effective_min_gap = max(requested_min_gap, max_horizon)
+        replay_audit = _historical_replay_audit(
+            requested_min_gap_days=requested_min_gap,
+            effective_min_gap_days=effective_min_gap,
+            max_horizon_days=max_horizon,
+            target_horizons=target_horizons,
+            sample_limit=sample_limit,
+            bars_count=bars_count,
+        )
+        run = ScanRunORM(
+            model_version_id=model.id,
+            source="historical_replay",
+            params=_jsonable({
+                "symbols": selected_symbols,
+                "symbol_limit": symbol_limit,
+                "bars_count": bars_count,
+                "samples_per_symbol": samples_per_symbol,
+                "horizon_days": horizon_days,
+                "min_gap_days": min_gap_days,
+                "effective_min_gap_days": effective_min_gap,
+                "audit": replay_audit,
+            }),
+            market_status={"mode": "historical_replay"},
+            hot_industries=[],
+            scanned=len(selected_symbols),
+            candidates=0,
+            analyzed=0,
+            tier1_count=0,
+            tier2_count=None,
+            tier3_count=None,
+            result_count=0,
+            rejected_count=0,
+            llm_status="disabled",
+            elapsed_ms=0.0,
+            created_at=_now(),
+        )
+        session.add(run)
+        session.flush()
+
+        created = 0
+        validated = 0
+        skipped: list[dict] = []
+        symbol_reports: list[dict] = []
+        due_cutoff = _now()
+        min_gap = effective_min_gap
+        for symbol in selected_symbols:
+            bars_raw = market_service.get_kline(symbol, period="daily", count=max(bars_count, min_history + sample_limit * min_gap + max_horizon + 5)) or []
+            bars = _sorted_valid_bars(bars_raw)
+            if len(bars) < min_history + max_horizon + 1:
+                skipped.append({"symbol": symbol, "reason": "insufficient_bars", "bars": len(bars)})
+                symbol_reports.append({"symbol": symbol, "created": 0, "validated": 0, "skipped": "insufficient_bars"})
+                continue
+            quote_name = ""
+            try:
+                quote_name = str((market_service.get_single_quote(symbol) or {}).get("name") or "")
+            except Exception:
+                quote_name = ""
+            latest_prediction_idx = len(bars) - max_horizon - 1
+            earliest_idx = 20
+            usable_span = latest_prediction_idx - earliest_idx + 1
+            if usable_span <= 0:
+                skipped.append({"symbol": symbol, "reason": "insufficient_window", "bars": len(bars)})
+                symbol_reports.append({"symbol": symbol, "created": 0, "validated": 0, "skipped": "insufficient_window"})
+                continue
+            step = max(min_gap, usable_span // sample_limit)
+            indices = list(range(latest_prediction_idx, earliest_idx - 1, -step))[:sample_limit]
+            symbol_created = 0
+            symbol_validated = 0
+            for rank, idx in enumerate(indices, start=1):
+                stock = _historical_stock_from_bars(
+                    symbol=symbol,
+                    name=quote_name or symbol,
+                    bars=bars,
+                    idx=idx,
+                )
+                estimates = estimate_predictions(stock, cfg)
+                selected_estimates = [e for e in estimates if int(e["horizon_days"]) in set(target_horizons)]
+                if not selected_estimates:
+                    continue
+                bar_dt = _bar_date(bars[idx])
+                if bar_dt is None:
+                    continue
+                for estimate in selected_estimates:
+                    horizon = int(estimate["horizon_days"])
+                    future = bars[idx + 1 : idx + 1 + horizon]
+                    if len(future) < horizon:
+                        continue
+                    future_end_dt = _bar_date(future[-1])
+                    due_at = future_end_dt or (bar_dt + timedelta(days=horizon))
+                    if due_at > due_cutoff:
+                        continue
+                    if _has_historical_replay_prediction(
+                        session,
+                        symbol=symbol,
+                        model_id=model.id,
+                        horizon_days=horizon,
+                        predicted_at=bar_dt,
+                    ):
+                        continue
+                    pred = StockPredictionORM(
+                        scan_run_id=run.id,
+                        model_version_id=model.id,
+                        symbol=symbol,
+                        name=quote_name or symbol,
+                        rank=rank,
+                        action=str((stock.get("ai_analysis") or {}).get("action") or "BUY").upper(),
+                        horizon_days=horizon,
+                        target_return_pct=estimate["target_return_pct"],
+                        stop_loss_pct=estimate["stop_loss_pct"],
+                        probability=estimate["probability"],
+                        expected_return_pct=estimate["expected_return_pct"],
+                        confidence=int(_f((stock.get("ai_analysis") or {}).get("confidence"))),
+                        score=int(_f(stock.get("score"))),
+                        price_at_prediction=_f(stock.get("price")),
+                        features=_jsonable(estimate["features"]),
+                        trade_plan=_jsonable(stock.get("trade_plan") or {}),
+                        raw_result=_jsonable({**stock, "source": "historical_replay"}),
+                        status="pending",
+                        predicted_at=bar_dt,
+                        due_at=due_at,
+                    )
+                    session.add(pred)
+                    session.flush()
+                    created += 1
+                    symbol_created += 1
+                    outcome = _build_outcome_from_future_bars(
+                        session,
+                        pred,
+                        future=future,
+                        details_extra={
+                            "source": "historical_replay",
+                            "prediction_bar_date": bars[idx].get("date"),
+                            "future_start_date": future[0].get("date") if future else None,
+                            "future_end_date": future[-1].get("date") if future else None,
+                            "horizon_unit": "trading_bars",
+                            "effective_min_gap_days": effective_min_gap,
+                        },
+                        validated_at=future_end_dt or due_at,
+                    )
+                    if outcome:
+                        validated += 1
+                        symbol_validated += 1
+            symbol_reports.append({
+                "symbol": symbol,
+                "name": quote_name or symbol,
+                "bars": len(bars),
+                "sample_points": len(indices),
+                "effective_min_gap_days": effective_min_gap,
+                "created": symbol_created,
+                "validated": symbol_validated,
+            })
+
+        run.candidates = created
+        run.analyzed = created
+        run.tier1_count = validated
+        run.result_count = validated
+        run.rejected_count = len(skipped)
+        session.flush()
+        diagnostics = get_diagnostics(limit=min(200, max(validated, 1)), db=session)
+        summary = get_summary(db=session)
+        return {
+            "ok": True,
+            "scan_run_id": run.id,
+            "model_version_id": model.id,
+            "model_version": model.version,
+            "symbols": selected_symbols,
+            "created_predictions": created,
+            "validated_predictions": validated,
+            "skipped": skipped,
+            "symbol_reports": symbol_reports,
+            "audit": replay_audit,
+            "diagnostics": {
+                "ready": diagnostics.get("ready"),
+                "sample_count": diagnostics.get("sample_count"),
+                "top_error_types": (diagnostics.get("error_types") or [])[:5],
+                "top_lessons": (diagnostics.get("lessons") or [])[:5],
+            },
+            "readiness": summary.get("readiness"),
         }
 
 
@@ -1024,7 +1790,9 @@ def _compact_auto_cycle_result(result: dict) -> dict:
         "status": result.get("status"),
         "evaluated_predictions": result.get("evaluated_predictions"),
         "min_samples": result.get("min_samples"),
+        "reason": result.get("reason"),
         "reasons": result.get("reasons") or [],
+        "readiness": result.get("readiness"),
     }
     active_model = result.get("active_model") or {}
     previous_model = result.get("previous_model") or {}
@@ -1296,6 +2064,7 @@ def validation_loop_status() -> dict:
         "auto_scan_target_horizon_days": settings.evolution_auto_scan_target_horizon_days,
         "auto_evolve_enabled": settings.evolution_auto_evolve_enabled,
         "auto_evolve_min_samples": settings.evolution_auto_evolve_min_samples,
+        "auto_evolve_min_live_samples": getattr(settings, "evolution_auto_evolve_min_live_samples", 0),
         "auto_promote_min_success_rate": settings.evolution_auto_promote_min_success_rate,
         "auto_promote_min_avg_return_pct": settings.evolution_auto_promote_min_avg_return_pct,
         "auto_promote_max_brier_score": settings.evolution_auto_promote_max_brier_score,
@@ -1325,6 +2094,24 @@ def _metric_pairs(session: Session, model_version_id: int | None = None) -> list
         if pred:
             pairs.append((pred, out))
     return pairs
+
+
+def _prediction_sample_source(pred: StockPredictionORM, outcome: PredictionOutcomeORM | None = None) -> str:
+    outcome_details = (outcome.details or {}) if outcome else {}
+    outcome_source = str(outcome_details.get("source") or "")
+    raw_source = str((pred.raw_result or {}).get("source") or "")
+    if outcome_source == "historical_replay" or raw_source == "historical_replay":
+        return "historical_replay"
+    if outcome_source == "trade_exit" or raw_source == "trade_fill":
+        return "trade_execution"
+    return "live_prediction"
+
+
+SAMPLE_SOURCE_LABELS = {
+    "live_prediction": "真实到期预测",
+    "historical_replay": "历史回放",
+    "trade_execution": "真实成交退出",
+}
 
 
 def _metric_rows_from_pairs(
@@ -1397,6 +2184,118 @@ def _compute_metrics_from_rows(rows: list[dict]) -> dict:
 
 def _compute_metrics_from_pairs(pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]]) -> dict:
     return _compute_metrics_from_rows(_metric_rows_from_pairs(pairs))
+
+
+def _compute_metrics_by_sample_source(pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]]) -> dict:
+    grouped: dict[str, list[tuple[StockPredictionORM, PredictionOutcomeORM]]] = {
+        "live_prediction": [],
+        "historical_replay": [],
+        "trade_execution": [],
+    }
+    for pred, out in pairs:
+        grouped.setdefault(_prediction_sample_source(pred, out), []).append((pred, out))
+    return {
+        key: {
+            "key": key,
+            "label": SAMPLE_SOURCE_LABELS.get(key, key),
+            **_compute_metrics_from_pairs(source_pairs),
+        }
+        for key, source_pairs in grouped.items()
+    }
+
+
+def _real_world_metric_pairs(
+    pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]],
+) -> list[tuple[StockPredictionORM, PredictionOutcomeORM]]:
+    return [
+        (pred, out)
+        for pred, out in pairs
+        if _prediction_sample_source(pred, out) != "historical_replay"
+    ]
+
+
+def _live_prediction_metric_pairs(
+    pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]],
+) -> list[tuple[StockPredictionORM, PredictionOutcomeORM]]:
+    return [
+        (pred, out)
+        for pred, out in pairs
+        if _prediction_sample_source(pred, out) == "live_prediction"
+    ]
+
+
+def _real_world_horizon_health(
+    pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]],
+    *,
+    min_samples: int = 5,
+) -> dict:
+    metrics = _compute_metrics_from_pairs(_live_prediction_metric_pairs(pairs))
+    rows = []
+    for row in metrics.get("by_horizon") or []:
+        sample_count = int(row.get("sample_count") or 0)
+        success_rate = _f(row.get("success_rate"))
+        avg_return = _f(row.get("avg_return_pct"))
+        calibration_error = _f(row.get("calibration_error"))
+        blockers: list[str] = []
+        if sample_count < min_samples:
+            status = "insufficient"
+            label = "样本不足"
+            blockers.append(f"真实预测样本 {sample_count} < {min_samples}")
+        elif avg_return < 0 or success_rate < 0.45 or calibration_error > 0.35:
+            status = "risk"
+            label = "现实风险"
+            if avg_return < 0:
+                blockers.append("平均收益为负")
+            if success_rate < 0.45:
+                blockers.append("真实命中率偏低")
+            if calibration_error > 0.35:
+                blockers.append("概率校准偏差过大")
+        elif success_rate >= 0.55 and avg_return > 0 and calibration_error <= 0.25:
+            status = "healthy"
+            label = "相对健康"
+        else:
+            status = "watch"
+            label = "继续观察"
+        rows.append({
+            **row,
+            "status": status,
+            "label": label,
+            "min_samples": min_samples,
+            "blockers": blockers,
+        })
+
+    covered = {int(row["horizon_days"]) for row in rows}
+    for horizon in DEFAULT_MODEL_CONFIG["horizons"]:
+        if int(horizon) in covered:
+            continue
+        rows.append({
+            "horizon_days": int(horizon),
+            "sample_count": 0,
+            "success_rate": 0.0,
+            "avg_return_pct": 0.0,
+            "avg_max_return_pct": 0.0,
+            "brier_score": 0.0,
+            "calibration_error": 0.0,
+            "status": "insufficient",
+            "label": "样本不足",
+            "min_samples": min_samples,
+            "blockers": [f"真实预测样本 0 < {min_samples}"],
+        })
+
+    rows.sort(key=lambda item: int(item.get("horizon_days") or 0))
+    return {
+        "source": "live_prediction",
+        "label": SAMPLE_SOURCE_LABELS["live_prediction"],
+        "sample_count": metrics.get("sample_count", 0),
+        "min_samples_per_horizon": min_samples,
+        "rows": rows,
+        "summary": {
+            "healthy": sum(1 for row in rows if row["status"] == "healthy"),
+            "watch": sum(1 for row in rows if row["status"] == "watch"),
+            "risk": sum(1 for row in rows if row["status"] == "risk"),
+            "insufficient": sum(1 for row in rows if row["status"] == "insufficient"),
+        },
+    }
 
 
 def compute_metrics(db: Session | None = None, model_version_id: int | None = None) -> dict:
@@ -1558,24 +2457,48 @@ def _compute_signal_quality_for_pairs(
     }
 
 
-def _candidate_holdout_gate(candidate_metrics: dict, baseline_metrics: dict) -> tuple[bool, list[str]]:
+def _candidate_holdout_reasons(
+    candidate_metrics: dict,
+    baseline_metrics: dict,
+    *,
+    prefix: str = "candidate holdout",
+) -> list[str]:
     reasons: list[str] = []
     if _f(candidate_metrics.get("brier_score"), 1.0) > _f(baseline_metrics.get("brier_score"), 1.0):
         reasons.append(
-            f"candidate holdout brier_score {_f(candidate_metrics.get('brier_score'), 1.0):.4f} > "
+            f"{prefix} brier_score {_f(candidate_metrics.get('brier_score'), 1.0):.4f} > "
             f"active {_f(baseline_metrics.get('brier_score'), 1.0):.4f}"
         )
     if _f(candidate_metrics.get("calibration_error"), 1.0) > _f(baseline_metrics.get("calibration_error"), 1.0):
         reasons.append(
-            f"candidate holdout calibration_error {_f(candidate_metrics.get('calibration_error'), 1.0):.4f} > "
+            f"{prefix} calibration_error {_f(candidate_metrics.get('calibration_error'), 1.0):.4f} > "
             f"active {_f(baseline_metrics.get('calibration_error'), 1.0):.4f}"
         )
+    return reasons
+
+
+def _candidate_holdout_gate(candidate_metrics: dict, baseline_metrics: dict) -> tuple[bool, list[str]]:
+    reasons = _candidate_holdout_reasons(candidate_metrics, baseline_metrics)
     return not reasons, reasons
 
 
-def _candidate_signal_quality_gate(candidate_quality: dict, baseline_quality: dict) -> tuple[bool, list[str]]:
+def _candidate_real_world_holdout_gate(candidate_metrics: dict, baseline_metrics: dict) -> tuple[bool, list[str]]:
+    reasons = _candidate_holdout_reasons(
+        candidate_metrics,
+        baseline_metrics,
+        prefix="real-world candidate holdout",
+    )
+    return not reasons, reasons
+
+
+def _candidate_signal_quality_reasons(
+    candidate_quality: dict,
+    baseline_quality: dict,
+    *,
+    prefix: str = "candidate signal",
+) -> list[str]:
     if not candidate_quality.get("ready"):
-        return True, []
+        return []
 
     reasons: list[str] = []
     candidate_ic = candidate_quality.get("mean_ic")
@@ -1585,20 +2508,34 @@ def _candidate_signal_quality_gate(candidate_quality: dict, baseline_quality: di
 
     if candidate_ic is not None and candidate_ic < AUTO_EVOLVE_MIN_SIGNAL_IC:
         reasons.append(
-            f"candidate signal ic {_f(candidate_ic):.4f} < {AUTO_EVOLVE_MIN_SIGNAL_IC:.4f}"
+            f"{prefix} ic {_f(candidate_ic):.4f} < {AUTO_EVOLVE_MIN_SIGNAL_IC:.4f}"
         )
     if candidate_wr is not None and candidate_wr < AUTO_EVOLVE_MIN_SIGNAL_WIN_RATE:
         reasons.append(
-            f"candidate signal win_rate {_f(candidate_wr):.4f} < {AUTO_EVOLVE_MIN_SIGNAL_WIN_RATE:.4f}"
+            f"{prefix} win_rate {_f(candidate_wr):.4f} < {AUTO_EVOLVE_MIN_SIGNAL_WIN_RATE:.4f}"
         )
     if baseline_ic is not None and candidate_ic is not None and candidate_ic < baseline_ic:
         reasons.append(
-            f"candidate signal ic {_f(candidate_ic):.4f} < active {_f(baseline_ic):.4f}"
+            f"{prefix} ic {_f(candidate_ic):.4f} < active {_f(baseline_ic):.4f}"
         )
     if baseline_wr is not None and candidate_wr is not None and candidate_wr < baseline_wr:
         reasons.append(
-            f"candidate signal win_rate {_f(candidate_wr):.4f} < active {_f(baseline_wr):.4f}"
+            f"{prefix} win_rate {_f(candidate_wr):.4f} < active {_f(baseline_wr):.4f}"
         )
+    return reasons
+
+
+def _candidate_signal_quality_gate(candidate_quality: dict, baseline_quality: dict) -> tuple[bool, list[str]]:
+    reasons = _candidate_signal_quality_reasons(candidate_quality, baseline_quality)
+    return not reasons, reasons
+
+
+def _candidate_real_world_signal_quality_gate(candidate_quality: dict, baseline_quality: dict) -> tuple[bool, list[str]]:
+    reasons = _candidate_signal_quality_reasons(
+        candidate_quality,
+        baseline_quality,
+        prefix="real-world candidate signal",
+    )
     return not reasons, reasons
 
 
@@ -1823,12 +2760,73 @@ def _walk_forward_validation_for_pairs(
     }
 
 
+def _walk_forward_readiness_for_pairs(
+    pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]],
+    runtime_params: dict[str, Any] | None = None,
+) -> dict:
+    """Return cheap readiness counters without running walk-forward replay."""
+    params = runtime_params or _walk_forward_runtime_params()
+    usable_count = 0
+    trade_dates = set()
+    for pred, out in pairs:
+        start = _f(out.start_price) or _f(pred.price_at_prediction)
+        if start <= 0:
+            continue
+        end = _f(out.end_price) or start * (1 + _f(out.close_return_pct) / 100.0)
+        if end <= 0:
+            continue
+        usable_count += 1
+        entry_day = _pair_entry_date(pred, out).date()
+        horizon = max(1, int(out.bars_checked or pred.horizon_days or 1))
+        for idx in range(horizon + 1):
+            trade_dates.add(entry_day + timedelta(days=idx))
+    unique_dates = len(trade_dates)
+    min_samples = int(params["min_samples"])
+    min_dates = int(params["min_dates"])
+    required_dates = min_dates
+    while (
+        required_dates < min_dates + 365
+        and _walk_forward_config_for_replay(required_dates, params) is None
+    ):
+        required_dates += 1
+    config_ready = _walk_forward_config_for_replay(unique_dates, params) is not None
+    ready = usable_count >= min_samples and config_ready
+    return {
+        "ready": ready,
+        "sample_count": usable_count,
+        "min_samples": min_samples,
+        "sample_gap": max(0, min_samples - usable_count),
+        "unique_dates": unique_dates,
+        "min_unique_dates": min_dates,
+        "required_unique_dates": required_dates,
+        "date_gap": max(0, required_dates - unique_dates),
+        "config_ready": config_ready,
+    }
+
+
 def _candidate_walk_forward_gate(
     validation: dict,
     runtime_params: dict[str, Any] | None = None,
+    *,
+    require_ready: bool = False,
 ) -> tuple[bool, list[str]]:
     params = runtime_params or _walk_forward_runtime_params()
     if not validation.get("ready"):
+        if require_ready:
+            sample_count = int(validation.get("sample_count") or 0)
+            unique_dates = int(validation.get("unique_dates") or 0)
+            min_samples = int(validation.get("min_samples") or params["min_samples"])
+            min_dates = int(
+                validation.get("min_unique_dates")
+                or validation.get("min_dates")
+                or params["min_dates"]
+            )
+            reason = str(validation.get("reason") or "not_ready")
+            return False, [
+                "candidate walk-forward not ready "
+                f"({reason}): samples {sample_count}/{min_samples}, "
+                f"unique_dates {unique_dates}/{min_dates}"
+            ]
         return True, []
 
     baseline = validation.get("baseline") or {}
@@ -1952,6 +2950,80 @@ def _rollback_active_model(
     }
 
 
+def _auto_evolution_readiness(
+    *,
+    pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]],
+    settings: Any,
+    train_pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]] | None = None,
+    holdout_pairs: list[tuple[StockPredictionORM, PredictionOutcomeORM]] | None = None,
+) -> dict:
+    if train_pairs is None or holdout_pairs is None:
+        train_pairs, holdout_pairs = _split_train_holdout_pairs(pairs)
+    min_samples = int(getattr(settings, "evolution_auto_evolve_min_samples", 60))
+    min_live_samples = int(getattr(settings, "evolution_auto_evolve_min_live_samples", 0) or 0)
+    sample_segments = _compute_metrics_by_sample_source(pairs)
+    live_metrics = sample_segments.get("live_prediction") or {}
+    live_sample_count = int(live_metrics.get("sample_count") or 0)
+    wf = _walk_forward_readiness_for_pairs(pairs)
+    sample_gap = max(0, min_samples - len(pairs))
+    live_sample_gap = max(0, min_live_samples - live_sample_count)
+    ready = (
+        bool(getattr(settings, "evolution_auto_evolve_enabled", True))
+        and sample_gap == 0
+        and live_sample_gap == 0
+        and bool(train_pairs)
+        and bool(holdout_pairs)
+        and bool(wf.get("ready"))
+    )
+    blockers: list[str] = []
+    if not getattr(settings, "evolution_auto_evolve_enabled", True):
+        blockers.append("auto_evolve_disabled")
+    if sample_gap:
+        blockers.append("insufficient_validated_predictions")
+    if live_sample_gap:
+        blockers.append("insufficient_live_predictions")
+    if not train_pairs or not holdout_pairs:
+        blockers.append("need_train_and_holdout_samples")
+    if not wf.get("ready"):
+        blockers.append("insufficient_walk_forward_history")
+    return {
+        "ready": ready,
+        "blockers": blockers,
+        "evaluated_predictions": len(pairs),
+        "min_samples": min_samples,
+        "sample_gap": sample_gap,
+        "live_sample_count": live_sample_count,
+        "min_live_samples": min_live_samples,
+        "live_sample_gap": live_sample_gap,
+        "sample_segments": sample_segments,
+        "train_sample_count": len(train_pairs),
+        "holdout_sample_count": len(holdout_pairs),
+        "walk_forward": wf,
+    }
+
+
+def _record_auto_evolve_decision(
+    session: Session,
+    *,
+    model: ModelVersionORM,
+    status: str,
+    metrics: dict,
+    promoted: bool = False,
+    summary: dict | None = None,
+) -> None:
+    session.add(EvolutionRunORM(
+        model_version_id=model.id,
+        status=status,
+        evaluated_predictions=int(metrics.get("sample_count") or 0),
+        success_rate=_f(metrics.get("success_rate")),
+        avg_return_pct=_f(metrics.get("avg_return_pct")),
+        brier_score=_f(metrics.get("brier_score")),
+        calibration_error=_f(metrics.get("calibration_error")),
+        promoted=promoted,
+        summary=summary or {},
+    ))
+
+
 def auto_evolve_cycle(db: Session | None = None) -> dict:
     """Run the safe automatic evolution cycle: rollback, then promote/generate."""
     from apps.api.app.core.config import get_evolution_settings
@@ -1964,7 +3036,16 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
         active = ensure_active_model(session)
         pairs = _metric_pairs(session, active.id)
         active_metrics = _compute_metrics_from_pairs(pairs)
+        sample_segments = _compute_metrics_by_sample_source(pairs)
+        live_metrics = sample_segments.get("live_prediction") or {
+            "key": "live_prediction",
+            "label": SAMPLE_SOURCE_LABELS["live_prediction"],
+            "sample_count": 0,
+        }
+        real_world_pairs = _real_world_metric_pairs(pairs)
+        real_world_metrics = _compute_metrics_from_pairs(real_world_pairs)
         train_pairs, holdout_pairs = _split_train_holdout_pairs(pairs)
+        _, real_world_holdout_pairs = _split_train_holdout_pairs(real_world_pairs)
         train_metrics = _compute_metrics_from_pairs(train_pairs)
         holdout_baseline_metrics = _metrics_for_pairs_with_config(
             holdout_pairs,
@@ -1974,58 +3055,218 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
             holdout_pairs,
             active.config or DEFAULT_MODEL_CONFIG,
         )
-
-        if (
-            settings.evolution_auto_rollback_enabled
-            and active.parent_id
-            and len(pairs) >= settings.evolution_auto_rollback_min_samples
-        ):
-            rollback_thresholds = {
-                "min_success_rate": settings.evolution_auto_rollback_min_success_rate,
-                "min_avg_return_pct": settings.evolution_auto_rollback_min_avg_return_pct,
-                "max_brier_score": settings.evolution_auto_rollback_max_brier_score,
-            }
-            should_rollback, rollback_reasons = _rollback_gate(active_metrics, rollback_thresholds)
-            parent = session.get(ModelVersionORM, active.parent_id)
-            if should_rollback and parent:
-                return _rollback_active_model(
-                    session,
-                    active=active,
-                    parent=parent,
-                    metrics=active_metrics,
-                    thresholds=rollback_thresholds,
-                    reasons=rollback_reasons,
-                )
-
-        min_samples = int(settings.evolution_auto_evolve_min_samples)
-        if len(pairs) < min_samples:
-            return {
-                "status": "insufficient_data",
-                "min_samples": min_samples,
-                "evaluated_predictions": len(pairs),
-                "metrics": active_metrics,
-                "train_sample_count": len(train_pairs),
-                "holdout_sample_count": len(holdout_pairs),
-                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
-            }
-        if not train_pairs or not holdout_pairs:
-            return {
-                "status": "insufficient_data",
-                "min_samples": min_samples,
-                "evaluated_predictions": len(pairs),
-                "metrics": active_metrics,
-                "train_sample_count": len(train_pairs),
-                "holdout_sample_count": len(holdout_pairs),
-                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
-                "reason": "need_train_and_holdout_samples",
-            }
-
+        real_world_holdout_baseline_metrics = _metrics_for_pairs_with_config(
+            real_world_holdout_pairs,
+            active.config or DEFAULT_MODEL_CONFIG,
+        )
+        real_world_holdout_baseline_signal_quality = _compute_signal_quality_for_pairs(
+            real_world_holdout_pairs,
+            active.config or DEFAULT_MODEL_CONFIG,
+        )
+        readiness = _auto_evolution_readiness(
+            pairs=pairs,
+            settings=settings,
+            train_pairs=train_pairs,
+            holdout_pairs=holdout_pairs,
+        )
         thresholds = {
             "min_success_rate": settings.evolution_auto_promote_min_success_rate,
             "min_avg_return_pct": settings.evolution_auto_promote_min_avg_return_pct,
             "max_brier_score": settings.evolution_auto_promote_max_brier_score,
             "max_calibration_error": settings.evolution_auto_promote_max_calibration_error,
         }
+
+        if (
+            settings.evolution_auto_rollback_enabled
+            and active.parent_id
+            and len(real_world_pairs) >= settings.evolution_auto_rollback_min_samples
+        ):
+            rollback_thresholds = {
+                "min_success_rate": settings.evolution_auto_rollback_min_success_rate,
+                "min_avg_return_pct": settings.evolution_auto_rollback_min_avg_return_pct,
+                "max_brier_score": settings.evolution_auto_rollback_max_brier_score,
+            }
+            should_rollback, rollback_reasons = _rollback_gate(real_world_metrics, rollback_thresholds)
+            parent = session.get(ModelVersionORM, active.parent_id)
+            if should_rollback and parent:
+                return _rollback_active_model(
+                    session,
+                    active=active,
+                    parent=parent,
+                    metrics=real_world_metrics,
+                    thresholds=rollback_thresholds,
+                    reasons=rollback_reasons,
+                )
+
+        min_samples = int(settings.evolution_auto_evolve_min_samples)
+        min_live_samples = int(getattr(settings, "evolution_auto_evolve_min_live_samples", 0) or 0)
+        if len(pairs) < min_samples:
+            reason = "insufficient_validated_predictions"
+            _record_auto_evolve_decision(
+                session,
+                model=active,
+                status="insufficient_data",
+                metrics=active_metrics,
+                summary={
+                    "source": "auto_evolve",
+                    "metrics": active_metrics,
+                    "train_metrics": train_metrics,
+                    "holdout_baseline_metrics": holdout_baseline_metrics,
+                    "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                    "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                    "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                    "sample_segments": sample_segments,
+                    "live_metrics": live_metrics,
+                    "real_world_metrics": real_world_metrics,
+                    "readiness": readiness,
+                    "reason": reason,
+                },
+            )
+            session.flush()
+            return {
+                "status": "insufficient_data",
+                "min_samples": min_samples,
+                "evaluated_predictions": len(pairs),
+                "metrics": active_metrics,
+                "train_sample_count": len(train_pairs),
+                "holdout_sample_count": len(holdout_pairs),
+                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                "sample_segments": sample_segments,
+                "live_metrics": live_metrics,
+                "real_world_metrics": real_world_metrics,
+                "readiness": readiness,
+                "reason": reason,
+            }
+        if int(live_metrics.get("sample_count") or 0) < min_live_samples:
+            reason = "insufficient_live_predictions"
+            _record_auto_evolve_decision(
+                session,
+                model=active,
+                status="insufficient_data",
+                metrics=active_metrics,
+                summary={
+                    "source": "auto_evolve",
+                    "metrics": active_metrics,
+                    "train_metrics": train_metrics,
+                    "holdout_baseline_metrics": holdout_baseline_metrics,
+                    "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                    "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                    "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                    "sample_segments": sample_segments,
+                    "live_metrics": live_metrics,
+                    "real_world_metrics": real_world_metrics,
+                    "readiness": readiness,
+                    "reason": reason,
+                },
+            )
+            session.flush()
+            return {
+                "status": "insufficient_data",
+                "min_samples": min_samples,
+                "min_live_samples": min_live_samples,
+                "evaluated_predictions": len(pairs),
+                "metrics": active_metrics,
+                "train_sample_count": len(train_pairs),
+                "holdout_sample_count": len(holdout_pairs),
+                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                "sample_segments": sample_segments,
+                "live_metrics": live_metrics,
+                "real_world_metrics": real_world_metrics,
+                "readiness": readiness,
+                "reason": reason,
+            }
+        if not train_pairs or not holdout_pairs:
+            reason = "need_train_and_holdout_samples"
+            _record_auto_evolve_decision(
+                session,
+                model=active,
+                status="insufficient_data",
+                metrics=active_metrics,
+                summary={
+                    "source": "auto_evolve",
+                    "metrics": active_metrics,
+                    "train_metrics": train_metrics,
+                    "holdout_baseline_metrics": holdout_baseline_metrics,
+                    "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                    "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                    "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                    "sample_segments": sample_segments,
+                    "live_metrics": live_metrics,
+                    "real_world_metrics": real_world_metrics,
+                    "readiness": readiness,
+                    "reason": reason,
+                },
+            )
+            session.flush()
+            return {
+                "status": "insufficient_data",
+                "min_samples": min_samples,
+                "evaluated_predictions": len(pairs),
+                "metrics": active_metrics,
+                "train_sample_count": len(train_pairs),
+                "holdout_sample_count": len(holdout_pairs),
+                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                "sample_segments": sample_segments,
+                "live_metrics": live_metrics,
+                "real_world_metrics": real_world_metrics,
+                "readiness": readiness,
+                "reason": reason,
+            }
+
+        live_allowed, live_reasons = _promotion_gate(live_metrics, thresholds)
+        if min_live_samples > 0 and not live_allowed:
+            reasons = [f"live_prediction {reason}" for reason in live_reasons]
+            session.add(EvolutionRunORM(
+                model_version_id=active.id,
+                status="auto_blocked",
+                evaluated_predictions=len(pairs),
+                success_rate=active_metrics["success_rate"],
+                avg_return_pct=active_metrics["avg_return_pct"],
+                brier_score=active_metrics["brier_score"],
+                calibration_error=active_metrics["calibration_error"],
+                promoted=False,
+                summary={
+                    "source": "auto_evolve",
+                    "metrics": active_metrics,
+                    "train_metrics": train_metrics,
+                    "holdout_baseline_metrics": holdout_baseline_metrics,
+                    "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                    "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                    "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                    "sample_segments": sample_segments,
+                    "live_metrics": live_metrics,
+                    "real_world_metrics": real_world_metrics,
+                    "readiness": readiness,
+                    "thresholds": thresholds,
+                    "reasons": reasons,
+                    "reason": "live_prediction_quality_gate_failed",
+                },
+            ))
+            session.flush()
+            return {
+                "status": "auto_blocked",
+                "evaluated_predictions": len(pairs),
+                "metrics": active_metrics,
+                "train_metrics": train_metrics,
+                "holdout_baseline_metrics": holdout_baseline_metrics,
+                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                "sample_segments": sample_segments,
+                "live_metrics": live_metrics,
+                "real_world_metrics": real_world_metrics,
+                "readiness": readiness,
+                "thresholds": thresholds,
+                "reasons": reasons,
+                "reason": "live_prediction_quality_gate_failed",
+            }
+
         allowed, reasons = _promotion_gate(active_metrics, thresholds)
         if not allowed:
             session.add(EvolutionRunORM(
@@ -2043,6 +3284,10 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
                     "train_metrics": train_metrics,
                     "holdout_baseline_metrics": holdout_baseline_metrics,
                     "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                    "sample_segments": sample_segments,
+                    "live_metrics": live_metrics,
+                    "real_world_metrics": real_world_metrics,
+                    "readiness": readiness,
                     "thresholds": thresholds,
                     "reasons": reasons,
                 },
@@ -2055,6 +3300,10 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
                 "train_metrics": train_metrics,
                 "holdout_baseline_metrics": holdout_baseline_metrics,
                 "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                "sample_segments": sample_segments,
+                "live_metrics": live_metrics,
+                "real_world_metrics": real_world_metrics,
+                "readiness": readiness,
                 "thresholds": thresholds,
                 "reasons": reasons,
             }
@@ -2068,16 +3317,51 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
             holdout_pairs,
             candidate_config,
         )
+        real_world_candidate_holdout_metrics = _metrics_for_pairs_with_config(
+            real_world_holdout_pairs,
+            candidate_config,
+        )
+        real_world_candidate_signal_quality = _compute_signal_quality_for_pairs(
+            real_world_holdout_pairs,
+            candidate_config,
+        )
         walk_forward_validation = _walk_forward_validation_for_pairs(
             pairs,
             baseline_config=active.config or DEFAULT_MODEL_CONFIG,
             candidate_config=candidate_config,
         )
-        walk_forward_allowed, walk_forward_reasons = _candidate_walk_forward_gate(walk_forward_validation)
+        walk_forward_allowed, walk_forward_reasons = _candidate_walk_forward_gate(
+            walk_forward_validation,
+            require_ready=True,
+        )
         holdout_allowed, holdout_reasons = _candidate_holdout_gate(
             candidate_holdout_metrics,
             holdout_baseline_metrics,
         )
+        signal_quality_allowed, signal_quality_reasons = _candidate_signal_quality_gate(
+            candidate_signal_quality,
+            holdout_baseline_signal_quality,
+        )
+        real_world_holdout_allowed, real_world_holdout_reasons = _candidate_real_world_holdout_gate(
+            real_world_candidate_holdout_metrics,
+            real_world_holdout_baseline_metrics,
+        )
+        real_world_signal_quality_allowed, real_world_signal_quality_reasons = _candidate_real_world_signal_quality_gate(
+            real_world_candidate_signal_quality,
+            real_world_holdout_baseline_signal_quality,
+        )
+        gate_summary = {
+            "holdout_passed": holdout_allowed,
+            "holdout_reasons": holdout_reasons,
+            "signal_quality_passed": signal_quality_allowed,
+            "signal_quality_reasons": signal_quality_reasons,
+            "real_world_holdout_passed": real_world_holdout_allowed,
+            "real_world_holdout_reasons": real_world_holdout_reasons,
+            "real_world_signal_quality_passed": real_world_signal_quality_allowed,
+            "real_world_signal_quality_reasons": real_world_signal_quality_reasons,
+            "walk_forward_passed": walk_forward_allowed,
+            "walk_forward_reasons": walk_forward_reasons,
+        }
         if not holdout_allowed:
             session.add(EvolutionRunORM(
                 model_version_id=active.id,
@@ -2096,9 +3380,18 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
                     "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
                     "candidate_holdout_metrics": candidate_holdout_metrics,
                     "candidate_signal_quality": candidate_signal_quality,
+                    "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                    "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                    "real_world_candidate_holdout_metrics": real_world_candidate_holdout_metrics,
+                    "real_world_candidate_signal_quality": real_world_candidate_signal_quality,
                     "walk_forward_validation": walk_forward_validation,
+                    "sample_segments": sample_segments,
+                    "live_metrics": live_metrics,
+                    "real_world_metrics": real_world_metrics,
+                    "readiness": readiness,
                     "thresholds": thresholds,
                     "reasons": holdout_reasons,
+                    **gate_summary,
                 },
             ))
             session.flush()
@@ -2111,14 +3404,19 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
                 "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
                 "candidate_holdout_metrics": candidate_holdout_metrics,
                 "candidate_signal_quality": candidate_signal_quality,
+                "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                "real_world_candidate_holdout_metrics": real_world_candidate_holdout_metrics,
+                "real_world_candidate_signal_quality": real_world_candidate_signal_quality,
                 "walk_forward_validation": walk_forward_validation,
+                "sample_segments": sample_segments,
+                "live_metrics": live_metrics,
+                "real_world_metrics": real_world_metrics,
+                "readiness": readiness,
                 "thresholds": thresholds,
                 "reasons": holdout_reasons,
+                **gate_summary,
             }
-        signal_quality_allowed, signal_quality_reasons = _candidate_signal_quality_gate(
-            candidate_signal_quality,
-            holdout_baseline_signal_quality,
-        )
         if not signal_quality_allowed:
             session.add(EvolutionRunORM(
                 model_version_id=active.id,
@@ -2137,9 +3435,18 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
                     "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
                     "candidate_holdout_metrics": candidate_holdout_metrics,
                     "candidate_signal_quality": candidate_signal_quality,
+                    "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                    "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                    "real_world_candidate_holdout_metrics": real_world_candidate_holdout_metrics,
+                    "real_world_candidate_signal_quality": real_world_candidate_signal_quality,
                     "walk_forward_validation": walk_forward_validation,
+                    "sample_segments": sample_segments,
+                    "live_metrics": live_metrics,
+                    "real_world_metrics": real_world_metrics,
+                    "readiness": readiness,
                     "thresholds": thresholds,
                     "reasons": signal_quality_reasons,
+                    **gate_summary,
                 },
             ))
             session.flush()
@@ -2152,9 +3459,132 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
                 "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
                 "candidate_holdout_metrics": candidate_holdout_metrics,
                 "candidate_signal_quality": candidate_signal_quality,
+                "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                "real_world_candidate_holdout_metrics": real_world_candidate_holdout_metrics,
+                "real_world_candidate_signal_quality": real_world_candidate_signal_quality,
                 "walk_forward_validation": walk_forward_validation,
+                "sample_segments": sample_segments,
+                "live_metrics": live_metrics,
+                "real_world_metrics": real_world_metrics,
+                "readiness": readiness,
                 "thresholds": thresholds,
                 "reasons": signal_quality_reasons,
+                **gate_summary,
+            }
+        if not real_world_holdout_allowed:
+            session.add(EvolutionRunORM(
+                model_version_id=active.id,
+                status="auto_blocked",
+                evaluated_predictions=len(pairs),
+                success_rate=active_metrics["success_rate"],
+                avg_return_pct=active_metrics["avg_return_pct"],
+                brier_score=active_metrics["brier_score"],
+                calibration_error=active_metrics["calibration_error"],
+                promoted=False,
+                summary={
+                    "source": "auto_evolve",
+                    "metrics": active_metrics,
+                    "train_metrics": train_metrics,
+                    "holdout_baseline_metrics": holdout_baseline_metrics,
+                    "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                    "candidate_holdout_metrics": candidate_holdout_metrics,
+                    "candidate_signal_quality": candidate_signal_quality,
+                    "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                    "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                    "real_world_candidate_holdout_metrics": real_world_candidate_holdout_metrics,
+                    "real_world_candidate_signal_quality": real_world_candidate_signal_quality,
+                    "walk_forward_validation": walk_forward_validation,
+                    "sample_segments": sample_segments,
+                    "live_metrics": live_metrics,
+                    "real_world_metrics": real_world_metrics,
+                    "readiness": readiness,
+                    "thresholds": thresholds,
+                    "reasons": real_world_holdout_reasons,
+                    "reason": "real_world_holdout_gate_failed",
+                    **gate_summary,
+                },
+            ))
+            session.flush()
+            return {
+                "status": "auto_blocked",
+                "evaluated_predictions": len(pairs),
+                "metrics": active_metrics,
+                "train_metrics": train_metrics,
+                "holdout_baseline_metrics": holdout_baseline_metrics,
+                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                "candidate_holdout_metrics": candidate_holdout_metrics,
+                "candidate_signal_quality": candidate_signal_quality,
+                "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                "real_world_candidate_holdout_metrics": real_world_candidate_holdout_metrics,
+                "real_world_candidate_signal_quality": real_world_candidate_signal_quality,
+                "walk_forward_validation": walk_forward_validation,
+                "sample_segments": sample_segments,
+                "live_metrics": live_metrics,
+                "real_world_metrics": real_world_metrics,
+                "readiness": readiness,
+                "thresholds": thresholds,
+                "reasons": real_world_holdout_reasons,
+                "reason": "real_world_holdout_gate_failed",
+                **gate_summary,
+            }
+        if not real_world_signal_quality_allowed:
+            session.add(EvolutionRunORM(
+                model_version_id=active.id,
+                status="auto_blocked",
+                evaluated_predictions=len(pairs),
+                success_rate=active_metrics["success_rate"],
+                avg_return_pct=active_metrics["avg_return_pct"],
+                brier_score=active_metrics["brier_score"],
+                calibration_error=active_metrics["calibration_error"],
+                promoted=False,
+                summary={
+                    "source": "auto_evolve",
+                    "metrics": active_metrics,
+                    "train_metrics": train_metrics,
+                    "holdout_baseline_metrics": holdout_baseline_metrics,
+                    "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                    "candidate_holdout_metrics": candidate_holdout_metrics,
+                    "candidate_signal_quality": candidate_signal_quality,
+                    "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                    "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                    "real_world_candidate_holdout_metrics": real_world_candidate_holdout_metrics,
+                    "real_world_candidate_signal_quality": real_world_candidate_signal_quality,
+                    "walk_forward_validation": walk_forward_validation,
+                    "sample_segments": sample_segments,
+                    "live_metrics": live_metrics,
+                    "real_world_metrics": real_world_metrics,
+                    "readiness": readiness,
+                    "thresholds": thresholds,
+                    "reasons": real_world_signal_quality_reasons,
+                    "reason": "real_world_signal_quality_gate_failed",
+                    **gate_summary,
+                },
+            ))
+            session.flush()
+            return {
+                "status": "auto_blocked",
+                "evaluated_predictions": len(pairs),
+                "metrics": active_metrics,
+                "train_metrics": train_metrics,
+                "holdout_baseline_metrics": holdout_baseline_metrics,
+                "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
+                "candidate_holdout_metrics": candidate_holdout_metrics,
+                "candidate_signal_quality": candidate_signal_quality,
+                "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                "real_world_candidate_holdout_metrics": real_world_candidate_holdout_metrics,
+                "real_world_candidate_signal_quality": real_world_candidate_signal_quality,
+                "walk_forward_validation": walk_forward_validation,
+                "sample_segments": sample_segments,
+                "live_metrics": live_metrics,
+                "real_world_metrics": real_world_metrics,
+                "readiness": readiness,
+                "thresholds": thresholds,
+                "reasons": real_world_signal_quality_reasons,
+                "reason": "real_world_signal_quality_gate_failed",
+                **gate_summary,
             }
         if not walk_forward_allowed:
             session.add(EvolutionRunORM(
@@ -2174,9 +3604,18 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
                     "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
                     "candidate_holdout_metrics": candidate_holdout_metrics,
                     "candidate_signal_quality": candidate_signal_quality,
+                    "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                    "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                    "real_world_candidate_holdout_metrics": real_world_candidate_holdout_metrics,
+                    "real_world_candidate_signal_quality": real_world_candidate_signal_quality,
                     "walk_forward_validation": walk_forward_validation,
+                    "sample_segments": sample_segments,
+                    "live_metrics": live_metrics,
+                    "real_world_metrics": real_world_metrics,
+                    "readiness": readiness,
                     "thresholds": thresholds,
                     "reasons": walk_forward_reasons,
+                    **gate_summary,
                 },
             ))
             session.flush()
@@ -2189,9 +3628,18 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
                 "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
                 "candidate_holdout_metrics": candidate_holdout_metrics,
                 "candidate_signal_quality": candidate_signal_quality,
+                "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                "real_world_candidate_holdout_metrics": real_world_candidate_holdout_metrics,
+                "real_world_candidate_signal_quality": real_world_candidate_signal_quality,
                 "walk_forward_validation": walk_forward_validation,
+                "sample_segments": sample_segments,
+                "live_metrics": live_metrics,
+                "real_world_metrics": real_world_metrics,
+                "readiness": readiness,
                 "thresholds": thresholds,
                 "reasons": walk_forward_reasons,
+                **gate_summary,
             }
 
         candidate = (
@@ -2230,7 +3678,16 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
                 "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
                 "candidate_holdout_metrics": candidate_holdout_metrics,
                 "candidate_signal_quality": candidate_signal_quality,
+                "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+                "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+                "real_world_candidate_holdout_metrics": real_world_candidate_holdout_metrics,
+                "real_world_candidate_signal_quality": real_world_candidate_signal_quality,
                 "walk_forward_validation": walk_forward_validation,
+                "sample_segments": sample_segments,
+                "live_metrics": live_metrics,
+                "real_world_metrics": real_world_metrics,
+                "readiness": readiness,
+                **gate_summary,
             },
         )
         session.flush()
@@ -2245,8 +3702,17 @@ def auto_evolve_cycle(db: Session | None = None) -> dict:
             "holdout_baseline_signal_quality": holdout_baseline_signal_quality,
             "candidate_holdout_metrics": candidate_holdout_metrics,
             "candidate_signal_quality": candidate_signal_quality,
+            "real_world_holdout_baseline_metrics": real_world_holdout_baseline_metrics,
+            "real_world_holdout_baseline_signal_quality": real_world_holdout_baseline_signal_quality,
+            "real_world_candidate_holdout_metrics": real_world_candidate_holdout_metrics,
+            "real_world_candidate_signal_quality": real_world_candidate_signal_quality,
             "walk_forward_validation": walk_forward_validation,
+            "sample_segments": sample_segments,
+            "live_metrics": live_metrics,
+            "real_world_metrics": real_world_metrics,
+            "readiness": readiness,
             "thresholds": thresholds,
+            **gate_summary,
         }
 
 
@@ -2266,9 +3732,18 @@ def _persist_model_metrics(session: Session, model_version_id: int | None, metri
 
 
 def get_summary(db: Session | None = None) -> dict:
+    from apps.api.app.core.config import get_evolution_settings
+
     with _ctx(db) as session:
         model = ensure_active_model(session)
-        metrics = _compute_metrics_from_pairs(_metric_pairs(session, model.id))
+        pairs = _metric_pairs(session, model.id)
+        metrics = _compute_metrics_from_pairs(pairs)
+        sample_segments = _compute_metrics_by_sample_source(pairs)
+        real_world_horizon_health = _real_world_horizon_health(pairs)
+        readiness = _auto_evolution_readiness(
+            pairs=pairs,
+            settings=get_evolution_settings(),
+        )
         now = _now()
         pending = session.query(StockPredictionORM).filter(StockPredictionORM.status == "pending").count()
         due = (
@@ -2293,6 +3768,9 @@ def get_summary(db: Session | None = None) -> dict:
         return {
             "active_model": _model_to_dict(model),
             "metrics": metrics,
+            "sample_segments": sample_segments,
+            "real_world_horizon_health": real_world_horizon_health,
+            "readiness": readiness,
             "counts": {
                 "total_predictions": total,
                 "pending": pending,
@@ -2301,6 +3779,206 @@ def get_summary(db: Session | None = None) -> dict:
             },
             "latest_scan_runs": [_scan_run_to_dict(r) for r in latest_runs],
             "latest_evolution_runs": [_evolution_run_to_dict(r) for r in latest_evolution],
+        }
+
+
+def _diagnosis_for_pair(
+    session: Session,
+    pred: StockPredictionORM,
+    outcome: PredictionOutcomeORM,
+) -> dict:
+    details = outcome.details or {}
+    diagnosis = details.get("diagnosis") if isinstance(details, dict) else None
+    if isinstance(diagnosis, dict) and diagnosis.get("error_type"):
+        return diagnosis
+    return _diagnose_prediction_outcome(
+        pred,
+        outcome,
+        config=_prediction_model_config(session, pred),
+    )
+
+
+def _counter_rows(
+    counter: Counter,
+    *,
+    total: int,
+    label_resolver=None,
+    limit: int = 10,
+) -> list[dict]:
+    rows = []
+    for key, count in counter.most_common(limit):
+        rows.append({
+            "key": key,
+            "label": label_resolver(key) if label_resolver else key,
+            "count": int(count),
+            "rate": round(count / total, 4) if total else 0.0,
+        })
+    return rows
+
+
+def get_diagnostics(
+    *,
+    limit: int = 100,
+    db: Session | None = None,
+    model_version_id: int | None = None,
+) -> dict:
+    """Aggregate recent prediction post-mortems into a learning report."""
+    with _ctx(db) as session:
+        q = session.query(PredictionOutcomeORM)
+        if model_version_id is not None:
+            q = q.filter(PredictionOutcomeORM.model_version_id == model_version_id)
+        outcomes = (
+            q.order_by(PredictionOutcomeORM.validated_at.desc(), PredictionOutcomeORM.id.desc())
+            .limit(max(1, min(limit, 1000)))
+            .all()
+        )
+
+        rows: list[dict] = []
+        for outcome in outcomes:
+            pred = session.get(StockPredictionORM, outcome.prediction_id)
+            if not pred:
+                continue
+            diagnosis = _diagnosis_for_pair(session, pred, outcome)
+            rows.append({
+                "prediction": pred,
+                "outcome": outcome,
+                "diagnosis": diagnosis,
+            })
+
+        total = len(rows)
+        if not rows:
+            return {
+                "ready": False,
+                "sample_count": 0,
+                "generated_at": _now().isoformat(),
+                "reason": "no_validated_predictions",
+                "error_types": [],
+                "verdicts": [],
+                "root_causes": [],
+                "lessons": [],
+                "recommended_actions": [],
+                "feature_feedback": {"penalties": [], "rewards": []},
+                "high_confidence_misses": [],
+                "worst_predictions": [],
+            }
+
+        error_counter: Counter = Counter()
+        verdict_counter: Counter = Counter()
+        cause_counter: Counter = Counter()
+        lesson_counter: Counter = Counter()
+        action_counter: Counter = Counter()
+        penalty_counter: Counter = Counter()
+        reward_counter: Counter = Counter()
+        return_by_error: dict[str, list[float]] = {}
+        prob_by_error: dict[str, list[float]] = {}
+
+        high_confidence_misses: list[dict] = []
+        worst_predictions: list[dict] = []
+        for row in rows:
+            pred = row["prediction"]
+            outcome = row["outcome"]
+            diagnosis = row["diagnosis"]
+            error_type = str(diagnosis.get("error_type") or "unknown")
+            verdict = str(diagnosis.get("verdict") or "unknown")
+            error_counter[error_type] += 1
+            verdict_counter[verdict] += 1
+            return_by_error.setdefault(error_type, []).append(_f(outcome.close_return_pct))
+            prob_by_error.setdefault(error_type, []).append(_f(pred.probability))
+
+            for cause in diagnosis.get("root_causes") or []:
+                factor = str(cause.get("factor") or "unknown")
+                cause_counter[factor] += 1
+            for lesson in diagnosis.get("lessons") or []:
+                lesson_counter[str(lesson)] += 1
+            for action in diagnosis.get("recommended_adjustments") or []:
+                key = str(action.get("action") or action.get("message") or "unknown")
+                action_counter[key] += 1
+
+            feedback = diagnosis.get("model_feedback") or {}
+            for penalty in feedback.get("feature_penalties") or []:
+                key = str(penalty.get("key") or "unknown")
+                penalty_counter[(key, str(penalty.get("label") or FEATURE_LABELS.get(key, key)))] += 1
+            for reward in feedback.get("feature_rewards") or []:
+                key = str(reward.get("key") or "unknown")
+                reward_counter[(key, str(reward.get("label") or FEATURE_LABELS.get(key, key)))] += 1
+
+            item = {
+                "id": pred.id,
+                "symbol": pred.symbol,
+                "name": pred.name,
+                "horizon_days": pred.horizon_days,
+                "probability_pct": round(_f(pred.probability) * 100, 1),
+                "expected_return_pct": round(_f(pred.expected_return_pct), 4),
+                "close_return_pct": round(_f(outcome.close_return_pct), 4),
+                "max_return_pct": round(_f(outcome.max_return_pct), 4),
+                "max_drawdown_pct": round(_f(outcome.max_drawdown_pct), 4),
+                "error_type": error_type,
+                "error_type_label": diagnosis.get("error_type_label") or ERROR_TYPE_LABELS.get(error_type, error_type),
+                "verdict": verdict,
+                "verdict_label": diagnosis.get("verdict_label") or VERDICT_LABELS.get(verdict, verdict),
+                "primary_cause": (diagnosis.get("root_causes") or [{}])[0].get("message"),
+                "validated_at": outcome.validated_at.isoformat() if outcome.validated_at else None,
+            }
+            if _f(pred.probability) >= 0.65 and not bool(outcome.success):
+                high_confidence_misses.append(item)
+            worst_predictions.append(item)
+
+        error_rows = []
+        for error_type, count in error_counter.most_common():
+            returns = return_by_error.get(error_type) or [0.0]
+            probs = prob_by_error.get(error_type) or [0.0]
+            error_rows.append({
+                "key": error_type,
+                "label": ERROR_TYPE_LABELS.get(error_type, error_type),
+                "count": int(count),
+                "rate": round(count / total, 4),
+                "avg_return_pct": round(mean(returns), 4),
+                "avg_probability_pct": round(mean(probs) * 100.0, 2),
+            })
+
+        def _feature_feedback_rows(counter: Counter) -> list[dict]:
+            rows_out = []
+            for (key, label), count in counter.most_common(10):
+                rows_out.append({
+                    "key": key,
+                    "label": label,
+                    "count": int(count),
+                    "rate": round(count / total, 4),
+                })
+            return rows_out
+
+        recommended_actions = []
+        for key, count in action_counter.most_common(8):
+            recommended_actions.append({
+                "action": key,
+                "count": int(count),
+                "rate": round(count / total, 4),
+            })
+
+        high_confidence_misses.sort(key=lambda item: (item["probability_pct"], -item["close_return_pct"]), reverse=True)
+        worst_predictions.sort(key=lambda item: item["close_return_pct"])
+        return {
+            "ready": True,
+            "sample_count": total,
+            "generated_at": _now().isoformat(),
+            "error_types": error_rows,
+            "verdicts": _counter_rows(
+                verdict_counter,
+                total=total,
+                label_resolver=lambda key: VERDICT_LABELS.get(key, key),
+            ),
+            "root_causes": _counter_rows(cause_counter, total=total, limit=12),
+            "lessons": [
+                {"message": lesson, "count": int(count), "rate": round(count / total, 4)}
+                for lesson, count in lesson_counter.most_common(8)
+            ],
+            "recommended_actions": recommended_actions,
+            "feature_feedback": {
+                "penalties": _feature_feedback_rows(penalty_counter),
+                "rewards": _feature_feedback_rows(reward_counter),
+            },
+            "high_confidence_misses": high_confidence_misses[:10],
+            "worst_predictions": worst_predictions[:10],
         }
 
 
@@ -2421,20 +4099,52 @@ def _adjust_weights(config: dict, pairs: list[tuple[StockPredictionORM, Predicti
     keys = list(weights)
     successes = [(pred, out) for pred, out in pairs if out.success]
     failures = [(pred, out) for pred, out in pairs if not out.success]
-    if not successes or not failures:
-        return cfg
+    if successes and failures:
+        for key in keys:
+            succ_avg = mean([_f(pred.features.get(key)) for pred, out in successes])
+            fail_avg = mean([_f(pred.features.get(key)) for pred, out in failures])
+            old_weight = _f(weights[key])
+            if old_weight < 0:
+                # Negative factors should become stronger when failures show more of that factor.
+                delta = _clamp((fail_avg - succ_avg) * 0.18, -0.12, 0.12)
+                weights[key] = -max(0.02, abs(old_weight) * (1.0 + delta))
+            else:
+                delta = _clamp((succ_avg - fail_avg) * 0.18, -0.12, 0.12)
+                weights[key] = max(0.02, old_weight * (1.0 + delta))
 
-    for key in keys:
-        succ_avg = mean([_f(pred.features.get(key)) for pred, out in successes])
-        fail_avg = mean([_f(pred.features.get(key)) for pred, out in failures])
+    penalty_counts: Counter = Counter()
+    reward_counts: Counter = Counter()
+    horizon_feedback: dict[str, list[float]] = {}
+    for pred, out in pairs:
+        diagnosis = ((out.details or {}).get("diagnosis") or {}) if isinstance(out.details, dict) else {}
+        feedback = diagnosis.get("model_feedback") or {}
+        for penalty in feedback.get("feature_penalties") or []:
+            key = str(penalty.get("key") or "")
+            if key in weights:
+                penalty_counts[key] += 1
+        for reward in feedback.get("feature_rewards") or []:
+            key = str(reward.get("key") or "")
+            if key in weights:
+                reward_counts[key] += 1
+        delta = _f(feedback.get("horizon_bias_delta"))
+        if delta:
+            horizon_feedback.setdefault(str(pred.horizon_days), []).append(delta)
+
+    pair_count = max(len(pairs), 1)
+    for key, count in penalty_counts.items():
+        impact = _clamp(count / pair_count * 0.18, 0.0, 0.10)
         old_weight = _f(weights[key])
         if old_weight < 0:
-            # Negative factors should become stronger when failures show more of that factor.
-            delta = _clamp((fail_avg - succ_avg) * 0.18, -0.12, 0.12)
-            weights[key] = -max(0.02, abs(old_weight) * (1.0 + delta))
+            weights[key] = -abs(old_weight) * (1.0 + impact)
         else:
-            delta = _clamp((succ_avg - fail_avg) * 0.18, -0.12, 0.12)
-            weights[key] = max(0.02, old_weight * (1.0 + delta))
+            weights[key] = max(0.02, old_weight * (1.0 - impact))
+    for key, count in reward_counts.items():
+        impact = _clamp(count / pair_count * 0.12, 0.0, 0.08)
+        old_weight = _f(weights[key])
+        if old_weight < 0:
+            weights[key] = -max(0.02, abs(old_weight) * (1.0 - impact))
+        else:
+            weights[key] = max(0.02, old_weight * (1.0 + impact))
 
     total = sum(abs(v) for v in weights.values()) or 1.0
     cfg["weights"] = {k: round(v / total, 4) for k, v in weights.items()}
@@ -2446,7 +4156,16 @@ def _adjust_weights(config: dict, pairs: list[tuple[StockPredictionORM, Predicti
         key = str(row["horizon_days"])
         prev = _f(bias.get(key))
         bias[key] = round(_clamp(prev + (_f(row["success_rate"]) - overall) * 0.08, -0.12, 0.12), 4)
+    for key, deltas in horizon_feedback.items():
+        prev = _f(bias.get(key))
+        bias[key] = round(_clamp(prev + mean(deltas), -0.12, 0.12), 4)
     cfg["horizon_bias"] = bias
+    if penalty_counts or reward_counts or horizon_feedback:
+        cfg["last_diagnostic_feedback"] = {
+            "feature_penalties": dict(penalty_counts),
+            "feature_rewards": dict(reward_counts),
+            "horizon_bias_feedback": {key: round(mean(values), 4) for key, values in horizon_feedback.items()},
+        }
     cfg["last_adjusted_at"] = _now().isoformat()
     return cfg
 

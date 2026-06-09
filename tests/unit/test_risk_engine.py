@@ -16,8 +16,8 @@ def _base_validate(**kwargs):
     return engine.validate_recommendation(
         symbol="600519.SH",
         action="BUY",
-        target_weight=0.20,
-        current_weight=0.15,
+        target_weight=0.12,
+        current_weight=0.08,
         industry="白酒",
         industry_weight=0.30,
         **kwargs,
@@ -39,8 +39,8 @@ def test_single_stock_weight_check_pass():
     
     result = engine.check_single_stock_weight(
         symbol="600519.SH",
-        target_weight=0.25,  # 25%
-        current_weight=0.20,
+        target_weight=0.12,  # 12%, within 15%
+        current_weight=0.08,
     )
     
     assert result.passed is True
@@ -53,8 +53,8 @@ def test_single_stock_weight_check_fail():
     
     result = engine.check_single_stock_weight(
         symbol="600519.SH",
-        target_weight=0.35,  # 35%, exceeds 30% limit
-        current_weight=0.30,
+        target_weight=0.18,  # 18%, exceeds 15% limit
+        current_weight=0.12,
     )
     
     assert result.passed is False
@@ -89,8 +89,8 @@ def test_validate_recommendation():
     results = engine.validate_recommendation(
         symbol="600519.SH",
         action="BUY",
-        target_weight=0.25,
-        current_weight=0.20,
+        target_weight=0.12,
+        current_weight=0.08,
         industry="白酒",
         industry_weight=0.35,
     )
@@ -107,8 +107,8 @@ def test_get_final_decision():
     results = engine.validate_recommendation(
         symbol="600519.SH",
         action="BUY",
-        target_weight=0.20,
-        current_weight=0.15,
+        target_weight=0.12,
+        current_weight=0.08,
         industry="白酒",
         industry_weight=0.30,
     )
@@ -119,8 +119,8 @@ def test_get_final_decision():
     results = engine.validate_recommendation(
         symbol="600519.SH",
         action="BUY",
-        target_weight=0.35,  # Exceeds limit
-        current_weight=0.30,
+        target_weight=0.18,  # Exceeds limit
+        current_weight=0.12,
         industry="白酒",
         industry_weight=0.30,
     )

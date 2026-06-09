@@ -1,9 +1,15 @@
+from concurrent.futures import ThreadPoolExecutor
+
 from fastapi.testclient import TestClient
 
 from apps.api.app.main import app
 
 
 client = TestClient(app)
+
+
+def _auth_headers(key: str) -> dict[str, str]:
+    return {"X-Api-Key": key}
 
 
 def test_healthcheck() -> None:
@@ -15,6 +21,47 @@ def test_healthcheck() -> None:
     assert payload["app"] == "AlphaAgent"
     assert "llm_configured" in payload
     assert "feishu_configured" in payload
+
+
+def test_readiness_reports_local_and_live_gates() -> None:
+    response = client.get("/api/v1/health/readiness")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["local_ready"] is True
+    assert payload["live_trading_ready"] is False
+    assert payload["status"] == "degraded"
+    assert isinstance(payload["checks"], list)
+    assert {item["id"] for item in payload["checks"]} >= {
+        "auth_config",
+        "database",
+        "market_provider",
+        "market_cache",
+        "trading_mode",
+        "qmt_live_safety",
+    }
+    assert payload["summary"]["warnings"] >= 1
+    assert payload["summary"]["next_action"]
+
+
+def test_readiness_reports_auth_not_configured(monkeypatch) -> None:
+    from apps.api.app.core import config as config_mod
+
+    monkeypatch.setenv("QUANT_AUTH_ENABLED", "true")
+    monkeypatch.delenv("QUANT_ADMIN_API_KEY", raising=False)
+    monkeypatch.delenv("QUANT_TRADER_API_KEY", raising=False)
+    monkeypatch.delenv("QUANT_VIEWER_API_KEY", raising=False)
+    config_mod.reset_settings_cache()
+
+    response = client.get("/api/v1/health/readiness")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["local_ready"] is False
+    auth_check = next(item for item in payload["checks"] if item["id"] == "auth_config")
+    assert auth_check["status"] == "fail"
+    assert auth_check["blocks_local"] is True
+    assert "QUANT_ADMIN_API_KEY" in auth_check["next_action"]
 
 
 def test_watchlist_add_list_and_delete(monkeypatch) -> None:
@@ -89,7 +136,18 @@ def test_alert_create_list_delete() -> None:
 def test_market_cache_status_shape() -> None:
     response = client.get("/api/v1/market/cache-status")
     assert response.status_code == 200
-    assert set(response.json()) == {"total", "ready"}
+    payload = response.json()
+    assert {
+        "total",
+        "ready",
+        "provider",
+        "mock",
+        "min_ready",
+        "real_time",
+        "live_trading_safe",
+    }.issubset(payload)
+    assert isinstance(payload["mock"], bool)
+    assert payload["live_trading_safe"] is (not payload["mock"])
 
 
 def test_llm_config_available_without_auth() -> None:
@@ -126,24 +184,24 @@ def test_trading_paper_order_flow(monkeypatch) -> None:
     monkeypatch.setattr(
         market_service,
         "get_single_quote",
-        lambda symbol: {"symbol": symbol, "name": "宁德时代", "price": 200.0},
+        lambda symbol: {"symbol": symbol, "name": "宁德时代", "price": 100.0},
     )
     monkeypatch.setattr(
         market_service,
         "get_realtime_quotes",
-        lambda symbols: [{"symbol": s, "name": "宁德时代", "price": 200.0, "change_pct": 0.0} for s in symbols],
+        lambda symbols: [{"symbol": s, "name": "宁德时代", "price": 100.0, "change_pct": 0.0} for s in symbols],
     )
 
     preview = client.post(
         "/api/v1/trading/preview",
-        json={"symbol": "300750.SZ", "side": "BUY", "quantity": 100, "price": 200.0},
+        json={"symbol": "300750.SZ", "side": "BUY", "quantity": 100, "price": 100.0},
     )
     assert preview.status_code == 200
     assert preview.json()["allowed"] is True
 
     order = client.post(
         "/api/v1/trading/orders",
-        json={"symbol": "300750.SZ", "side": "BUY", "quantity": 100, "price": 200.0, "name": "宁德时代"},
+        json={"symbol": "300750.SZ", "side": "BUY", "quantity": 100, "price": 100.0, "name": "宁德时代"},
     )
     assert order.status_code == 200
     assert order.json()["status"] == "FILLED"
@@ -176,9 +234,9 @@ def test_trading_rebalance_plan_route(monkeypatch) -> None:
                 {
                     "symbol": "300750.SZ",
                     "name": "宁德时代",
-                    "price": 200.0,
+                        "price": 100.0,
                     "score": 88,
-                    "trade_plan": {"entry_mid": 200.0, "expected_return_pct": 8.0},
+                        "trade_plan": {"entry_mid": 100.0, "expected_return_pct": 8.0},
                     "ai_analysis": {"action": "BUY"},
                     "evolution": {"probability": 0.72, "expected_return_pct": 8.5},
                     "fundamental": {"info": {"industry": "电池"}},
@@ -200,7 +258,7 @@ def test_trading_rebalance_plan_route(monkeypatch) -> None:
     )
 
     quote_map = {
-        "300750.SZ": {"symbol": "300750.SZ", "name": "宁德时代", "price": 200.0, "change_pct": 0.0, "prev_close": 200.0, "industry": "电池"},
+        "300750.SZ": {"symbol": "300750.SZ", "name": "宁德时代", "price": 100.0, "change_pct": 0.0, "prev_close": 100.0, "industry": "电池"},
         "000001.SZ": {"symbol": "000001.SZ", "name": "平安银行", "price": 10.0, "change_pct": 0.0, "prev_close": 10.0, "industry": "银行"},
     }
     monkeypatch.setattr(market_service, "get_single_quote", lambda symbol: quote_map[symbol])
@@ -228,6 +286,60 @@ def test_trading_rebalance_plan_route(monkeypatch) -> None:
     assert len(payload["actions"]) == 2
     assert all(action["risk"]["allowed"] is True for action in payload["actions"])
     assert len(payload["target_weights"]) == 2
+
+
+def test_trading_paper_account_initialization_is_concurrency_safe(monkeypatch) -> None:
+    from apps.api.app.core import config as config_mod
+    from apps.api.app.db.models import TradingAccountORM
+    from apps.api.app.db.session import session_scope
+    from apps.api.app.services import market_service
+
+    monkeypatch.setenv("QUANT_TRADING_MODE", "paper")
+    monkeypatch.setenv("QUANT_PAPER_INITIAL_CASH", "100000")
+    config_mod.reset_settings_cache()
+    monkeypatch.setattr(market_service, "get_realtime_quotes", lambda symbols: [])
+
+    paths = ["/api/v1/trading/account", "/api/v1/trading/positions"] * 8
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses = list(pool.map(client.get, paths))
+
+    assert all(response.status_code == 200 for response in responses)
+    with session_scope() as session:
+        assert session.query(TradingAccountORM).filter_by(account_id="PAPER").count() == 1
+
+
+def test_trading_paper_concurrent_buy_orders_cannot_overspend_cash(monkeypatch) -> None:
+    from apps.api.app.core import config as config_mod
+    from apps.api.app.services import market_service
+
+    monkeypatch.setenv("QUANT_TRADING_MODE", "paper")
+    monkeypatch.setenv("QUANT_PAPER_INITIAL_CASH", "100000")
+    monkeypatch.setenv("QUANT_TRADING_SINGLE_STOCK_MAX_WEIGHT", "1.0")
+    monkeypatch.setenv("QUANT_TRADING_DAILY_TURNOVER_LIMIT", "2.0")
+    config_mod.reset_settings_cache()
+    monkeypatch.setattr(
+        market_service,
+        "get_single_quote",
+        lambda symbol: {"symbol": symbol, "name": "宁德时代", "price": 300.0, "prev_close": 300.0},
+    )
+    monkeypatch.setattr(
+        market_service,
+        "get_realtime_quotes",
+        lambda symbols: [{"symbol": s, "name": "宁德时代", "price": 300.0, "prev_close": 300.0} for s in symbols],
+    )
+
+    body = {"symbol": "300750.SZ", "side": "BUY", "quantity": 100, "price": 300.0, "name": "宁德时代"}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        responses = list(pool.map(lambda _: client.post("/api/v1/trading/orders", json=body), range(4)))
+
+    assert all(response.status_code == 200 for response in responses)
+    statuses = [response.json()["status"] for response in responses]
+    assert statuses.count("FILLED") == 3
+    assert statuses.count("REJECTED") == 1
+
+    account = client.get("/api/v1/trading/account").json()
+    assert account["cash"] >= 0
+    assert account["cash"] == 10000.0
 
 
 def test_evolution_auto_cycle_route_available() -> None:
@@ -267,6 +379,50 @@ def test_evolution_auto_scan_route_available(monkeypatch) -> None:
     assert payload["predictions_created"] == 8
 
 
+def test_evolution_backfill_route_passes_request(monkeypatch) -> None:
+    from apps.api.app.services import evolution_service
+
+    captured = {}
+
+    def fake_backfill(**kwargs):
+        captured.update(kwargs)
+        return {
+            "ok": True,
+            "scan_run_id": 9,
+            "symbols": kwargs["symbols"],
+            "created_predictions": 2,
+            "validated_predictions": 2,
+            "diagnostics": {"ready": True, "top_error_types": []},
+        }
+
+    monkeypatch.setattr(evolution_service, "backfill_historical_predictions", fake_backfill)
+
+    response = client.post(
+        "/api/v1/evolution/backfill",
+        json={
+            "symbols": ["300750.sz"],
+            "symbol_limit": 3,
+            "bars_count": 120,
+            "samples_per_symbol": 2,
+            "horizon_days": 5,
+            "min_gap_days": 7,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["created_predictions"] == 2
+    assert captured == {
+        "symbols": ["300750.sz"],
+        "symbol_limit": 3,
+        "bars_count": 120,
+        "samples_per_symbol": 2,
+        "horizon_days": 5,
+        "min_gap_days": 7,
+    }
+
+
 def test_evolution_config_runtime_override_applies() -> None:
     response = client.post(
         "/api/v1/evolution/config",
@@ -283,6 +439,7 @@ def test_evolution_config_runtime_override_applies() -> None:
             "auto_scan_target_horizon_days": 5,
             "auto_evolve_enabled": False,
             "auto_evolve_min_samples": 12,
+            "auto_evolve_min_live_samples": 7,
             "auto_promote_min_success_rate": 0.66,
             "auto_walk_forward_min_samples": 18,
             "auto_walk_forward_min_dates": 21,
@@ -308,6 +465,7 @@ def test_evolution_config_runtime_override_applies() -> None:
     assert effective["auto_scan_target_horizon_days"] == 5
     assert effective["auto_evolve_enabled"] is False
     assert effective["auto_evolve_min_samples"] == 12
+    assert effective["auto_evolve_min_live_samples"] == 7
     assert effective["auto_promote_min_success_rate"] == 0.66
     assert effective["auto_walk_forward_min_samples"] == 18
     assert effective["auto_walk_forward_min_dates"] == 21
@@ -320,6 +478,7 @@ def test_evolution_config_runtime_override_applies() -> None:
     assert fetched["runtime_override"]["validate_time"] == "09:05"
     assert fetched["runtime_override"]["failure_alert_enabled"] is False
     assert fetched["runtime_override"]["failure_alert_cooldown_seconds"] == 120
+    assert fetched["runtime_override"]["auto_evolve_min_live_samples"] == 7
     assert fetched["runtime_override"]["auto_walk_forward_min_samples"] == 18
     assert fetched["runtime_override"]["auto_walk_forward_min_dates"] == 21
 
@@ -331,3 +490,56 @@ def test_evolution_config_rejects_invalid_validate_time() -> None:
     )
 
     assert response.status_code == 422
+
+
+def test_rbac_route_boundaries(monkeypatch) -> None:
+    from apps.api.app.core import config as config_mod
+    from apps.api.app.services import market_service
+
+    monkeypatch.setenv("QUANT_AUTH_ENABLED", "true")
+    monkeypatch.setenv("QUANT_ADMIN_API_KEY", "admin-key")
+    monkeypatch.setenv("QUANT_TRADER_API_KEY", "trader-key")
+    monkeypatch.setenv("QUANT_VIEWER_API_KEY", "viewer-key")
+    config_mod.reset_settings_cache()
+
+    monkeypatch.setattr(
+        market_service,
+        "get_single_quote",
+        lambda symbol: {"symbol": symbol, "name": "宁德时代", "price": 100.0},
+    )
+
+    assert client.get("/api/v1/market/cache-status").status_code == 401
+    assert client.get("/api/v1/market/cache-status", headers=_auth_headers("viewer-key")).status_code == 200
+
+    viewer_write = client.post(
+        "/api/v1/alerts/",
+        headers=_auth_headers("viewer-key"),
+        json={
+            "symbol": "300750.SZ",
+            "name": "宁德时代",
+            "alert_type": "price_above",
+            "target_price": 200.0,
+        },
+    )
+    assert viewer_write.status_code == 403
+    assert viewer_write.json()["detail"]["code"] == "INSUFFICIENT_ROLE"
+
+    trader_write = client.post(
+        "/api/v1/alerts/",
+        headers=_auth_headers("trader-key"),
+        json={
+            "symbol": "300750.SZ",
+            "name": "宁德时代",
+            "alert_type": "price_above",
+            "target_price": 200.0,
+        },
+    )
+    assert trader_write.status_code == 200
+    alert_id = trader_write.json()["id"]
+
+    admin_only = client.delete("/api/v1/scanner/cache", headers=_auth_headers("trader-key"))
+    assert admin_only.status_code == 403
+    assert admin_only.json()["detail"]["code"] == "INSUFFICIENT_ROLE"
+
+    assert client.delete("/api/v1/scanner/cache", headers=_auth_headers("admin-key")).status_code == 200
+    assert client.delete(f"/api/v1/alerts/{alert_id}", headers=_auth_headers("trader-key")).status_code == 200

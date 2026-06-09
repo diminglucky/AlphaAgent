@@ -77,9 +77,9 @@ class RiskEngine:
                 rule_id="single_stock_max_weight",
                 rule_type=RiskRuleType.SINGLE_STOCK_MAX_WEIGHT,
                 scope="symbol",
-                threshold=0.30,
+                threshold=0.15,
                 action_on_breach=RiskDecision.BLOCK,
-                description="Single stock cannot exceed 30% of portfolio",
+                description="Single stock cannot exceed 15% of portfolio",
             ),
             RiskRule(
                 rule_id="industry_max_weight",

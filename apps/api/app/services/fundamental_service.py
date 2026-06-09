@@ -71,6 +71,55 @@ def _ak():
     return ak
 
 
+def _provider_name() -> str:
+    try:
+        from apps.api.app.core.config import get_settings
+
+        return str(get_settings().market_data_provider or "").strip().lower()
+    except Exception:
+        return "akshare"
+
+
+def _is_mock_provider() -> bool:
+    return _provider_name() == "mock"
+
+
+def _mock_stock(symbol: str):
+    from libs.market_data.universe import UNIVERSE
+
+    return next((stock for stock in UNIVERSE if stock.symbol == symbol), None)
+
+
+def _mock_hot_industries() -> list[dict]:
+    from libs.market_data.universe import UNIVERSE
+
+    grouped: dict[str, dict] = {}
+    for stock in UNIVERSE:
+        rec = grouped.setdefault(stock.industry, {
+            "name": stock.industry,
+            "change_pct": 0.0,
+            "net_inflow": 0.0,
+            "leader": stock.name,
+            "leader_pct": -999.0,
+            "company_count": 0,
+        })
+        pct = round(stock.trend * 1000, 2)
+        rec["change_pct"] += pct
+        rec["net_inflow"] += stock.trend * stock.base_price * 1e7
+        rec["company_count"] += 1
+        if pct > rec["leader_pct"]:
+            rec["leader"] = stock.name
+            rec["leader_pct"] = pct
+    rows = []
+    for rec in grouped.values():
+        count = max(int(rec["company_count"]), 1)
+        rec["change_pct"] = round(rec["change_pct"] / count, 2)
+        rec["net_inflow"] = round(rec["net_inflow"], 2)
+        rows.append(rec)
+    rows.sort(key=lambda x: (x["change_pct"], x["net_inflow"]), reverse=True)
+    return rows
+
+
 def _safe_float(v) -> Optional[float]:
     try:
         if v is None:
@@ -196,6 +245,30 @@ def get_stock_info(symbol: str) -> dict:
     cached = _info_cache.get(code)
     if cached and (time.monotonic() - cached[0]) < _INFO_TTL:
         return cached[1]
+    if _is_mock_provider():
+        stock = _mock_stock(symbol)
+        name = stock.name if stock else ""
+        industry = stock.industry if stock else ""
+        base = stock.base_price if stock else 50.0
+        info = {
+            "symbol": symbol,
+            "code": code,
+            "name": name,
+            "industry": industry,
+            "total_mv": base * 1.2e8,
+            "float_mv": base * 8.0e7,
+            "list_date": "2018-01-01",
+            "days_listed": max(0, (date.today() - date(2018, 1, 1)).days),
+            "is_st": bool(getattr(stock, "is_st", False)) if stock else False,
+            "pe": round(25 - (getattr(stock, "trend", 0.0) * 800), 2) if stock else 30.0,
+            "pe_static": None,
+            "pb": round(2.5 + abs(getattr(stock, "trend", 0.0)) * 100, 2) if stock else 3.0,
+            "peg": None,
+            "ps": None,
+            "_partial": False,
+        }
+        _info_cache[code] = (time.monotonic(), info)
+        return info
 
     info = {
         "symbol": symbol,
@@ -323,6 +396,20 @@ def get_fund_flow(symbol: str) -> dict:
     cached = _flow_cache.get(code)
     if cached and (time.monotonic() - cached[0]) < _FLOW_TTL:
         return cached[1]
+    if _is_mock_provider():
+        stock = _mock_stock(symbol)
+        trend = getattr(stock, "trend", 0.0) if stock else 0.0
+        turnover_rate = round(2.0 + abs(trend) * 800, 2)
+        out = {
+            "today_net": round(trend * 8e10, 2),
+            "today_inflow": round(max(trend, 0.001) * 1.2e11, 2),
+            "today_outflow": round(max(-trend, 0.001) * 8e10, 2),
+            "today_pct": round(trend * 1000, 2),
+            "turnover_rate": turnover_rate,
+            "_partial": False,
+        }
+        _flow_cache[code] = (time.monotonic(), out)
+        return out
 
     out = {
         "today_net": None,           # 当日净额（流入-流出）
@@ -395,6 +482,23 @@ def _ensure_northbound():
 def get_northbound_flow(symbol: str) -> dict:
     """Return 5-day northbound holding change for A-share symbols."""
     code = _normalize_code(symbol)
+    if _is_mock_provider():
+        stock = _mock_stock(symbol)
+        trend = getattr(stock, "trend", 0.0) if stock else 0.0
+        add_mv = trend * 6e10
+        return {
+            "date": "2026-04-25",
+            "hold_mv": abs(add_mv) * 20,
+            "hold_ratio_float": round(4.0 + abs(trend) * 600, 3),
+            "hold_ratio_total": round(3.0 + abs(trend) * 500, 3),
+            "add_shares_5d": round(add_mv / max(getattr(stock, "base_price", 50.0), 1), 2) if stock else 0,
+            "add_mv_5d": round(add_mv, 2),
+            "add_mv_pct_5d": round(trend * 1000, 2),
+            "add_ratio_float_5d": round(trend * 80, 4),
+            "add_ratio_total_5d": round(trend * 60, 4),
+            "board": getattr(stock, "industry", ""),
+            "_partial": False,
+        }
     out = {
         "date": "",
         "hold_mv": None,
@@ -484,6 +588,29 @@ def get_research_rating(symbol: str, days: int = 30) -> dict:
     cached = _research_cache.get(code)
     if cached and (time.monotonic() - cached[0]) < _RESEARCH_TTL:
         return cached[1]
+    if _is_mock_provider():
+        stock = _mock_stock(symbol)
+        trend = getattr(stock, "trend", 0.0) if stock else 0.0
+        positive = trend > 0.001
+        out = {
+            "days": days,
+            "report_count": 4 if positive else 1,
+            "buy_count": 2 if positive else 0,
+            "positive_count": 3 if positive else 0,
+            "neutral_count": 1,
+            "negative_count": 0 if trend >= 0 else 1,
+            "institutions": ["Alpha Mock Research", "Beta Quant Lab"] if positive else ["Alpha Mock Research"],
+            "latest_reports": [{
+                "date": "2026-04-25",
+                "title": f"{getattr(stock, 'name', symbol)} mock 研报摘要",
+                "rating": "买入" if positive else "中性",
+                "institution": "Alpha Mock Research",
+                "pdf_url": "",
+            }],
+            "_partial": False,
+        }
+        _research_cache[code] = (time.monotonic(), out)
+        return out
 
     out = {
         "days": days,
@@ -671,6 +798,29 @@ def _ensure_insider_changes(days: int = 90):
 def get_insider_reduction(symbol: str, days: int = 90) -> dict:
     """Return recent insider reduction summary."""
     code = _normalize_code(symbol)
+    if _is_mock_provider():
+        stock = _mock_stock(symbol)
+        risk = getattr(stock, "trend", 0.0) < -0.002 or bool(getattr(stock, "is_st", False))
+        return {
+            "days": days,
+            "reduce_count": 1 if risk else 0,
+            "total_reduce_amount": 5e7 if risk else 0.0,
+            "total_reduce_shares": 1e6 if risk else 0.0,
+            "latest_date": "2026-04-15" if risk else "",
+            "events": [{
+                "date": "2026-04-15",
+                "name": getattr(stock, "name", symbol),
+                "person": "Mock Holder",
+                "position": "高管",
+                "relation": "本人",
+                "reason": "mock 风险样本",
+                "shares": -1e6,
+                "amount": -5e7,
+                "price": getattr(stock, "base_price", 50.0),
+                "ratio": -0.05,
+            }] if risk else [],
+            "_partial": False,
+        }
     out = {
         "days": days,
         "reduce_count": 0,
@@ -733,6 +883,14 @@ def _ensure_industries():
     global _hot_industries, _hot_concepts, _industry_ts
     with _industry_lock:
         if _industry_ts > 0 and (time.monotonic() - _industry_ts) < _INDUSTRY_TTL:
+            return
+        if _is_mock_provider():
+            _hot_industries = _mock_hot_industries()
+            _hot_concepts = [
+                {**row, "name": f"{row['name']}概念"}
+                for row in _hot_industries[:20]
+            ]
+            _industry_ts = time.monotonic()
             return
         try:
             ak = _ak()
@@ -900,6 +1058,18 @@ def _fetch_lhb_today():
 
 def get_lhb_record(symbol: str) -> list[dict]:
     """获取个股近 5 日的龙虎榜记录。"""
+    if _is_mock_provider():
+        stock = _mock_stock(symbol)
+        if not stock or getattr(stock, "trend", 0.0) <= 0.003:
+            return []
+        return [{
+            "date": "2026-04-25",
+            "reason": "日涨幅偏离值达7%的证券",
+            "net_buy": round(stock.trend * 5e10, 2),
+            "interpret": "机构席位净买入",
+            "next_1d": round(stock.trend * 1000, 2),
+            "next_5d": round(stock.trend * 3000, 2),
+        }]
     global _lhb_cache, _lhb_ts
     with _lhb_lock:
         if not _lhb_cache or (time.monotonic() - _lhb_ts) > _LHB_TTL:

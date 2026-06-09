@@ -9,6 +9,7 @@ from apps.api.app.core.auth import (
     _resolve_role,
     authenticate_api_key,
     get_current_user,
+    is_auth_configured,
     require_admin,
     require_trader,
 )
@@ -87,7 +88,18 @@ def test_authenticate_api_key_ignores_empty_default_keys(monkeypatch) -> None:
     monkeypatch.setattr(auth_mod, "get_settings", lambda: Settings(auth_enabled=True))
     with pytest.raises(HTTPException) as exc_info:
         authenticate_api_key("")
-    assert exc_info.value.status_code == 401
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail["code"] == "AUTH_NOT_CONFIGURED"
+
+
+def test_is_auth_configured_requires_at_least_one_key(monkeypatch) -> None:
+    from apps.api.app.core import auth as auth_mod
+
+    monkeypatch.setattr(auth_mod, "get_settings", lambda: Settings(auth_enabled=True))
+    assert is_auth_configured() is False
+
+    monkeypatch.setattr(auth_mod, "get_settings", lambda: Settings(auth_enabled=True, viewer_api_key="viewer-key"))
+    assert is_auth_configured() is True
 
 
 def test_require_trader_and_admin_guards() -> None:

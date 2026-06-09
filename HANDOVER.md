@@ -232,7 +232,7 @@ Agent.vue 同时监听 3 个生命周期：
 - `QUANT_PAPER_INITIAL_CASH`：模拟盘初始现金，默认 100 万
 - `QUANT_QMT_GATEWAY_API_KEY`：可选，转发 QMT Gateway 时发送 `X-API-Key`
 - `QUANT_TRADING_BLOCK_ST_BUY=true`：默认拦截 ST 股票买入
-- `QUANT_TRADING_SINGLE_STOCK_MAX_WEIGHT=0.30`：单股目标仓位上限
+- `QUANT_TRADING_SINGLE_STOCK_MAX_WEIGHT=0.15`：单股目标仓位上限
 - `QUANT_TRADING_DAILY_TURNOVER_LIMIT=0.50`：单日成交额/总资产上限
 - `QUANT_TRADING_ENFORCE_HOURS=false`：是否强制交易时段校验，默认关闭以便模拟盘和测试
 
@@ -567,7 +567,7 @@ Scanner 扫描结果保存到 `localStorage['scanner:last_result_v1']`：
 
 ### 中优先级
 
-5. **风控增强**：当前已接入 A 股规则、ST 拦截、单股仓位和日成交额限制；后续补行业集中度、真实交易日历、停牌/退市数据和 QMT 可卖数量实时预览
+5. **风控增强**：当前已接入 A 股规则、ST 拦截、单股仓位、日成交额限制、行业集中度、组合回撤、杠杆、波动率和调仓现金预算校验；后续补真实交易日历、节假日跳过、停牌/退市数据和 QMT 可卖数量实时预览
 6. **扫描进度细化**：Scanner 已接 `/scanner/ws/scan` 且 WebSocket 会携带 API key 查询参数；后续可继续显示更细的候选池数量、LLM token 和单股耗时
 7. **行业关联增强**：当前已显示所属行业、行业排名和景气分；后续可补概念板块关联和同业对比列表
 8. **北向资金增强**：当前已接入 5 日北向增减持排行；后续可加入连续多日明细趋势和外资持股占比历史分位

@@ -6,6 +6,7 @@ import logging
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
+from apps.api.app.core.auth import get_current_user, require_admin, require_trader
 from apps.api.app.db.session import get_db
 from apps.api.app.db.models import WatchlistORM, AnalysisCacheORM
 from apps.api.app.services import market_service, alert_service
@@ -61,7 +62,11 @@ def _run_super_analyst(symbol: str, name: str, db: Session) -> dict:
 
 
 @router.post("/analyze/{symbol}")
-async def analyze_stock(symbol: str, db: Session = Depends(get_db)):
+async def analyze_stock(
+    symbol: str,
+    _: object = Depends(require_trader),
+    db: Session = Depends(get_db),
+):
     """深度分析单只股票（SuperAnalystAgent）— 在线程池执行避免阻塞"""
     import asyncio
     from concurrent.futures import ThreadPoolExecutor
@@ -101,7 +106,7 @@ async def analyze_stock(symbol: str, db: Session = Depends(get_db)):
 
 
 @router.post("/scan")
-def scan_watchlist(db: Session = Depends(get_db)):
+def scan_watchlist(_: object = Depends(require_trader), db: Session = Depends(get_db)):
     """扫描全部自选股，逐一深度分析"""
     items = db.query(WatchlistORM).order_by(WatchlistORM.sort_order).all()
     if not items:
@@ -148,6 +153,7 @@ def scan_watchlist(db: Session = Depends(get_db)):
 
 @router.get("/cache")
 def get_cached_analyses(
+    _: object = Depends(get_current_user),
     db: Session = Depends(get_db),
     max_age_hours: int = 24,
 ):
@@ -170,7 +176,7 @@ def get_cached_analyses(
 
 
 @router.get("/cache/{symbol}")
-def get_cached_analysis(symbol: str, db: Session = Depends(get_db)):
+def get_cached_analysis(symbol: str, _: object = Depends(get_current_user), db: Session = Depends(get_db)):
     cache = db.query(AnalysisCacheORM).filter(AnalysisCacheORM.symbol == symbol).first()
     if not cache:
         return {"symbol": symbol, "result": None}
@@ -188,6 +194,7 @@ def get_cached_analysis(symbol: str, db: Session = Depends(get_db)):
 
 @router.delete("/cache")
 def clear_analysis_cache(
+    _: object = Depends(require_admin),
     db: Session = Depends(get_db),
     symbol: str | None = None,
 ):

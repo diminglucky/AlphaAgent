@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from apps.api.app.db.session import get_db
 from apps.api.app.db.models import WatchlistORM
+from apps.api.app.core.auth import get_current_user, require_trader
 from apps.api.app.services import market_service
 
 router = APIRouter(prefix="/watchlist", tags=["watchlist"])
@@ -26,7 +27,7 @@ class AddSymbolReq(BaseModel):
 
 
 @router.get("/")
-def list_watchlist(db: Session = Depends(get_db)):
+def list_watchlist(_: object = Depends(get_current_user), db: Session = Depends(get_db)):
     items = db.query(WatchlistORM).order_by(WatchlistORM.sort_order, WatchlistORM.id).all()
     return [
         {
@@ -41,7 +42,7 @@ def list_watchlist(db: Session = Depends(get_db)):
 
 
 @router.post("/")
-def add_symbol(req: AddSymbolReq, db: Session = Depends(get_db)):
+def add_symbol(req: AddSymbolReq, _: object = Depends(require_trader), db: Session = Depends(get_db)):
     symbol = _normalize_symbol(req.symbol)
     existing = db.query(WatchlistORM).filter(WatchlistORM.symbol == symbol).first()
     if existing:
@@ -62,7 +63,7 @@ def add_symbol(req: AddSymbolReq, db: Session = Depends(get_db)):
 
 
 @router.delete("/{symbol}")
-def remove_symbol(symbol: str, db: Session = Depends(get_db)):
+def remove_symbol(symbol: str, _: object = Depends(require_trader), db: Session = Depends(get_db)):
     symbol = _normalize_symbol(symbol)
     item = db.query(WatchlistORM).filter(WatchlistORM.symbol == symbol).first()
     if not item:
@@ -73,7 +74,7 @@ def remove_symbol(symbol: str, db: Session = Depends(get_db)):
 
 
 @router.get("/with-quotes")
-def list_with_quotes(db: Session = Depends(get_db)):
+def list_with_quotes(_: object = Depends(get_current_user), db: Session = Depends(get_db)):
     """自选股列表 + 实时行情"""
     items = db.query(WatchlistORM).order_by(WatchlistORM.sort_order, WatchlistORM.id).all()
     if not items:

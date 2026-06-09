@@ -549,7 +549,7 @@ class PortfolioManager:
         n_holdings = len(positions)
 
         flags: list[str] = []
-        if weight > 0.30:
+        if weight > 0.15:
             flags.append("OVERWEIGHT_POSITION")
         if n_holdings > 0 and cash_ratio < 0.05:
             flags.append("LOW_CASH")
@@ -561,7 +561,7 @@ class PortfolioManager:
             if "OVERWEIGHT_POSITION" in flags:
                 view = AnalystView.BEARISH
                 reasoning = (
-                    f"当前持仓权重已达 {weight:.0%}（>30%），不建议加仓"
+                    f"当前持仓权重已达 {weight:.0%}（>15%），不建议加仓"
                 )
                 conf = 0.85
             elif "LOW_CASH" in flags:
@@ -581,7 +581,7 @@ class PortfolioManager:
                 view = AnalystView.NEUTRAL
                 reasoning = "未持仓，无需考虑卖出"
                 conf = 0.4
-            elif weight > 0.30:
+            elif weight > 0.15:
                 view = AnalystView.BULLISH  # bullish on the SELL action
                 reasoning = f"重仓 {weight:.0%}，建议减仓再平衡"
                 conf = 0.8

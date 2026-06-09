@@ -31,7 +31,7 @@ class AnalysisOrchestrator:
             instrument={...},        # Instrument metadata dict
             news_items=[...],        # list[dict] from NewsRepository
             risk_flags=[...],        # list[str] active risk flags
-            portfolio_context="当前仓位 5%，上限 30%",
+            portfolio_context="当前仓位 5%，上限 15%",
         )
     """
 

@@ -28,6 +28,15 @@ class EvolveReq(BaseModel):
     promote: bool = False
 
 
+class BackfillReq(BaseModel):
+    symbols: Optional[list[str]] = None
+    symbol_limit: int = Field(default=10, ge=1, le=100)
+    bars_count: int = Field(default=260, ge=80, le=1000)
+    samples_per_symbol: int = Field(default=6, ge=1, le=50)
+    horizon_days: Optional[int] = Field(default=None, ge=1, le=60)
+    min_gap_days: int = Field(default=5, ge=1, le=120)
+
+
 class EvolutionConfigUpdate(BaseModel):
     validate_interval_seconds: Optional[int] = Field(default=None, ge=0, le=604800)
     validate_initial_delay_seconds: Optional[int] = Field(default=None, ge=0, le=86400)
@@ -46,6 +55,7 @@ class EvolutionConfigUpdate(BaseModel):
     auto_scan_target_horizon_days: Optional[int] = Field(default=None, ge=0, le=60)
     auto_evolve_enabled: Optional[bool] = None
     auto_evolve_min_samples: Optional[int] = Field(default=None, ge=1, le=100000)
+    auto_evolve_min_live_samples: Optional[int] = Field(default=None, ge=0, le=100000)
     auto_promote_min_success_rate: Optional[float] = Field(default=None, ge=0, le=1)
     auto_promote_min_avg_return_pct: Optional[float] = Field(default=None, ge=-100, le=100)
     auto_promote_max_brier_score: Optional[float] = Field(default=None, ge=0, le=1)
@@ -101,6 +111,7 @@ _CONFIG_KEY_MAP = {
     "auto_scan_target_horizon_days": "evolution_auto_scan_target_horizon_days",
     "auto_evolve_enabled": "evolution_auto_evolve_enabled",
     "auto_evolve_min_samples": "evolution_auto_evolve_min_samples",
+    "auto_evolve_min_live_samples": "evolution_auto_evolve_min_live_samples",
     "auto_promote_min_success_rate": "evolution_auto_promote_min_success_rate",
     "auto_promote_min_avg_return_pct": "evolution_auto_promote_min_avg_return_pct",
     "auto_promote_max_brier_score": "evolution_auto_promote_max_brier_score",
@@ -152,6 +163,21 @@ def predictions(
         status=status,
         horizon_days=horizon_days,
         limit=limit,
+        db=db,
+    )
+
+
+@router.get("/diagnostics")
+def diagnostics(
+    limit: int = 100,
+    model_version_id: Optional[int] = None,
+    _: object = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """预测复盘聚合：错误类型、根因、模型反馈和高置信失败样本。"""
+    return evolution_service.get_diagnostics(
+        limit=limit,
+        model_version_id=model_version_id,
         db=db,
     )
 
@@ -228,6 +254,26 @@ async def auto_scan(_: object = Depends(require_admin)):
     loop = asyncio.get_event_loop()
     with ThreadPoolExecutor(max_workers=1) as pool:
         return await loop.run_in_executor(pool, evolution_service.run_auto_scan_once)
+
+
+@router.post("/backfill")
+async def backfill(req: Optional[BackfillReq] = Body(default=None), _: object = Depends(require_admin)):
+    """用历史 K 线回放生成已验证预测样本，帮助模型先获得可复盘训练数据。"""
+    if req is None:
+        req = BackfillReq()
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return await loop.run_in_executor(
+            pool,
+            lambda: evolution_service.backfill_historical_predictions(
+                symbols=req.symbols,
+                symbol_limit=req.symbol_limit,
+                bars_count=req.bars_count,
+                samples_per_symbol=req.samples_per_symbol,
+                horizon_days=req.horizon_days,
+                min_gap_days=req.min_gap_days,
+            ),
+        )
 
 
 @router.get("/config")

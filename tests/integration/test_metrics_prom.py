@@ -13,6 +13,9 @@ def test_cache_status_endpoint_returns_readiness() -> None:
     payload = response.json()
     assert isinstance(payload["total"], int)
     assert isinstance(payload["ready"], bool)
+    assert isinstance(payload["provider"], str)
+    assert isinstance(payload["mock"], bool)
+    assert isinstance(payload["live_trading_safe"], bool)
 
 
 def test_ws_status_endpoint_returns_counts() -> None:

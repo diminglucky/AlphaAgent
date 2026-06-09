@@ -10,14 +10,15 @@ from libs.portfolio.optimizer import (
 from libs.quant_core.models import Position
 
 
-# 5-stock fixtures: avg raw weight = 0.95/5 = 0.19, well below 30% cap,
-# so the differentiation between schemes is preserved.
+# Use a wider cap for scheme-differentiation tests so default 15% risk caps
+# do not flatten the relative ordering being tested.
 SIGNALS_5 = {"A": 0.8, "B": 0.6, "C": 0.5, "D": 0.4, "E": 0.3}
 VOLS_5 = {"A": 0.030, "B": 0.020, "C": 0.010, "D": 0.025, "E": 0.015}
+SCHEME_TEST_CONSTRAINTS = PortfolioConstraints(max_single_stock_weight=0.50)
 
 
 def test_equal_weight_scheme():
-    optimizer = PortfolioOptimizer()
+    optimizer = PortfolioOptimizer(SCHEME_TEST_CONSTRAINTS)
     weights = optimizer.calculate_target_weights(
         SIGNALS_5, [], 1_000_000.0, scheme=WeightingScheme.EQUAL_WEIGHT,
     )
@@ -30,7 +31,7 @@ def test_equal_weight_scheme():
 
 def test_inverse_volatility_scheme():
     """Lowest-vol stock should get the largest weight."""
-    optimizer = PortfolioOptimizer()
+    optimizer = PortfolioOptimizer(SCHEME_TEST_CONSTRAINTS)
     weights = optimizer.calculate_target_weights(
         SIGNALS_5, [], 1_000_000.0,
         scheme=WeightingScheme.INVERSE_VOLATILITY,
@@ -45,7 +46,7 @@ def test_inverse_volatility_scheme():
 
 def test_inverse_volatility_no_vol_data_falls_back():
     """Without vols, INVERSE_VOLATILITY falls back to equal weight."""
-    optimizer = PortfolioOptimizer()
+    optimizer = PortfolioOptimizer(SCHEME_TEST_CONSTRAINTS)
     weights = optimizer.calculate_target_weights(
         SIGNALS_5, [], 1_000_000.0,
         scheme=WeightingScheme.INVERSE_VOLATILITY,
@@ -62,7 +63,7 @@ def test_risk_adjusted_scheme():
     Compare A (0.8/0.030 = 26.7) vs C (0.5/0.010 = 50).
     Despite lower raw signal, C should outweigh A.
     """
-    optimizer = PortfolioOptimizer()
+    optimizer = PortfolioOptimizer(SCHEME_TEST_CONSTRAINTS)
     weights = optimizer.calculate_target_weights(
         SIGNALS_5, [], 1_000_000.0,
         scheme=WeightingScheme.RISK_ADJUSTED,
@@ -73,7 +74,7 @@ def test_risk_adjusted_scheme():
 
 def test_signal_proportional_default():
     """Default scheme remains signal-proportional (legacy behaviour)."""
-    optimizer = PortfolioOptimizer()
+    optimizer = PortfolioOptimizer(SCHEME_TEST_CONSTRAINTS)
     weights_default = optimizer.calculate_target_weights(SIGNALS_5, [], 1_000_000.0)
     weights_explicit = optimizer.calculate_target_weights(
         SIGNALS_5, [], 1_000_000.0,
@@ -86,8 +87,8 @@ def test_signal_proportional_default():
 
 def test_inverse_volatility_floor():
     """Vol floor (0.5%) prevents division blow-up for halted/zero-vol stocks."""
-    optimizer = PortfolioOptimizer()
-    # Use 5 stocks so the cap doesn't bind
+    optimizer = PortfolioOptimizer(SCHEME_TEST_CONSTRAINTS)
+    # Use a wide cap so the cap doesn't hide the inverse-vol ordering.
     weights = optimizer.calculate_target_weights(
         {"A": 0.5, "B": 0.5, "C": 0.5, "D": 0.5, "E": 0.5}, [], 1_000_000.0,
         scheme=WeightingScheme.INVERSE_VOLATILITY,
@@ -102,7 +103,7 @@ def test_portfolio_optimizer_initialization():
     """Test optimizer initializes with default constraints."""
     optimizer = PortfolioOptimizer()
     
-    assert optimizer.constraints.max_single_stock_weight == 0.30
+    assert optimizer.constraints.max_single_stock_weight == 0.15
     assert optimizer.constraints.max_industry_weight == 0.40
 
 
@@ -149,6 +150,38 @@ def test_calculate_target_weights_with_cap():
     assert sum(weights.values()) < 1.0
     # All should be positive
     assert all(w > 0 for w in weights.values())
+
+
+def test_calculate_target_weights_respects_single_stock_cap():
+    """A dominant signal should still be capped at the configured max weight."""
+    optimizer = PortfolioOptimizer()
+
+    weights = optimizer.calculate_target_weights(
+        {"600519.SH": 1.0},
+        [],
+        1_000_000.0,
+    )
+
+    assert weights["600519.SH"] == pytest.approx(0.15)
+
+
+def test_calculate_target_weights_respects_max_positions():
+    """Optimizer should not emit more target positions than the configured cap."""
+    optimizer = PortfolioOptimizer(PortfolioConstraints(max_positions=2))
+
+    weights = optimizer.calculate_target_weights(
+        {
+            "A": 0.8,
+            "B": 0.7,
+            "C": 0.6,
+            "D": 0.5,
+        },
+        [],
+        1_000_000.0,
+    )
+
+    assert set(weights) == {"A", "B"}
+    assert len(weights) == 2
 
 
 def test_generate_rebalance_actions():
@@ -217,3 +250,18 @@ def test_optimize_with_warnings():
     # Should have warnings about high turnover
     assert len(result.warnings) > 0
     assert any("换手率" in w for w in result.warnings)
+
+
+def test_optimize_warns_when_candidates_exceed_max_positions():
+    """The warning should explain why lower-ranked signals were removed."""
+    optimizer = PortfolioOptimizer(PortfolioConstraints(max_positions=2))
+
+    result = optimizer.optimize(
+        {"A": 0.8, "B": 0.7, "C": 0.6},
+        [],
+        1_000_000.0,
+        {"A": 10.0, "B": 10.0, "C": 10.0},
+    )
+
+    assert result.risk_metrics["num_positions"] == 2
+    assert any("最大持仓数2" in warning for warning in result.warnings)

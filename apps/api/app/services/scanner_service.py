@@ -910,20 +910,20 @@ def _build_trade_plan(
 
     # ---------- 建议仓位 ----------
     if rating == "强烈推荐":
-        position_pct = "20-30%"
+        position_pct = "10-15%"
     elif rating == "推荐":
-        position_pct = "10-20%"
-    elif rating == "观察":
         position_pct = "5-10%"
+    elif rating == "观察":
+        position_pct = "3-5%"
     else:
         position_pct = "建议跳过"
 
     # 高波动股票降仓位
     if vol_20d_pct and vol_20d_pct > 4:
         if rating == "强烈推荐":
-            position_pct = "10-20%"
-        elif rating == "推荐":
             position_pct = "5-10%"
+        elif rating == "推荐":
+            position_pct = "3-5%"
 
     # ---------- 期望收益 + 风险收益比 ----------
     expected_return = round((target1 - entry_mid) / entry_mid * 100, 2)

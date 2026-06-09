@@ -45,6 +45,11 @@
         <div class="metric-value">{{ pct(metrics.success_rate) }}</div>
         <div class="metric-sub">平均收益 {{ signed(metrics.avg_return_pct) }}%</div>
       </div>
+      <div class="metric-card" :class="{ active: evolutionReadiness.ready }">
+        <div class="metric-label">进化就绪度</div>
+        <div class="metric-value">{{ readinessLabel }}</div>
+        <div class="metric-sub">{{ readinessHint }}</div>
+      </div>
       <div class="metric-card">
         <div class="metric-label">概率校准误差</div>
         <div class="metric-value">{{ pct(metrics.calibration_error) }}</div>
@@ -56,6 +61,41 @@
         <div class="metric-sub">
           {{ llmSummary.calls || 0 }} 次调用 · ${{ fmtCost(llmSummary.estimated_cost_usd) }}
         </div>
+      </div>
+    </div>
+
+    <div class="segment-grid">
+      <div
+        v-for="segment in sampleSegments"
+        :key="segment.key"
+        class="segment-card"
+        :class="{ primary: segment.key === 'live_prediction' }"
+      >
+        <div class="segment-title">
+          <span>{{ segment.label }}</span>
+          <el-tag v-if="segment.key === 'live_prediction'" size="small" type="success" effect="dark">现实优先</el-tag>
+          <el-tag v-else-if="segment.key === 'historical_replay'" size="small" type="warning" effect="plain">训练加速</el-tag>
+          <el-tag v-else size="small" type="info" effect="plain">执行反馈</el-tag>
+        </div>
+        <div class="segment-stats">
+          <div>
+            <b>{{ segment.sample_count || 0 }}</b>
+            <span>样本</span>
+          </div>
+          <div>
+            <b>{{ pct(segment.success_rate) }}</b>
+            <span>命中率</span>
+          </div>
+          <div>
+            <b :class="segment.avg_return_pct >= 0 ? 'up' : 'down'">{{ signed(segment.avg_return_pct) }}%</b>
+            <span>平均收益</span>
+          </div>
+          <div>
+            <b>{{ pct(segment.calibration_error) }}</b>
+            <span>校准误差</span>
+          </div>
+        </div>
+        <div class="segment-note">{{ sampleSegmentNote(segment.key, segment.sample_count) }}</div>
       </div>
     </div>
 
@@ -152,6 +192,10 @@
           <el-form-item label="晋升最小样本">
             <el-input-number v-model="evolutionForm.auto_evolve_min_samples" :min="1" :max="100000" :step="10" />
           </el-form-item>
+          <el-form-item label="真实样本门槛">
+            <el-input-number v-model="evolutionForm.auto_evolve_min_live_samples" :min="0" :max="100000" :step="5" />
+            <div class="field-hint">自动晋升必须先满足真实到期预测样本；0 表示只做实验性关闭，不建议用于现实验证。</div>
+          </el-form-item>
           <el-form-item label="晋升最低命中率">
             <el-input-number v-model="evolutionForm.auto_promote_min_success_rate" :min="0" :max="1" :step="0.01" />
           </el-form-item>
@@ -227,6 +271,46 @@
         <el-button plain :loading="savingConfig" @click="resetEvolutionConfig">重置为环境变量</el-button>
         <span class="muted">运行时覆盖项 {{ Object.keys(evolutionRuntime || {}).length }} 个</span>
       </div>
+      <div class="readiness-panel">
+        <div class="readiness-title">
+          <span>当前自动进化状态</span>
+          <el-tag :type="evolutionReadiness.ready ? 'success' : 'warning'" size="small" effect="dark">
+            {{ evolutionReadiness.ready ? '可进入质量门控' : '继续积累样本' }}
+          </el-tag>
+        </div>
+        <div class="readiness-grid">
+          <div class="readiness-item">
+            <span>已验证样本</span>
+            <b>{{ evolutionReadiness.evaluated_predictions || 0 }} / {{ evolutionReadiness.min_samples || '--' }}</b>
+            <small v-if="evolutionReadiness.sample_gap">还差 {{ evolutionReadiness.sample_gap }} 条</small>
+            <small v-else>已达到晋升最小样本</small>
+          </div>
+          <div class="readiness-item">
+            <span>真实到期样本</span>
+            <b>{{ evolutionReadiness.live_sample_count || 0 }} / {{ evolutionReadiness.min_live_samples ?? '--' }}</b>
+            <small v-if="evolutionReadiness.live_sample_gap">还差 {{ evolutionReadiness.live_sample_gap }} 条真实验证</small>
+            <small v-else>现实样本门槛已满足</small>
+          </div>
+          <div class="readiness-item">
+            <span>训练 / 留出</span>
+            <b>{{ evolutionReadiness.train_sample_count || 0 }} / {{ evolutionReadiness.holdout_sample_count || 0 }}</b>
+            <small>{{ trainHoldoutHint }}</small>
+          </div>
+          <div class="readiness-item">
+            <span>Walk-forward 样本</span>
+            <b>{{ walkForwardReadiness.sample_count || 0 }} / {{ walkForwardReadiness.min_samples || '--' }}</b>
+            <small v-if="walkForwardReadiness.sample_gap">还差 {{ walkForwardReadiness.sample_gap }} 条</small>
+            <small v-else>样本数已满足</small>
+          </div>
+          <div class="readiness-item">
+            <span>Walk-forward 日期</span>
+            <b>{{ walkForwardReadiness.unique_dates || 0 }} / {{ walkForwardRequiredDates }}</b>
+            <small v-if="walkForwardReadiness.date_gap">还差 {{ walkForwardReadiness.date_gap }} 个日期</small>
+            <small v-else>日期覆盖已满足</small>
+          </div>
+        </div>
+        <div v-if="readinessNextAction" class="readiness-action">{{ readinessNextAction }}</div>
+      </div>
       <div v-if="autoScanLastRun" class="auto-scan-status">
         <div>
           <span class="muted">最近自动采样</span>
@@ -266,6 +350,9 @@
         <div v-if="validationLastRun.auto_cycle_result?.reasons?.length" class="auto-scan-error">
           {{ validationLastRun.auto_cycle_result.reasons.join('；') }}
         </div>
+        <div v-else-if="validationLastRun.auto_cycle_result?.reason" class="auto-scan-error">
+          {{ cycleReasonLabel(validationLastRun.auto_cycle_result.reason) }}
+        </div>
         <div v-if="validationLastRun.error" class="auto-scan-error">{{ validationLastRun.error }}</div>
       </div>
       <div v-if="failureAlertLastEvent" class="auto-scan-status">
@@ -286,13 +373,75 @@
       </div>
     </el-card>
 
+    <el-card shadow="never" class="panel-card replay-card">
+      <template #header>
+        <div class="card-header">
+          <span>历史回放训练</span>
+          <span class="muted">用历史 K 线立刻生成“预测-验证-复盘”样本，不必等待未来到期</span>
+        </div>
+      </template>
+      <div class="replay-form">
+        <el-input
+          v-model="backfillForm.symbols"
+          placeholder="可选：300750.SZ, 000001.SZ；留空则用最近扫描股票"
+          clearable
+        />
+        <el-input-number v-model="backfillForm.symbol_limit" :min="1" :max="100" :step="1" />
+        <el-input-number v-model="backfillForm.samples_per_symbol" :min="1" :max="50" :step="1" />
+        <el-input-number v-model="backfillForm.bars_count" :min="80" :max="1000" :step="20" />
+        <el-input-number v-model="backfillForm.min_gap_days" :min="1" :max="120" :step="1" />
+        <el-select v-model="backfillForm.horizon_days" style="width:150px">
+          <el-option :value="null" label="全部周期" />
+          <el-option :value="3" label="3 日" />
+          <el-option :value="5" label="5 日" />
+          <el-option :value="10" label="10 日" />
+          <el-option :value="20" label="20 日" />
+        </el-select>
+        <el-button type="primary" :loading="backfilling" @click="backfillHistory">生成历史验证样本</el-button>
+      </div>
+      <div class="replay-hints">
+        <span>股票上限 {{ backfillForm.symbol_limit }}</span>
+        <span>每股样本 {{ backfillForm.samples_per_symbol }}</span>
+        <span>K 线 {{ backfillForm.bars_count }} 根</span>
+        <span>最小间隔 {{ backfillForm.min_gap_days }} 根交易日</span>
+        <span>系统会自动拉开到最长预测周期，降低标签窗口重叠</span>
+      </div>
+      <div v-if="backfillLastRun" class="replay-result">
+        <div>
+          <el-tag :type="backfillLastRun.ok ? 'success' : 'danger'" size="small" effect="dark">
+            {{ backfillLastRun.ok ? '回放完成' : '回放失败' }}
+          </el-tag>
+          <span>新增 {{ backfillLastRun.created_predictions || 0 }} 条，已验证 {{ backfillLastRun.validated_predictions || 0 }} 条</span>
+        </div>
+        <div class="auto-scan-meta">
+          <span>股票 {{ (backfillLastRun.symbols || []).join(', ') || '--' }}</span>
+          <span>批次 {{ backfillLastRun.scan_run_id || '--' }}</span>
+          <span v-if="backfillLastRun.diagnostics?.top_error_types?.length">
+            主要错误 {{ backfillLastRun.diagnostics.top_error_types[0].label }}
+          </span>
+        </div>
+        <div v-if="backfillLastRun.audit?.anti_leakage" class="replay-audit">
+          <b>回放审计</b>
+          <span>特征窗口：预测日及以前</span>
+          <span>验证窗口：预测日之后</span>
+          <span>
+            间隔 {{ backfillLastRun.audit.anti_leakage.effective_min_gap_days }} 根交易日
+            <template v-if="backfillLastRun.audit.anti_leakage.effective_min_gap_days !== backfillLastRun.audit.anti_leakage.requested_min_gap_days">
+              （从 {{ backfillLastRun.audit.anti_leakage.requested_min_gap_days }} 自动拉开）
+            </template>
+          </span>
+          <span>最长周期 {{ backfillLastRun.audit.anti_leakage.max_horizon_days }} 根交易日</span>
+        </div>
+      </div>
+    </el-card>
+
     <el-row :gutter="16">
       <el-col :span="10">
         <el-card shadow="never" class="panel-card">
           <template #header>
             <div class="card-header">
-              <span>按预测周期表现</span>
-              <el-tag size="small" type="info" effect="plain">3 / 5 / 10 / 20 日</el-tag>
+              <span>全量周期表现</span>
+              <el-tag size="small" type="info" effect="plain">含历史回放</el-tag>
             </div>
           </template>
           <el-empty v-if="!horizonRows.length" description="暂无已验证样本" />
@@ -321,6 +470,40 @@
       </el-col>
 
       <el-col :span="14">
+        <el-card shadow="never" class="panel-card real-horizon-panel">
+          <template #header>
+            <div class="card-header">
+              <span>真实预测周期健康</span>
+              <el-tag size="small" type="success" effect="dark">
+                {{ realWorldHorizonHealth.sample_count || 0 }} 个真实到期预测
+              </el-tag>
+            </div>
+          </template>
+          <div class="real-horizon-grid">
+            <div
+              v-for="row in realWorldHorizonRows"
+              :key="row.horizon_days"
+              class="real-horizon-card"
+              :class="row.status"
+            >
+              <div class="real-horizon-head">
+                <b>{{ row.horizon_days }} 日</b>
+                <el-tag :type="healthTagType(row.status)" size="small" effect="dark">{{ row.label }}</el-tag>
+              </div>
+              <div class="real-horizon-score">
+                <span>{{ row.sample_count || 0 }} / {{ row.min_samples || realWorldHorizonHealth.min_samples_per_horizon || 5 }}</span>
+                <small>真实预测样本</small>
+              </div>
+              <div class="real-horizon-metrics">
+                <span>命中 {{ pct(row.success_rate) }}</span>
+                <span>收益 {{ signed(row.avg_return_pct) }}%</span>
+                <span>校准 {{ pct(row.calibration_error) }}</span>
+              </div>
+              <div class="real-horizon-note">{{ realHorizonNote(row) }}</div>
+            </div>
+          </div>
+        </el-card>
+
         <el-card shadow="never" class="panel-card">
           <template #header>
             <div class="card-header">
@@ -400,6 +583,116 @@
       </div>
     </el-card>
 
+    <el-card shadow="never" class="panel-card diagnosis-card">
+      <template #header>
+        <div class="card-header">
+          <span>预测复盘 / 错误归因</span>
+          <div class="table-actions">
+            <el-tag v-if="diagnosticReady" size="small" type="success" effect="dark">
+              最近 {{ diagnostics.sample_count }} 条
+            </el-tag>
+            <el-tag v-if="topErrorType" size="small" :type="errorTypeTag(topErrorType.key)" effect="dark">
+              主要问题：{{ topErrorType.label }}
+            </el-tag>
+          </div>
+        </div>
+      </template>
+      <el-empty v-if="!diagnosticReady" description="暂无可复盘的已验证预测" />
+      <div v-else class="diagnosis-layout">
+        <div class="diagnosis-panel">
+          <div class="diagnosis-title">错误类型分布</div>
+          <div class="error-type-list">
+            <div v-for="item in diagnostics.error_types || []" :key="item.key" class="error-type-row">
+              <div class="error-type-head">
+                <span>{{ item.label }}</span>
+                <b>{{ item.count }} 条</b>
+              </div>
+              <el-progress
+                :percentage="Math.round((item.rate || 0) * 100)"
+                :stroke-width="7"
+                :show-text="false"
+                :color="diagnosisColor(item.key)"
+              />
+              <div class="error-type-meta">
+                <span>占比 {{ pct(item.rate) }}</span>
+                <span>平均收益 {{ signed(item.avg_return_pct) }}%</span>
+                <span>平均概率 {{ fmt(item.avg_probability_pct) }}%</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="diagnosis-panel">
+          <div class="diagnosis-title">模型下一步该学什么</div>
+          <div v-if="!(diagnostics.lessons || []).length" class="muted">暂无稳定结论</div>
+          <div v-for="lesson in diagnostics.lessons || []" :key="lesson.message" class="lesson-item">
+            <span>{{ lesson.message }}</span>
+            <b>{{ lesson.count }}x</b>
+          </div>
+          <div class="diagnosis-subtitle">特征反馈</div>
+          <div class="feature-feedback">
+            <div>
+              <span class="feedback-label">应降权</span>
+              <el-tag
+                v-for="item in diagnostics.feature_feedback?.penalties || []"
+                :key="`penalty-${item.key}`"
+                size="small"
+                type="danger"
+                effect="plain"
+              >
+                {{ item.label }} · {{ item.count }}
+              </el-tag>
+              <span v-if="!(diagnostics.feature_feedback?.penalties || []).length" class="muted">无</span>
+            </div>
+            <div>
+              <span class="feedback-label">可保留/增权</span>
+              <el-tag
+                v-for="item in diagnostics.feature_feedback?.rewards || []"
+                :key="`reward-${item.key}`"
+                size="small"
+                type="success"
+                effect="plain"
+              >
+                {{ item.label }} · {{ item.count }}
+              </el-tag>
+              <span v-if="!(diagnostics.feature_feedback?.rewards || []).length" class="muted">无</span>
+            </div>
+          </div>
+        </div>
+        <div class="diagnosis-panel wide">
+          <div class="diagnosis-title">高置信失败样本</div>
+          <el-table :data="diagnostics.high_confidence_misses || []" size="small" height="260">
+            <el-table-column label="股票" min-width="140">
+              <template #default="{ row }">
+                <div class="stock-cell">
+                  <span class="stock-name">{{ row.name || row.symbol }}</span>
+                  <span class="stock-code">{{ row.symbol }}</span>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="周期" width="70">
+              <template #default="{ row }">{{ row.horizon_days }} 日</template>
+            </el-table-column>
+            <el-table-column label="概率" width="80">
+              <template #default="{ row }">{{ row.probability_pct }}%</template>
+            </el-table-column>
+            <el-table-column label="真实收益" width="95">
+              <template #default="{ row }">
+                <span :class="row.close_return_pct >= 0 ? 'up' : 'down'">{{ signed(row.close_return_pct) }}%</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="归因" min-width="180">
+              <template #default="{ row }">
+                <el-tag :type="errorTypeTag(row.error_type)" size="small" effect="dark">
+                  {{ row.error_type_label }}
+                </el-tag>
+                <div class="diagnosis-cause">{{ row.primary_cause || '--' }}</div>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+      </div>
+    </el-card>
+
     <el-card shadow="never" class="panel-card">
       <template #header>
         <div class="card-header">
@@ -434,18 +727,30 @@
               <el-tag :type="gateTagType(row.summary?.signal_quality_passed)" size="small" effect="dark">
                 Signal {{ gateLabel(row.summary?.signal_quality_passed) }}
               </el-tag>
+              <el-tag :type="gateTagType(row.summary?.real_world_holdout_passed)" size="small" effect="dark">
+                真实H {{ gateLabel(row.summary?.real_world_holdout_passed) }}
+              </el-tag>
+              <el-tag :type="gateTagType(row.summary?.real_world_signal_quality_passed)" size="small" effect="dark">
+                真实S {{ gateLabel(row.summary?.real_world_signal_quality_passed) }}
+              </el-tag>
               <el-tag
-                :type="gateTagType(row.summary?.walk_forward_passed, row.summary?.walk_forward_validation?.ready)"
+                :type="gateTagType(row.summary?.walk_forward_passed, row.summary?.walk_forward_validation)"
                 size="small"
                 effect="dark"
               >
-                WF {{ gateLabel(row.summary?.walk_forward_passed, row.summary?.walk_forward_validation?.ready) }}
+                WF {{ gateLabel(row.summary?.walk_forward_passed, row.summary?.walk_forward_validation) }}
               </el-tag>
             </div>
-            <div v-if="row.summary?.walk_forward_validation?.ready" class="wf-meta">
+            <div v-if="row.summary?.walk_forward_validation" class="wf-meta">
               <span>样本 {{ row.summary.walk_forward_validation.sample_count }}</span>
               <span>日期 {{ row.summary.walk_forward_validation.unique_dates }}</span>
-              <span>折数 {{ row.summary.walk_forward_validation.baseline?.n_folds || 0 }}</span>
+              <span v-if="row.summary.walk_forward_validation.ready">
+                折数 {{ row.summary.walk_forward_validation.baseline?.n_folds || 0 }}
+              </span>
+              <span v-else>
+                需要 {{ row.summary.walk_forward_validation.min_samples || '--' }} 样本 /
+                {{ row.summary.walk_forward_validation.min_unique_dates || '--' }} 日期
+              </span>
             </div>
           </template>
         </el-table-column>
@@ -549,6 +854,17 @@
             <span v-else class="muted">--</span>
           </template>
         </el-table-column>
+        <el-table-column label="复盘归因" min-width="180">
+          <template #default="{ row }">
+            <span v-if="!diagnosisOf(row)" class="muted">待验证后生成</span>
+            <div v-else class="sample-diagnosis">
+              <el-tag :type="errorTypeTag(diagnosisOf(row).error_type)" size="small" effect="dark">
+                {{ diagnosisOf(row).error_type_label || diagnosisOf(row).error_type }}
+              </el-tag>
+              <span>{{ primaryCause(diagnosisOf(row)) }}</span>
+            </div>
+          </template>
+        </el-table-column>
         <el-table-column label="到期" min-width="150">
           <template #default="{ row }">{{ fmtTime(row.due_at) }}</template>
         </el-table-column>
@@ -570,6 +886,7 @@ const validating = ref(false)
 const evolving = ref(false)
 const autoCycling = ref(false)
 const autoScanning = ref(false)
+const backfilling = ref(false)
 const savingConfig = ref(false)
 const error = ref('')
 const summary = ref(null)
@@ -577,9 +894,19 @@ const predictions = ref([])
 const comparison = ref(null)
 const llmUsage = ref(null)
 const evolutionConfig = ref(null)
+const diagnostics = ref(null)
+const backfillLastRun = ref(null)
 const filters = reactive({
   status: '',
   horizon_days: null,
+})
+const backfillForm = reactive({
+  symbols: '',
+  symbol_limit: 10,
+  samples_per_symbol: 6,
+  bars_count: 260,
+  horizon_days: 5,
+  min_gap_days: 5,
 })
 const evolutionForm = reactive({
   validate_interval_seconds: 86400,
@@ -599,6 +926,7 @@ const evolutionForm = reactive({
   auto_scan_target_horizon_days: 0,
   auto_evolve_enabled: true,
   auto_evolve_min_samples: 60,
+  auto_evolve_min_live_samples: 20,
   auto_promote_min_success_rate: 0.52,
   auto_promote_min_avg_return_pct: 0,
   auto_promote_max_brier_score: 0.28,
@@ -619,6 +947,21 @@ const evolutionForm = reactive({
 const activeModel = computed(() => summary.value?.active_model || null)
 const counts = computed(() => summary.value?.counts || {})
 const metrics = computed(() => summary.value?.metrics || {})
+const segmentMap = computed(() => summary.value?.sample_segments || {})
+const sampleSegments = computed(() => [
+  segmentMap.value.live_prediction || { key: 'live_prediction', label: '真实到期预测' },
+  segmentMap.value.historical_replay || { key: 'historical_replay', label: '历史回放' },
+  segmentMap.value.trade_execution || { key: 'trade_execution', label: '真实成交退出' },
+])
+const realWorldHorizonHealth = computed(() => summary.value?.real_world_horizon_health || {})
+const realWorldHorizonRows = computed(() => realWorldHorizonHealth.value?.rows || [])
+const evolutionReadiness = computed(() => summary.value?.readiness || {})
+const walkForwardReadiness = computed(() => evolutionReadiness.value?.walk_forward || {})
+const walkForwardRequiredDates = computed(() => (
+  walkForwardReadiness.value?.required_unique_dates
+  || walkForwardReadiness.value?.min_unique_dates
+  || '--'
+))
 const horizonRows = computed(() => metrics.value?.by_horizon || [])
 const llmSummary = computed(() => llmUsage.value?.summary || {})
 const evolutionEffective = computed(() => evolutionConfig.value?.effective || {})
@@ -626,6 +969,33 @@ const evolutionRuntime = computed(() => evolutionConfig.value?.runtime_override 
 const autoScanLastRun = computed(() => evolutionEffective.value?.auto_scan_last_run || null)
 const validationLastRun = computed(() => evolutionEffective.value?.validation_last_run || null)
 const failureAlertLastEvent = computed(() => evolutionEffective.value?.failure_alert_last_event || null)
+const diagnosticReady = computed(() => Boolean(diagnostics.value?.ready))
+const topErrorType = computed(() => (diagnostics.value?.error_types || [])[0] || null)
+const readinessLabel = computed(() => {
+  if (evolutionReadiness.value?.ready) return 'Ready'
+  return `${evolutionReadiness.value?.evaluated_predictions || 0}/${evolutionReadiness.value?.min_samples || '--'}`
+})
+const readinessHint = computed(() => {
+  if (evolutionReadiness.value?.ready) return '真实样本、总样本与 WF 历史已满足'
+  if (counts.value?.due) return `有 ${counts.value.due} 条到期预测待验证`
+  if (evolutionReadiness.value?.sample_gap) return `还差 ${evolutionReadiness.value.sample_gap} 条已验证样本`
+  if (evolutionReadiness.value?.live_sample_gap) return `还差 ${evolutionReadiness.value.live_sample_gap} 条真实到期预测样本`
+  if (walkForwardReadiness.value?.date_gap) return `WF 还差 ${walkForwardReadiness.value.date_gap} 个日期`
+  return '等待更多扫描样本到期'
+})
+const trainHoldoutHint = computed(() => {
+  if (evolutionReadiness.value?.train_sample_count && evolutionReadiness.value?.holdout_sample_count) {
+    return '训练集和留出集均可用'
+  }
+  return '需要同时具备训练与留出样本'
+})
+const readinessNextAction = computed(() => {
+  if (evolutionReadiness.value?.ready) return '下一步：运行“自动进化检查”，系统会经过质量门控、holdout 和 walk-forward 后才允许晋升。'
+  if (counts.value?.due) return `下一步：点击“验证到期预测”，先关闭 ${counts.value.due} 条已到期样本。`
+  if (evolutionReadiness.value?.live_sample_gap) return '下一步：继续自动采样并等待真实预测到期；历史回放只用于训练，不会单独触发自动晋升。'
+  if (counts.value?.pending) return '下一步：等待 pending 样本到达预测周期；如果想更快校准模型，先用“历史回放训练”生成已验证样本。'
+  return '下一步：点击“自动采样一次”，让 Scanner 先生成可验证预测样本。'
+})
 
 function fmt(v) {
   const n = Number(v)
@@ -665,6 +1035,52 @@ function progressColor(v) {
   return '#67c23a'
 }
 
+function diagnosisColor(key) {
+  if (key === 'none') return '#67c23a'
+  if (key === 'target_too_aggressive' || key === 'weak_signal_quality') return '#e6a23c'
+  return '#f56c6c'
+}
+
+function errorTypeTag(key) {
+  if (key === 'none') return 'success'
+  if (key === 'target_too_aggressive' || key === 'weak_signal_quality' || key === 'timing_horizon_mismatch') return 'warning'
+  return 'danger'
+}
+
+function diagnosisOf(row) {
+  return row?.outcome?.details?.diagnosis || null
+}
+
+function primaryCause(diagnosis) {
+  return (diagnosis?.root_causes || [])[0]?.message || diagnosis?.verdict_label || '--'
+}
+
+function sampleSegmentNote(key, count) {
+  if (!count) {
+    if (key === 'live_prediction') return '还没有真实到期样本，不能判断现实预测能力。'
+    if (key === 'historical_replay') return '可用历史回放先生成训练反馈，但不要当成现实胜率。'
+    return '真实成交退出可验证买入后实际卖出的结果。'
+  }
+  if (key === 'live_prediction') return '最重要的现实检验口径，模型是否可用优先看这里。'
+  if (key === 'historical_replay') return '用于快速校准和发现错误模式，需防止过拟合。'
+  return '反映实际执行后的退出质量，可辅助调整持有/止损规则。'
+}
+
+function healthTagType(status) {
+  if (status === 'healthy') return 'success'
+  if (status === 'watch') return 'warning'
+  if (status === 'risk') return 'danger'
+  return 'info'
+}
+
+function realHorizonNote(row) {
+  if ((row.blockers || []).length) return row.blockers.join('；')
+  if (row.status === 'healthy') return '该周期已有一定真实预测验证，可作为自动进化的重要证据。'
+  if (row.status === 'watch') return '没有明显失效，但样本或校准还不足以大胆放权。'
+  if (row.status === 'risk') return '该周期真实表现偏弱，自动进化应降低信任度。'
+  return '等待真实预测到期，不要用历史回放替代现实验证。'
+}
+
 function runStatusType(status) {
   if (status === 'auto_promoted' || status === 'completed') return 'success'
   if (status === 'auto_rolled_back') return 'danger'
@@ -681,6 +1097,17 @@ function runStatusLabel(status) {
     auto_rolled_back: '自动回滚',
   }
   return labels[status] || status || '--'
+}
+
+function cycleReasonLabel(reason) {
+  const labels = {
+    insufficient_validated_predictions: '已运行自动进化检查，但已验证样本不足，继续采样并等待到期验证。',
+    insufficient_live_predictions: '已运行自动进化检查，但真实到期预测样本不足；历史回放不会单独触发自动晋升。',
+    live_prediction_quality_gate_failed: '真实到期预测样本未通过质量门槛，暂不允许自动晋升。',
+    need_train_and_holdout_samples: '已运行自动进化检查，但训练集和留出集不足，暂不允许晋升。',
+    insufficient_walk_forward_history: 'walk-forward 历史不足，暂不允许自动晋升。',
+  }
+  return labels[reason] || reason || ''
 }
 
 function alertStatusType(status) {
@@ -708,8 +1135,10 @@ function decisionText(row) {
   const gates = []
   if (summary.holdout_passed !== undefined) gates.push(`Holdout ${summary.holdout_passed ? '通过' : '阻断'}`)
   if (summary.signal_quality_passed !== undefined) gates.push(`Signal ${summary.signal_quality_passed ? '通过' : '阻断'}`)
-  if (summary.walk_forward_passed !== undefined) gates.push(`WF ${summary.walk_forward_passed ? '通过' : '阻断'}`)
+  if (summary.real_world_holdout_passed !== undefined) gates.push(`真实Holdout ${summary.real_world_holdout_passed ? '通过' : '阻断'}`)
+  if (summary.real_world_signal_quality_passed !== undefined) gates.push(`真实Signal ${summary.real_world_signal_quality_passed ? '通过' : '阻断'}`)
   const wf = summary.walk_forward_validation || {}
+  if (summary.walk_forward_passed !== undefined) gates.push(`WF ${gateLabel(summary.walk_forward_passed, wf)}`)
   if (wf.ready && wf.candidate && wf.baseline) {
     gates.push(
       `回放 ${signedPctRatio(wf.candidate.oos_total_return_mean)}% / ${signedPctRatio(wf.baseline.oos_total_return_mean)}%`
@@ -722,15 +1151,17 @@ function decisionText(row) {
   return '--'
 }
 
-function gateTagType(value, ready = true) {
-  if (!ready) return 'info'
+function gateTagType(value, validation = null) {
+  if (validation && validation.ready === false && value === false) return 'warning'
+  if (validation && validation.ready === false) return 'info'
   if (value === true) return 'success'
   if (value === false) return 'danger'
   return 'info'
 }
 
-function gateLabel(value, ready = true) {
-  if (!ready) return 'N/A'
+function gateLabel(value, validation = null) {
+  if (validation && validation.ready === false && value === false) return '未就绪阻断'
+  if (validation && validation.ready === false) return '未就绪'
   if (value === true) return '通过'
   if (value === false) return '阻断'
   return '--'
@@ -769,6 +1200,17 @@ async function loadComparison() {
   comparison.value = await api.evolutionCompare()
 }
 
+async function loadDiagnostics() {
+  diagnostics.value = await api.evolutionDiagnostics({ limit: 120 })
+}
+
+function parseSymbols(value) {
+  return String(value || '')
+    .split(/[,\s，、]+/)
+    .map(item => item.trim().toUpperCase())
+    .filter(Boolean)
+}
+
 async function loadUsage() {
   llmUsage.value = await api.llmUsage({ limit: 100 })
 }
@@ -789,7 +1231,14 @@ async function loadAll() {
   loading.value = true
   error.value = ''
   try {
-    await Promise.all([loadSummary(), loadPredictions(), loadComparison(), loadUsage(), loadEvolutionConfig()])
+    await Promise.all([
+      loadSummary(),
+      loadPredictions(),
+      loadComparison(),
+      loadDiagnostics(),
+      loadUsage(),
+      loadEvolutionConfig(),
+    ])
   } catch (e) {
     error.value = `加载模型进化数据失败：${e.message}`
   } finally {
@@ -840,6 +1289,35 @@ async function autoScanOnce() {
     error.value = `自动采样失败：${e.message}`
   } finally {
     autoScanning.value = false
+  }
+}
+
+async function backfillHistory() {
+  backfilling.value = true
+  error.value = ''
+  try {
+    const symbols = parseSymbols(backfillForm.symbols)
+    const ret = await api.evolutionBackfill({
+      symbols: symbols.length ? symbols : null,
+      symbol_limit: backfillForm.symbol_limit,
+      samples_per_symbol: backfillForm.samples_per_symbol,
+      bars_count: backfillForm.bars_count,
+      horizon_days: backfillForm.horizon_days || null,
+      min_gap_days: backfillForm.min_gap_days,
+    })
+    backfillLastRun.value = ret
+    if (ret.ok) {
+      const msg = `历史回放完成：新增 ${ret.created_predictions || 0} 条，验证 ${ret.validated_predictions || 0} 条`
+      if (ret.created_predictions > 0) ElMessage.success(msg)
+      else ElMessage.warning(`${msg}；这些历史日期可能已经回放过`)
+    } else {
+      ElMessage.warning(`历史回放未执行：${ret.reason || '没有可用股票'}`)
+    }
+    await loadAll()
+  } catch (e) {
+    error.value = `历史回放训练失败：${e.message}`
+  } finally {
+    backfilling.value = false
   }
 }
 
@@ -920,12 +1398,28 @@ onMounted(loadAll)
 .hero-card h2 { margin:6px 0; font-size:30px; color:#fff; }
 .hero-card p { color:#a9b4c8; max-width:680px; line-height:1.7; }
 .hero-actions { display:flex; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
-.metric-grid { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:12px; }
+.metric-grid { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:12px; }
 .metric-card { background:#1a1a2e; border:1px solid #2a2a4a; border-radius:14px; padding:16px; }
 .metric-card.active { border-color:#409eff; background:#12223d; }
 .metric-label { color:#909399; font-size:12px; }
 .metric-value { margin-top:8px; color:#fff; font-size:28px; font-weight:900; }
 .metric-sub { margin-top:6px; color:#7e8797; font-size:12px; }
+.segment-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }
+.segment-card {
+  padding:14px;
+  border:1px solid #2a2a4a;
+  border-radius:14px;
+  background:
+    radial-gradient(circle at 0% 0%, rgba(64, 158, 255, .10), transparent 30%),
+    #111827;
+}
+.segment-card.primary { border-color:#67c23a; }
+.segment-title { display:flex; align-items:center; justify-content:space-between; gap:10px; color:#fff; font-weight:900; }
+.segment-stats { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin-top:12px; }
+.segment-stats div { padding:8px; border:1px solid #253046; border-radius:10px; background:rgba(255,255,255,.03); }
+.segment-stats b { display:block; color:#fff; font-family:monospace; font-size:16px; }
+.segment-stats span { display:block; margin-top:4px; color:#909399; font-size:11px; }
+.segment-note { margin-top:10px; color:#909399; font-size:12px; line-height:1.5; }
 .panel-card { border-radius:14px; }
 .card-header { display:flex; justify-content:space-between; align-items:center; gap:12px; font-weight:800; }
 .muted { color:#909399; font-size:12px; }
@@ -933,6 +1427,25 @@ onMounted(loadAll)
 .config-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px 18px; }
 .config-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:8px; }
 .field-hint { color:#909399; font-size:12px; line-height:1.5; margin-top:4px; width:100%; }
+.readiness-panel {
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  margin-top:14px;
+  padding:14px;
+  border:1px solid #2a3a64;
+  border-radius:14px;
+  background:
+    radial-gradient(circle at 8% 20%, rgba(103, 194, 58, .14), transparent 26%),
+    #101827;
+}
+.readiness-title { display:flex; align-items:center; justify-content:space-between; gap:10px; color:#fff; font-weight:900; }
+.readiness-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; }
+.readiness-item { border:1px solid #253046; border-radius:12px; padding:12px; background:rgba(255,255,255,.03); }
+.readiness-item span,
+.readiness-item small { display:block; color:#909399; font-size:12px; line-height:1.5; }
+.readiness-item b { display:block; margin:4px 0; color:#fff; font-size:20px; font-family:monospace; }
+.readiness-action { color:#d7dce7; font-size:13px; line-height:1.6; }
 .auto-scan-status {
   display:flex;
   flex-direction:column;
@@ -946,10 +1459,85 @@ onMounted(loadAll)
 .auto-scan-status > div:first-child { display:flex; align-items:center; gap:8px; }
 .auto-scan-meta { display:flex; gap:12px; flex-wrap:wrap; color:#d7dce7; font-size:12px; }
 .auto-scan-error { color:#f56c6c; font-size:12px; line-height:1.5; }
+.replay-card { overflow:hidden; }
+.replay-form {
+  display:grid;
+  grid-template-columns:minmax(240px,1fr) repeat(4,128px) 150px auto;
+  gap:10px;
+  align-items:center;
+}
+.replay-form :deep(.el-input-number),
+.replay-form :deep(.el-select) {
+  width:100%;
+}
+.replay-hints {
+  display:flex;
+  gap:10px;
+  flex-wrap:wrap;
+  margin-top:10px;
+  color:#909399;
+  font-size:12px;
+}
+.replay-hints span {
+  padding:5px 8px;
+  border:1px solid #253046;
+  border-radius:999px;
+  background:#111827;
+}
+.replay-result {
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  margin-top:12px;
+  padding:12px;
+  border:1px solid #2a3a64;
+  border-radius:12px;
+  background:
+    radial-gradient(circle at 4% 0%, rgba(64, 158, 255, .14), transparent 30%),
+    #111827;
+}
+.replay-result > div:first-child { display:flex; align-items:center; gap:8px; flex-wrap:wrap; color:#d7dce7; font-size:13px; }
+.replay-audit {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+  color:#909399;
+  font-size:12px;
+  line-height:1.5;
+}
+.replay-audit b { color:#d7dce7; }
+.replay-audit span {
+  padding:4px 7px;
+  border:1px solid #253046;
+  border-radius:999px;
+  background:rgba(255,255,255,.03);
+}
 .horizon-list { display:flex; flex-direction:column; gap:16px; }
 .horizon-item { background:#16162a; border:1px solid #2a2a4a; border-radius:12px; padding:14px; }
 .horizon-title { display:flex; justify-content:space-between; color:#fff; font-weight:800; margin-bottom:10px; }
 .horizon-meta { display:flex; justify-content:space-between; gap:8px; margin-top:8px; color:#909399; font-size:12px; }
+.real-horizon-panel { margin-bottom:16px; }
+.real-horizon-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+.real-horizon-card {
+  border:1px solid #253046;
+  border-radius:14px;
+  padding:12px;
+  background:linear-gradient(145deg, rgba(255,255,255,.05), rgba(255,255,255,.02));
+}
+.real-horizon-card.healthy { border-color:rgba(103,194,58,.65); box-shadow:0 0 0 1px rgba(103,194,58,.12) inset; }
+.real-horizon-card.watch { border-color:rgba(230,162,60,.65); }
+.real-horizon-card.risk { border-color:rgba(245,108,108,.7); }
+.real-horizon-card.insufficient { border-color:#2f3b52; opacity:.86; }
+.real-horizon-head { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.real-horizon-head b { color:#fff; font-size:18px; }
+.real-horizon-score { display:flex; align-items:baseline; gap:8px; margin-top:10px; }
+.real-horizon-score span { color:#fff; font-size:22px; font-weight:900; font-family:monospace; }
+.real-horizon-score small,
+.real-horizon-metrics,
+.real-horizon-note { color:#909399; font-size:12px; line-height:1.5; }
+.real-horizon-metrics { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+.real-horizon-note { margin-top:8px; min-height:18px; }
 .table-actions { display:flex; gap:8px; }
 .stock-cell { display:flex; flex-direction:column; gap:2px; }
 .stock-name { color:#fff; font-weight:800; }
@@ -972,6 +1560,61 @@ onMounted(loadAll)
 .compare-stock b { color:#7db7ff; font-family:monospace; }
 .compare-stock.strong b { color:#f56c6c; }
 .compare-stock.muted-stock { opacity:.72; }
+.diagnosis-card { overflow:hidden; }
+.diagnosis-layout { display:grid; grid-template-columns:1fr 1fr 1.4fr; gap:12px; }
+.diagnosis-panel {
+  min-width:0;
+  padding:14px;
+  border:1px solid #2a2a4a;
+  border-radius:14px;
+  background:
+    radial-gradient(circle at 10% 0%, rgba(245, 108, 108, .12), transparent 32%),
+    #111827;
+}
+.diagnosis-panel.wide { padding-bottom:8px; }
+.diagnosis-title { color:#fff; font-weight:900; margin-bottom:12px; }
+.diagnosis-subtitle { color:#d7dce7; font-weight:800; margin:14px 0 8px; font-size:13px; }
+.error-type-list { display:flex; flex-direction:column; gap:12px; }
+.error-type-row { display:flex; flex-direction:column; gap:7px; }
+.error-type-head,
+.error-type-meta {
+  display:flex;
+  justify-content:space-between;
+  gap:8px;
+  color:#d7dce7;
+  font-size:12px;
+}
+.error-type-head b { color:#fff; font-family:monospace; }
+.error-type-meta { color:#909399; flex-wrap:wrap; }
+.lesson-item {
+  display:flex;
+  justify-content:space-between;
+  gap:10px;
+  padding:10px 0;
+  border-bottom:1px solid #253046;
+  color:#d7dce7;
+  font-size:13px;
+  line-height:1.5;
+}
+.lesson-item:last-child { border-bottom:none; }
+.lesson-item b { color:#7db7ff; font-family:monospace; white-space:nowrap; }
+.feature-feedback { display:flex; flex-direction:column; gap:10px; }
+.feature-feedback > div { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+.feedback-label { color:#909399; font-size:12px; min-width:74px; }
+.diagnosis-cause {
+  margin-top:5px;
+  color:#909399;
+  font-size:12px;
+  line-height:1.4;
+}
+.sample-diagnosis {
+  display:flex;
+  flex-direction:column;
+  gap:5px;
+  color:#909399;
+  font-size:12px;
+  line-height:1.35;
+}
 .gate-tags { display:flex; flex-wrap:wrap; gap:6px; }
 .wf-meta,
 .wf-detail {
@@ -990,8 +1633,17 @@ onMounted(loadAll)
   .hero-card { flex-direction:column; }
   .hero-actions { justify-content:flex-start; }
   .metric-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .segment-grid { grid-template-columns:1fr; }
   .config-grid { grid-template-columns:1fr; }
+  .readiness-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .replay-form { grid-template-columns:1fr 1fr; }
   .compare-stats { grid-template-columns:repeat(2,minmax(0,1fr)); }
   .compare-columns { grid-template-columns:1fr; }
+  .diagnosis-layout { grid-template-columns:1fr; }
+}
+
+@media (max-width: 720px) {
+  .readiness-grid { grid-template-columns:1fr; }
+  .replay-form { grid-template-columns:1fr; }
 }
 </style>

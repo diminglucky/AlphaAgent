@@ -2,6 +2,50 @@
   <div class="settings-page">
     <h2>系统设置</h2>
 
+    <div class="settings-card readiness-card">
+      <div class="card-header">
+        <span class="card-title">🧭 可用性检查</span>
+        <el-tag :type="readinessStatusType" size="small" effect="dark">
+          {{ readinessStatusLabel }}
+        </el-tag>
+      </div>
+      <div class="readiness-summary">
+        <div class="readiness-tile">
+          <span>本地 / 模拟盘</span>
+          <b :class="readiness?.local_ready ? 'text-ok' : 'text-fail'">
+            {{ readiness ? (readiness.local_ready ? '可用' : '阻断') : '检查中' }}
+          </b>
+        </div>
+        <div class="readiness-tile">
+          <span>QMT 实盘</span>
+          <b :class="readiness?.live_trading_ready ? 'text-ok' : 'text-fail'">
+            {{ readiness ? (readiness.live_trading_ready ? '可用' : '不可用') : '检查中' }}
+          </b>
+        </div>
+        <div class="readiness-tile wide">
+          <span>下一步</span>
+          <b>{{ readiness?.summary?.next_action || '加载中...' }}</b>
+        </div>
+      </div>
+      <div v-if="readinessChecks.length" class="readiness-checks">
+        <div
+          v-for="item in readinessChecks"
+          :key="item.id"
+          class="readiness-check"
+          :class="`readiness-${item.status}`"
+        >
+          <div class="rc-top">
+            <span>{{ item.label }}</span>
+            <el-tag size="small" :type="checkTagType(item.status)">
+              {{ checkLabel(item.status) }}
+            </el-tag>
+          </div>
+          <div class="rc-message">{{ item.message }}</div>
+          <div v-if="item.next_action" class="rc-action">下一步：{{ item.next_action }}</div>
+        </div>
+      </div>
+    </div>
+
     <div class="settings-card">
       <div class="card-header">
         <span class="card-title">🔐 API 鉴权</span>
@@ -244,6 +288,12 @@
           <el-tag type="info" size="small">{{ health.market_provider }}</el-tag>
         </div>
         <div class="status-item">
+          <div class="si-label">API 鉴权</div>
+          <el-tag :type="authStatusType" size="small">
+            {{ authStatusLabel }}
+          </el-tag>
+        </div>
+        <div class="status-item">
           <div class="si-label">WebSocket</div>
           <el-tag :type="wsStatus.loop_running ? 'success' : 'danger'" size="small">
             {{ wsStatus.loop_running ? '运行中' : '未启动' }}
@@ -281,7 +331,14 @@ import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import { api, getApiKey, setApiKey } from '../api.js'
 
-const health = ref({ llm_configured: false, feishu_configured: false, market_provider: 'akshare' })
+const health = ref({
+  llm_configured: false,
+  feishu_configured: false,
+  market_provider: 'akshare',
+  auth_enabled: false,
+  auth_configured: true,
+})
+const readiness = ref(null)
 const wsStatus = ref({ loop_running: false, quotes_clients: 0, alerts_clients: 0 })
 const llmStatus = ref({})
 const presets = ref({})
@@ -307,6 +364,27 @@ const llmForm = ref({
 })
 
 const currentPreset = computed(() => presets.value[llmForm.value.provider] || null)
+const authStatusType = computed(() => {
+  if (!health.value.auth_enabled) return 'warning'
+  return health.value.auth_configured ? 'success' : 'danger'
+})
+const authStatusLabel = computed(() => {
+  if (!health.value.auth_enabled) return '本地关闭'
+  return health.value.auth_configured ? '已开启' : '缺少 Key'
+})
+const readinessChecks = computed(() => readiness.value?.checks || [])
+const readinessStatusType = computed(() => {
+  if (!readiness.value) return 'info'
+  if (readiness.value.live_trading_ready) return 'success'
+  if (readiness.value.local_ready) return 'warning'
+  return 'danger'
+})
+const readinessStatusLabel = computed(() => {
+  if (!readiness.value) return '检查中'
+  if (readiness.value.live_trading_ready) return '实盘可用'
+  if (readiness.value.local_ready) return '仅本地可用'
+  return '存在阻断'
+})
 
 function saveApiKey() {
   setApiKey(apiKeyInput.value)
@@ -342,20 +420,30 @@ function applyPreset(key) {
 
 async function loadStatus() {
   try {
-    const [h, ws, llm, notifyCfg] = await Promise.all([
+    const [h, r] = await Promise.all([
       api.health(),
+      api.readiness().catch(() => null),
+    ])
+    health.value = h
+    readiness.value = r
+    const [wsResult, llmResult, notifyResult] = await Promise.allSettled([
       api.wsStatus(),
       api.llmConfig(),
       api.notifyConfig(),
     ])
-    health.value = h
-    wsStatus.value = ws
-    llmStatus.value = llm.effective || {}
-    presets.value = llm.presets || {}
-    feishuConfig.value = notifyCfg.feishu || {}
+    if (wsResult.status === 'fulfilled') wsStatus.value = wsResult.value
+
+    const llm = llmResult.status === 'fulfilled' ? llmResult.value : null
+    if (llm) {
+      llmStatus.value = llm.effective || {}
+      presets.value = llm.presets || {}
+    }
+
+    const notifyCfg = notifyResult.status === 'fulfilled' ? notifyResult.value : null
+    if (notifyCfg) feishuConfig.value = notifyCfg.feishu || {}
 
     // 用当前生效配置填充表单（api_key 不回填，保持空）
-    const eff = llm.effective || {}
+    const eff = llm?.effective || {}
     if (eff.provider) llmForm.value.provider = eff.provider
     if (eff.base_url) llmForm.value.base_url = eff.base_url
     if (eff.model) llmForm.value.model = eff.model
@@ -365,6 +453,18 @@ async function loadStatus() {
   } catch (e) {
     console.error(e)
   }
+}
+
+function checkTagType(status) {
+  if (status === 'pass') return 'success'
+  if (status === 'warn') return 'warning'
+  return 'danger'
+}
+
+function checkLabel(status) {
+  if (status === 'pass') return '通过'
+  if (status === 'warn') return '注意'
+  return '阻断'
 }
 
 async function saveLLMConfig() {
@@ -499,6 +599,80 @@ onMounted(loadStatus)
   border: 1px solid #2a2a4a;
   border-radius: 10px;
   padding: 20px 24px;
+}
+
+.readiness-card {
+  border-color: rgba(64, 158, 255, 0.28);
+  background:
+    radial-gradient(circle at top right, rgba(64, 158, 255, 0.14), transparent 32%),
+    #1a1a2e;
+}
+
+.readiness-summary {
+  display: grid;
+  grid-template-columns: 150px 150px 1fr;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.readiness-tile {
+  background: #16162a;
+  border: 1px solid #2a2a4a;
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.readiness-tile span {
+  display: block;
+  color: #909399;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.readiness-tile b {
+  display: block;
+  color: #d7dce7;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.readiness-checks {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.readiness-check {
+  border: 1px solid #2a2a4a;
+  border-radius: 8px;
+  padding: 12px;
+  background: #141426;
+}
+
+.readiness-pass { border-color: rgba(103, 194, 58, 0.35); }
+.readiness-warn { border-color: rgba(230, 162, 60, 0.42); }
+.readiness-fail { border-color: rgba(245, 108, 108, 0.48); }
+
+.rc-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  color: #e0e0e0;
+  font-weight: 600;
+}
+
+.rc-message,
+.rc-action {
+  color: #c0c4cc;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.rc-action {
+  color: #f3d19e;
+  margin-top: 6px;
 }
 
 .card-header {
@@ -672,4 +846,9 @@ onMounted(loadStatus)
 
 .text-ok { color: #67c23a; }
 .text-fail { color: #f56c6c; }
+
+@media (max-width: 900px) {
+  .readiness-summary { grid-template-columns: 1fr; }
+  .readiness-checks { grid-template-columns: 1fr; }
+}
 </style>

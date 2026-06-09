@@ -19,7 +19,10 @@ http.interceptors.request.use(config => {
 http.interceptors.response.use(
   res => res.data,
   err => {
-    const msg = err.response?.data?.detail || err.message || '请求失败'
+    const detail = err.response?.data?.detail
+    const msg = typeof detail === 'string'
+      ? detail
+      : detail?.message || detail?.code || err.message || '请求失败'
     return Promise.reject(new Error(msg))
   }
 )
@@ -80,6 +83,7 @@ export const api = {
 
   // 系统
   health: () => http.get('/health'),
+  readiness: () => http.get('/health/readiness'),
   wsStatus: () => http.get('/ws/status'),
   notifyStatus: () => http.get('/notify/status'),
   notifyConfig: () => http.get('/notify/config'),
@@ -107,6 +111,7 @@ export const api = {
   // 模型进化
   evolutionSummary: () => http.get('/evolution/summary'),
   evolutionPredictions: (params = {}) => http.get('/evolution/predictions', { params }),
+  evolutionDiagnostics: (params = {}) => http.get('/evolution/diagnostics', { params }),
   evolutionModels: () => http.get('/evolution/models'),
   evolutionScanRuns: (params = {}) => http.get('/evolution/scan-runs', { params }),
   evolutionCompare: (params = {}) => http.get('/evolution/compare', { params }),
@@ -114,6 +119,7 @@ export const api = {
   evolutionEvolve: (data = {}) => http.post('/evolution/evolve', data),
   evolutionAutoCycle: () => http.post('/evolution/auto-cycle'),
   evolutionAutoScan: () => http.post('/evolution/auto-scan', null, { timeout: 600000 }),
+  evolutionBackfill: (data = {}) => http.post('/evolution/backfill', data, { timeout: 600000 }),
   evolutionConfig: () => http.get('/evolution/config'),
   evolutionConfigSet: (data = {}) => http.post('/evolution/config', data),
   evolutionConfigReset: () => http.delete('/evolution/config'),

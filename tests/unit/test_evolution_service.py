@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -69,6 +70,24 @@ def _scan_output(stocks: list[dict] | None = None) -> dict:
     }
 
 
+def _historical_bars(count: int = 90, *, start_price: float = 100.0) -> list[dict]:
+    start = datetime(2024, 1, 1)
+    rows = []
+    price = start_price
+    for i in range(count):
+        price += 0.18 if i % 9 != 0 else -0.7
+        rows.append({
+            "date": (start + timedelta(days=i)).date().isoformat(),
+            "open": round(price - 0.2, 2),
+            "high": round(price + 1.6, 2),
+            "low": round(price - 1.2, 2),
+            "close": round(price, 2),
+            "volume": 100000 + i * 1000,
+            "change_pct": 0.2,
+        })
+    return rows
+
+
 def _seed_validated_model_samples(
     db_session,
     model: ModelVersionORM,
@@ -79,6 +98,7 @@ def _seed_validated_model_samples(
     failure_probability: float = 0.25,
     success_return: float = 3.0,
     failure_return: float = -1.0,
+    sample_source: str = "live_prediction",
 ) -> None:
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     total = successes + failures
@@ -107,7 +127,7 @@ def _seed_validated_model_samples(
                 "ai": 0.7 if success else 0.3,
             },
             trade_plan={},
-            raw_result={},
+            raw_result={"source": sample_source} if sample_source != "live_prediction" else {},
             status="validated",
             predicted_at=now,
             due_at=now,
@@ -132,7 +152,7 @@ def _seed_validated_model_samples(
             hit_target=success,
             hit_stop=not success,
             bars_checked=5,
-            details={},
+            details={"source": sample_source} if sample_source != "live_prediction" else {},
             validated_at=now,
         ))
     db_session.flush()
@@ -296,6 +316,409 @@ def test_validate_predictions_marks_success(monkeypatch, db_session) -> None:
     assert outcome.success is True
     assert outcome.hit_target is True
     assert outcome.close_return_pct > 0
+    diagnosis = (outcome.details or {}).get("diagnosis") or {}
+    assert diagnosis["verdict"] == "hit_target"
+    assert diagnosis["error_type"] == "none"
+    assert diagnosis["model_feedback"]["feature_rewards"]
+
+
+def test_validate_predictions_records_failure_diagnosis(monkeypatch, db_session) -> None:
+    evolution_service.record_scan_result(_scan_output(), db=db_session)
+    pred = db_session.query(StockPredictionORM).filter(StockPredictionORM.horizon_days == 3).first()
+    pred.predicted_at = datetime(2024, 1, 1)
+    pred.due_at = datetime(2024, 1, 4)
+    pred.probability = 0.82
+    pred.expected_return_pct = 4.5
+    pred.features = {
+        **(pred.features or {}),
+        "technical": 0.9,
+        "flow": 0.85,
+        "ai": 0.9,
+        "reduction_risk": 0.7,
+        "risk": 0.35,
+    }
+    db_session.flush()
+
+    def fake_kline(symbol: str, period: str = "daily", count: int = 120):
+        assert symbol == "300750.SZ"
+        return [
+            {"date": "2024-01-02", "open": 100, "high": 100.5, "low": 96, "close": 97.0},
+            {"date": "2024-01-03", "open": 97, "high": 98.0, "low": 92, "close": 93.0},
+            {"date": "2024-01-04", "open": 93, "high": 94.0, "low": 90, "close": 91.0},
+        ]
+
+    monkeypatch.setattr(evolution_service.market_service, "get_kline", fake_kline)
+
+    result = evolution_service.validate_predictions(horizon_days=3, force=True, db=db_session)
+
+    assert result["validated"] == 1
+    outcome = db_session.query(PredictionOutcomeORM).filter_by(prediction_id=pred.id).one()
+    diagnosis = (outcome.details or {}).get("diagnosis") or {}
+    assert diagnosis["error_type"] == "stop_loss_hit"
+    assert diagnosis["verdict"] == "stopped_out"
+    assert diagnosis["root_causes"]
+    assert diagnosis["model_feedback"]["feature_penalties"]
+
+
+def test_get_diagnostics_aggregates_recent_postmortems(db_session) -> None:
+    model = evolution_service.ensure_active_model(db_session)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    samples = [
+        ("300001.SZ", 0.78, -4.0, False, "overconfident_false_positive"),
+        ("300002.SZ", 0.62, 1.2, False, "target_too_aggressive"),
+        ("300003.SZ", 0.72, 4.0, True, "none"),
+    ]
+    for idx, (symbol, probability, ret, success, error_type) in enumerate(samples):
+        pred = StockPredictionORM(
+            scan_run_id=None,
+            model_version_id=model.id,
+            symbol=symbol,
+            name=f"诊断样本{idx}",
+            rank=idx + 1,
+            action="BUY",
+            horizon_days=5,
+            target_return_pct=3.0,
+            stop_loss_pct=8.0,
+            probability=probability,
+            expected_return_pct=2.5,
+            confidence=70,
+            score=80,
+            price_at_prediction=100.0,
+            features={
+                "technical": 0.8,
+                "flow": 0.75,
+                "ai": 0.8,
+                "risk": 0.5,
+                "reduction_risk": 0.6,
+            },
+            trade_plan={},
+            raw_result={},
+            status="validated",
+            predicted_at=now - timedelta(days=10 + idx),
+            due_at=now - timedelta(days=5 + idx),
+            validated_at=now - timedelta(days=idx),
+        )
+        db_session.add(pred)
+        db_session.flush()
+        outcome = PredictionOutcomeORM(
+            prediction_id=pred.id,
+            model_version_id=model.id,
+            symbol=symbol,
+            horizon_days=5,
+            start_price=100,
+            end_price=100 + ret,
+            max_price=105 if success else 101,
+            min_price=99 if success else 94,
+            close_return_pct=ret,
+            max_return_pct=5 if success else 1,
+            max_drawdown_pct=-1 if success else -6,
+            success=success,
+            hit_target=success,
+            hit_stop=False,
+            bars_checked=5,
+            details={
+                "diagnosis": {
+                    "verdict": "hit_target" if success else "false_positive",
+                    "verdict_label": "达到目标" if success else "上涨判断失败",
+                    "error_type": error_type,
+                    "error_type_label": evolution_service.ERROR_TYPE_LABELS.get(error_type, error_type),
+                    "root_causes": [{"factor": "misleading_positive_factors", "severity": 0.8, "message": "正向因子误导"}],
+                    "lessons": ["降低类似高置信失败样本的概率输出。"],
+                    "recommended_adjustments": [{"action": "lower_confidence_for_pattern", "message": "降低置信度"}],
+                    "model_feedback": {
+                        "feature_penalties": [{"key": "technical", "label": "技术形态"}] if not success else [],
+                        "feature_rewards": [{"key": "flow", "label": "资金流"}] if success else [],
+                    },
+                }
+            },
+            validated_at=now - timedelta(days=idx),
+        )
+        db_session.add(outcome)
+    db_session.flush()
+
+    report = evolution_service.get_diagnostics(limit=20, db=db_session)
+
+    assert report["ready"] is True
+    assert report["sample_count"] == 3
+    assert {row["key"] for row in report["error_types"]} >= {"overconfident_false_positive", "target_too_aggressive", "none"}
+    assert report["high_confidence_misses"][0]["symbol"] == "300001.SZ"
+    assert report["feature_feedback"]["penalties"][0]["key"] == "technical"
+    assert report["recommended_actions"][0]["action"] == "lower_confidence_for_pattern"
+
+
+def test_adjust_weights_uses_diagnostics_when_only_failures(db_session) -> None:
+    model = evolution_service.ensure_active_model(db_session)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    pairs = []
+    for i in range(4):
+        pred = StockPredictionORM(
+            scan_run_id=None,
+            model_version_id=model.id,
+            symbol=f"30010{i}.SZ",
+            name=f"失败样本{i}",
+            rank=i + 1,
+            action="BUY",
+            horizon_days=5,
+            target_return_pct=3.0,
+            stop_loss_pct=8.0,
+            probability=0.78,
+            expected_return_pct=2.5,
+            confidence=80,
+            score=85,
+            price_at_prediction=100.0,
+            features={"technical": 0.9, "flow": 0.8, "risk": 0.4, "reduction_risk": 0.8},
+            trade_plan={},
+            raw_result={},
+            status="validated",
+            predicted_at=now,
+            due_at=now,
+            validated_at=now,
+        )
+        db_session.add(pred)
+        db_session.flush()
+        out = PredictionOutcomeORM(
+            prediction_id=pred.id,
+            model_version_id=model.id,
+            symbol=pred.symbol,
+            horizon_days=5,
+            start_price=100,
+            end_price=95,
+            max_price=101,
+            min_price=94,
+            close_return_pct=-5,
+            max_return_pct=1,
+            max_drawdown_pct=-6,
+            success=False,
+            hit_target=False,
+            hit_stop=False,
+            bars_checked=5,
+            details={
+                "diagnosis": {
+                    "model_feedback": {
+                        "horizon_bias_delta": -0.01,
+                        "feature_penalties": [{"key": "technical", "label": "技术形态"}],
+                        "feature_rewards": [],
+                    }
+                }
+            },
+            validated_at=now,
+        )
+        db_session.add(out)
+        pairs.append((pred, out))
+    db_session.flush()
+
+    adjusted = evolution_service._adjust_weights(model.config, pairs)
+
+    assert adjusted["weights"]["technical"] < model.config["weights"]["technical"]
+    assert adjusted["horizon_bias"]["5"] < 0
+    assert adjusted["last_diagnostic_feedback"]["feature_penalties"]["technical"] == 4
+
+
+def test_backfill_historical_predictions_creates_validated_samples(monkeypatch, db_session) -> None:
+    bars_by_symbol = {
+        "300750.SZ": _historical_bars(100, start_price=100.0),
+        "000001.SZ": _historical_bars(100, start_price=12.0),
+    }
+
+    def fake_kline(symbol: str, period: str = "daily", count: int = 120):
+        return bars_by_symbol[symbol]
+
+    monkeypatch.setattr(evolution_service.market_service, "get_kline", fake_kline)
+    monkeypatch.setattr(
+        evolution_service.market_service,
+        "get_single_quote",
+        lambda symbol: {"symbol": symbol, "name": f"{symbol}名称"},
+    )
+
+    result = evolution_service.backfill_historical_predictions(
+        symbols=["300750.SZ", "000001.SZ"],
+        bars_count=100,
+        samples_per_symbol=2,
+        horizon_days=5,
+        db=db_session,
+    )
+
+    assert result["ok"] is True
+    assert result["created_predictions"] == 4
+    assert result["validated_predictions"] == 4
+    assert result["audit"]["anti_leakage"]["uses_future_features"] is False
+    assert result["audit"]["anti_leakage"]["effective_min_gap_days"] == 5
+    assert result["diagnostics"]["ready"] is True
+    assert db_session.query(StockPredictionORM).filter(StockPredictionORM.status == "validated").count() == 4
+    outcomes = db_session.query(PredictionOutcomeORM).all()
+    assert len(outcomes) == 4
+    assert all((out.details or {}).get("source") == "historical_replay" for out in outcomes)
+    assert all((out.details or {}).get("effective_min_gap_days") == 5 for out in outcomes)
+    assert all((out.details or {}).get("diagnosis") for out in outcomes)
+
+
+def test_backfill_historical_predictions_is_idempotent(monkeypatch, db_session) -> None:
+    bars = _historical_bars(90, start_price=100.0)
+    monkeypatch.setattr(evolution_service.market_service, "get_kline", lambda *args, **kwargs: bars)
+    monkeypatch.setattr(
+        evolution_service.market_service,
+        "get_single_quote",
+        lambda symbol: {"symbol": symbol, "name": "宁德时代"},
+    )
+
+    first = evolution_service.backfill_historical_predictions(
+        symbols=["300750.SZ"],
+        bars_count=90,
+        samples_per_symbol=3,
+        horizon_days=5,
+        db=db_session,
+    )
+    second = evolution_service.backfill_historical_predictions(
+        symbols=["300750.SZ"],
+        bars_count=90,
+        samples_per_symbol=3,
+        horizon_days=5,
+        db=db_session,
+    )
+
+    assert first["validated_predictions"] == 3
+    assert second["validated_predictions"] == 0
+    assert db_session.query(StockPredictionORM).count() == 3
+    assert db_session.query(PredictionOutcomeORM).count() == 3
+
+
+def test_backfill_historical_predictions_expands_gap_to_horizon(monkeypatch, db_session) -> None:
+    bars = _historical_bars(180, start_price=100.0)
+    monkeypatch.setattr(evolution_service.market_service, "get_kline", lambda *args, **kwargs: bars)
+    monkeypatch.setattr(
+        evolution_service.market_service,
+        "get_single_quote",
+        lambda symbol: {"symbol": symbol, "name": "宁德时代"},
+    )
+
+    result = evolution_service.backfill_historical_predictions(
+        symbols=["300750.SZ"],
+        bars_count=180,
+        samples_per_symbol=3,
+        horizon_days=20,
+        min_gap_days=3,
+        db=db_session,
+    )
+
+    assert result["ok"] is True
+    assert result["created_predictions"] == 3
+    anti_leakage = result["audit"]["anti_leakage"]
+    assert anti_leakage["requested_min_gap_days"] == 3
+    assert anti_leakage["effective_min_gap_days"] == 20
+    assert anti_leakage["max_horizon_days"] == 20
+    predictions = (
+        db_session.query(StockPredictionORM)
+        .order_by(StockPredictionORM.predicted_at.asc())
+        .all()
+    )
+    gaps = [
+        (right.predicted_at.date() - left.predicted_at.date()).days
+        for left, right in zip(predictions, predictions[1:])
+    ]
+    assert gaps
+    assert min(gaps) >= 20
+    outcomes = db_session.query(PredictionOutcomeORM).all()
+    assert all((out.details or {}).get("effective_min_gap_days") == 20 for out in outcomes)
+
+
+def test_backfill_historical_predictions_rejects_unsupported_horizon(monkeypatch, db_session) -> None:
+    monkeypatch.setattr(evolution_service.market_service, "get_kline", lambda *args, **kwargs: _historical_bars(120))
+
+    result = evolution_service.backfill_historical_predictions(
+        symbols=["300750.SZ"],
+        bars_count=120,
+        samples_per_symbol=2,
+        horizon_days=7,
+        db=db_session,
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "unsupported_horizon"
+    assert result["supported_horizons"] == [3, 5, 10, 20]
+    assert db_session.query(StockPredictionORM).count() == 0
+    assert db_session.query(PredictionOutcomeORM).count() == 0
+
+
+def test_summary_segments_real_predictions_from_replay_and_execution(db_session) -> None:
+    model = evolution_service.ensure_active_model(db_session)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    samples = [
+        ("300001.SZ", "live_prediction", {}, {}, True, 4.0, 5),
+        ("300004.SZ", "live_prediction", {}, {}, False, -1.0, 10),
+        ("300002.SZ", "historical_replay", {"source": "historical_replay"}, {"source": "historical_replay"}, False, -2.0),
+        ("300003.SZ", "trade_execution", {"source": "trade_fill"}, {"source": "trade_exit"}, True, 1.5),
+    ]
+    for idx, sample in enumerate(samples):
+        symbol, _segment, raw_result, details, success, ret, *maybe_horizon = sample
+        horizon = maybe_horizon[0] if maybe_horizon else 5
+        pred = StockPredictionORM(
+            scan_run_id=None,
+            model_version_id=model.id,
+            symbol=symbol,
+            name=f"分层样本{idx}",
+            rank=idx + 1,
+            action="BUY",
+            horizon_days=horizon,
+            target_return_pct=3.0,
+            stop_loss_pct=8.0,
+            probability=0.7,
+            expected_return_pct=2.0,
+            confidence=70,
+            score=80,
+            price_at_prediction=100.0,
+            features={},
+            trade_plan={},
+            raw_result=raw_result,
+            status="validated",
+            predicted_at=now - timedelta(days=10 + idx),
+            due_at=now - timedelta(days=horizon + idx),
+            validated_at=now - timedelta(days=idx),
+        )
+        db_session.add(pred)
+        db_session.flush()
+        db_session.add(PredictionOutcomeORM(
+            prediction_id=pred.id,
+            model_version_id=model.id,
+            symbol=symbol,
+            horizon_days=horizon,
+            start_price=100,
+            end_price=100 + ret,
+            max_price=105 if success else 101,
+            min_price=99 if success else 94,
+            close_return_pct=ret,
+            max_return_pct=5 if success else 1,
+            max_drawdown_pct=-1 if success else -6,
+            success=success,
+            hit_target=success,
+            hit_stop=False,
+            bars_checked=horizon,
+            details=details,
+            validated_at=now - timedelta(days=idx),
+        ))
+    db_session.flush()
+
+    summary = evolution_service.get_summary(db=db_session)
+
+    segments = summary["sample_segments"]
+    assert summary["metrics"]["sample_count"] == 4
+    assert summary["real_world_horizon_health"]["source"] == "live_prediction"
+    assert summary["real_world_horizon_health"]["sample_count"] == 2
+    health_by_horizon = {
+        int(row["horizon_days"]): row
+        for row in summary["real_world_horizon_health"]["rows"]
+    }
+    assert health_by_horizon[5]["sample_count"] == 1
+    assert health_by_horizon[5]["success_rate"] == 1.0
+    assert health_by_horizon[10]["sample_count"] == 1
+    assert health_by_horizon[10]["success_rate"] == 0.0
+    assert health_by_horizon[3]["sample_count"] == 0
+    assert health_by_horizon[20]["sample_count"] == 0
+    assert segments["live_prediction"]["sample_count"] == 2
+    assert segments["live_prediction"]["success_rate"] == 0.5
+    assert segments["historical_replay"]["sample_count"] == 1
+    assert segments["historical_replay"]["success_rate"] == 0.0
+    assert segments["trade_execution"]["sample_count"] == 1
+    assert segments["trade_execution"]["success_rate"] == 1.0
 
 
 def test_evolve_model_can_promote_candidate(db_session) -> None:
@@ -754,6 +1177,7 @@ def test_record_trade_fills_settles_execution_predictions_fifo_by_buy_fill_group
 
 def test_auto_evolve_cycle_blocks_when_quality_gate_fails(monkeypatch, db_session) -> None:
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_SAMPLES", "4")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_LIVE_SAMPLES", "4")
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_SUCCESS_RATE", "0.80")
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_AVG_RETURN_PCT", "0")
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MAX_BRIER_SCORE", "0.30")
@@ -774,8 +1198,110 @@ def test_auto_evolve_cycle_blocks_when_quality_gate_fails(monkeypatch, db_sessio
     assert run.promoted is False
 
 
-def test_auto_evolve_cycle_promotes_when_quality_gate_passes(monkeypatch, db_session) -> None:
+def test_auto_evolve_cycle_records_insufficient_data_readiness(monkeypatch, db_session) -> None:
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_SAMPLES", "10")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_LIVE_SAMPLES", "1")
+    from apps.api.app.core import config as config_mod
+    config_mod.reset_settings_cache()
+    model = evolution_service.ensure_active_model(db_session)
+    _seed_validated_model_samples(db_session, model, successes=2, failures=1)
+
+    result = evolution_service.auto_evolve_cycle(db=db_session)
+
+    assert result["status"] == "insufficient_data"
+    assert result["reason"] == "insufficient_validated_predictions"
+    assert result["readiness"]["sample_gap"] == 7
+    assert result["readiness"]["walk_forward"]["sample_gap"] > 0
+    assert result["readiness"]["walk_forward"]["required_unique_dates"] >= 12
+    assert result["readiness"]["walk_forward"]["date_gap"] > 0
+    run = db_session.query(EvolutionRunORM).order_by(EvolutionRunORM.id.desc()).one()
+    assert run.status == "insufficient_data"
+    assert run.promoted is False
+    assert run.evaluated_predictions == 3
+    assert run.summary["readiness"]["sample_gap"] == 7
+    assert run.summary["reason"] == "insufficient_validated_predictions"
+
+
+def test_auto_evolve_cycle_blocks_when_only_historical_replay_samples(monkeypatch, db_session) -> None:
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_SAMPLES", "4")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_LIVE_SAMPLES", "3")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_SUCCESS_RATE", "0.45")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_AVG_RETURN_PCT", "0")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MAX_BRIER_SCORE", "0.30")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MAX_CALIBRATION_ERROR", "0.30")
+    from apps.api.app.core import config as config_mod
+    config_mod.reset_settings_cache()
+    model = evolution_service.ensure_active_model(db_session)
+    _seed_validated_model_samples(
+        db_session,
+        model,
+        successes=8,
+        failures=0,
+        sample_source="historical_replay",
+    )
+
+    result = evolution_service.auto_evolve_cycle(db=db_session)
+
+    assert result["status"] == "insufficient_data"
+    assert result["reason"] == "insufficient_live_predictions"
+    assert result["readiness"]["live_sample_count"] == 0
+    assert result["readiness"]["min_live_samples"] == 3
+    assert result["readiness"]["live_sample_gap"] == 3
+    assert result["sample_segments"]["historical_replay"]["sample_count"] == 8
+    assert result["sample_segments"]["live_prediction"]["sample_count"] == 0
+    assert db_session.query(ModelVersionORM).filter(ModelVersionORM.status == "candidate").count() == 0
+    run = db_session.query(EvolutionRunORM).order_by(EvolutionRunORM.id.desc()).one()
+    assert run.status == "insufficient_data"
+    assert run.summary["reason"] == "insufficient_live_predictions"
+    assert run.summary["readiness"]["blockers"] == [
+        "insufficient_live_predictions",
+        "insufficient_walk_forward_history",
+    ]
+
+
+def test_auto_evolve_cycle_blocks_when_live_quality_fails_even_if_total_passes(monkeypatch, db_session) -> None:
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_SAMPLES", "8")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_LIVE_SAMPLES", "4")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_SUCCESS_RATE", "0.50")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_AVG_RETURN_PCT", "0")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MAX_BRIER_SCORE", "0.50")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MAX_CALIBRATION_ERROR", "0.50")
+    from apps.api.app.core import config as config_mod
+    config_mod.reset_settings_cache()
+    model = evolution_service.ensure_active_model(db_session)
+    _seed_validated_model_samples(
+        db_session,
+        model,
+        successes=8,
+        failures=0,
+        success_probability=0.85,
+        success_return=4.0,
+        sample_source="historical_replay",
+    )
+    _seed_validated_model_samples(
+        db_session,
+        model,
+        successes=0,
+        failures=4,
+        failure_probability=0.85,
+        failure_return=-4.0,
+        sample_source="live_prediction",
+    )
+
+    result = evolution_service.auto_evolve_cycle(db=db_session)
+
+    assert result["status"] == "auto_blocked"
+    assert result["reason"] == "live_prediction_quality_gate_failed"
+    assert result["readiness"]["live_sample_gap"] == 0
+    assert result["metrics"]["success_rate"] > 0.5
+    assert result["live_metrics"]["success_rate"] == 0
+    assert any(reason.startswith("live_prediction success_rate") for reason in result["reasons"])
+    assert db_session.query(ModelVersionORM).filter(ModelVersionORM.status == "candidate").count() == 0
+
+
+def test_auto_evolve_cycle_blocks_when_walk_forward_not_ready(monkeypatch, db_session) -> None:
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_SAMPLES", "4")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_LIVE_SAMPLES", "4")
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_SUCCESS_RATE", "0.70")
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_AVG_RETURN_PCT", "0")
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MAX_BRIER_SCORE", "0.20")
@@ -784,21 +1310,55 @@ def test_auto_evolve_cycle_promotes_when_quality_gate_passes(monkeypatch, db_ses
     config_mod.reset_settings_cache()
     model = evolution_service.ensure_active_model(db_session)
     _seed_validated_model_samples(db_session, model, successes=4, failures=1)
+    monkeypatch.setattr(evolution_service, "_candidate_holdout_gate", lambda candidate, baseline: (True, []))
+    monkeypatch.setattr(evolution_service, "_candidate_signal_quality_gate", lambda candidate, baseline: (True, []))
+
+    result = evolution_service.auto_evolve_cycle(db=db_session)
+
+    assert result["status"] == "auto_blocked"
+    assert result["walk_forward_passed"] is False
+    assert result["walk_forward_validation"]["ready"] is False
+    assert any("walk-forward not ready" in reason for reason in result["reasons"])
+    db_session.refresh(model)
+    assert model.status == "active"
+    assert db_session.query(ModelVersionORM).filter(ModelVersionORM.status == "candidate").count() == 0
+
+
+def test_auto_evolve_cycle_promotes_when_quality_and_walk_forward_pass(monkeypatch, db_session) -> None:
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_SAMPLES", "20")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_LIVE_SAMPLES", "20")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_SUCCESS_RATE", "0.45")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_AVG_RETURN_PCT", "0")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MAX_BRIER_SCORE", "0.30")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MAX_CALIBRATION_ERROR", "0.30")
+    from apps.api.app.core import config as config_mod
+    config_mod.reset_settings_cache()
+    model = evolution_service.ensure_active_model(db_session)
+    _seed_walk_forward_samples(db_session, model, total=32)
+    monkeypatch.setattr(evolution_service, "_candidate_holdout_gate", lambda candidate, baseline: (True, []))
+    monkeypatch.setattr(evolution_service, "_candidate_signal_quality_gate", lambda candidate, baseline: (True, []))
+    monkeypatch.setattr(
+        evolution_service,
+        "_adjust_weights",
+        lambda config, pairs: copy.deepcopy(config),
+    )
 
     result = evolution_service.auto_evolve_cycle(db=db_session)
 
     assert result["status"] == "auto_promoted"
+    assert result["walk_forward_passed"] is True
+    assert result["walk_forward_validation"]["ready"] is True
     assert result["previous_model"]["status"] == "retired"
     assert result["active_model"]["status"] == "active"
     active = db_session.query(ModelVersionORM).filter(ModelVersionORM.status == "active").one()
     assert active.parent_id == model.id
     assert active.version == result["active_model"]["version"]
-    assert active.config["weights"]["reduction_risk"] < 0
     assert result["candidate_holdout_metrics"]["sample_count"] >= 1
 
 
 def test_auto_evolve_cycle_rolls_back_degraded_child(monkeypatch, db_session) -> None:
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_SAMPLES", "100")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_LIVE_SAMPLES", "0")
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_ROLLBACK_MIN_SAMPLES", "3")
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_ROLLBACK_MIN_SUCCESS_RATE", "0.50")
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_ROLLBACK_MIN_AVG_RETURN_PCT", "0")
@@ -839,8 +1399,54 @@ def test_auto_evolve_cycle_rolls_back_degraded_child(monkeypatch, db_session) ->
     assert result["active_model"]["version"] == parent.version
 
 
+def test_auto_evolve_cycle_does_not_roll_back_from_historical_replay_only(monkeypatch, db_session) -> None:
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_SAMPLES", "100")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_LIVE_SAMPLES", "0")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_ROLLBACK_MIN_SAMPLES", "3")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_ROLLBACK_MIN_SUCCESS_RATE", "0.50")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_ROLLBACK_MIN_AVG_RETURN_PCT", "0")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_ROLLBACK_MAX_BRIER_SCORE", "0.50")
+    from apps.api.app.core import config as config_mod
+    config_mod.reset_settings_cache()
+    parent = evolution_service.ensure_active_model(db_session)
+    parent.status = "retired"
+    child = ModelVersionORM(
+        name=parent.name,
+        version="rule-v2",
+        status="active",
+        parent_id=parent.id,
+        config=parent.config,
+        metrics={},
+        note="degraded child from replay",
+        activated_at=datetime.now(timezone.utc).replace(tzinfo=None),
+    )
+    db_session.add(child)
+    db_session.flush()
+    _seed_validated_model_samples(
+        db_session,
+        child,
+        successes=0,
+        failures=5,
+        success_probability=0.8,
+        failure_probability=0.8,
+        failure_return=-4.0,
+        sample_source="historical_replay",
+    )
+
+    result = evolution_service.auto_evolve_cycle(db=db_session)
+
+    assert result["status"] == "insufficient_data"
+    assert result["reason"] == "insufficient_validated_predictions"
+    assert result["real_world_metrics"]["sample_count"] == 0
+    db_session.refresh(parent)
+    db_session.refresh(child)
+    assert parent.status == "retired"
+    assert child.status == "active"
+
+
 def test_auto_evolve_cycle_blocks_when_candidate_fails_holdout(monkeypatch, db_session) -> None:
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_SAMPLES", "4")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_LIVE_SAMPLES", "4")
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_SUCCESS_RATE", "0.70")
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_AVG_RETURN_PCT", "0")
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MAX_BRIER_SCORE", "0.20")
@@ -866,8 +1472,61 @@ def test_auto_evolve_cycle_blocks_when_candidate_fails_holdout(monkeypatch, db_s
     assert db_session.query(ModelVersionORM).filter(ModelVersionORM.status == "candidate").count() == 0
 
 
+def test_auto_evolve_cycle_blocks_when_candidate_degrades_real_world_holdout(monkeypatch, db_session) -> None:
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_SAMPLES", "8")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_LIVE_SAMPLES", "4")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_SUCCESS_RATE", "0.45")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_AVG_RETURN_PCT", "-1")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MAX_BRIER_SCORE", "0.50")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MAX_CALIBRATION_ERROR", "0.50")
+    from apps.api.app.core import config as config_mod
+    config_mod.reset_settings_cache()
+    model = evolution_service.ensure_active_model(db_session)
+    _seed_validated_model_samples(
+        db_session,
+        model,
+        successes=16,
+        failures=0,
+        success_probability=0.8,
+        success_return=4.0,
+        sample_source="historical_replay",
+    )
+    _seed_validated_model_samples(
+        db_session,
+        model,
+        successes=4,
+        failures=0,
+        success_probability=0.8,
+        success_return=3.0,
+        sample_source="live_prediction",
+    )
+
+    bad_live_config = copy.deepcopy(model.config or evolution_service.DEFAULT_MODEL_CONFIG)
+    bad_live_config["horizon_bias"] = {"3": -0.8, "5": -0.8, "10": -0.8, "20": -0.8}
+    monkeypatch.setattr(evolution_service, "_adjust_weights", lambda config, pairs: bad_live_config)
+    monkeypatch.setattr(evolution_service, "_candidate_holdout_gate", lambda candidate, baseline: (True, []))
+    monkeypatch.setattr(evolution_service, "_candidate_signal_quality_gate", lambda candidate, baseline: (True, []))
+    monkeypatch.setattr(
+        evolution_service,
+        "_candidate_walk_forward_gate",
+        lambda validation, require_ready=False: (True, []),
+    )
+
+    result = evolution_service.auto_evolve_cycle(db=db_session)
+
+    assert result["status"] == "auto_blocked"
+    assert result["reason"] == "real_world_holdout_gate_failed"
+    assert result["real_world_holdout_passed"] is False
+    assert result["real_world_candidate_holdout_metrics"]["sample_count"] >= 1
+    assert any(reason.startswith("real-world candidate holdout") for reason in result["reasons"])
+    db_session.refresh(model)
+    assert model.status == "active"
+    assert db_session.query(ModelVersionORM).filter(ModelVersionORM.status == "candidate").count() == 0
+
+
 def test_auto_evolve_cycle_blocks_when_candidate_fails_walk_forward(monkeypatch, db_session) -> None:
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_SAMPLES", "20")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_LIVE_SAMPLES", "20")
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_SUCCESS_RATE", "0.45")
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_AVG_RETURN_PCT", "0")
     monkeypatch.setenv("QUANT_EVOLUTION_AUTO_PROMOTE_MAX_BRIER_SCORE", "0.20")
@@ -886,6 +1545,8 @@ def test_auto_evolve_cycle_blocks_when_candidate_fails_walk_forward(monkeypatch,
     monkeypatch.setattr(evolution_service, "_adjust_weights", lambda config, pairs: bad_config)
     monkeypatch.setattr(evolution_service, "_candidate_holdout_gate", lambda candidate, baseline: (True, []))
     monkeypatch.setattr(evolution_service, "_candidate_signal_quality_gate", lambda candidate, baseline: (True, []))
+    monkeypatch.setattr(evolution_service, "_candidate_real_world_holdout_gate", lambda candidate, baseline: (True, []))
+    monkeypatch.setattr(evolution_service, "_candidate_real_world_signal_quality_gate", lambda candidate, baseline: (True, []))
 
     result = evolution_service.auto_evolve_cycle(db=db_session)
 
@@ -1016,6 +1677,55 @@ def test_run_auto_scan_once_records_last_run(monkeypatch) -> None:
     assert result["results"] == 2
     assert result["predictions_created"] == 8
     assert evolution_service._auto_scan_last_run == result
+
+
+def test_run_auto_scan_once_persists_pending_predictions_with_mock_market(monkeypatch, tmp_path) -> None:
+    from apps.api.app.core import config as config_mod
+    from apps.api.app.db import session as session_mod
+    from apps.api.app.services import market_service
+
+    old_engine = session_mod._engine
+    old_factory = session_mod._SessionLocal
+    with market_service._market_lock:
+        old_market_cache = dict(market_service._market_cache)
+    test_engine = None
+    monkeypatch.setenv("QUANT_MARKET_DATA_PROVIDER", "mock")
+    monkeypatch.setenv("QUANT_DATABASE_URL", f"sqlite:///{tmp_path / 'auto-scan.db'}")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_SCAN_TOP_N", "5")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_SCAN_MIN_SCORE", "30")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_SCAN_CANDIDATE_POOL", "30")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_SCAN_ENABLE_FUNDAMENTAL", "false")
+    monkeypatch.setenv("QUANT_EVOLUTION_AUTO_SCAN_ENABLE_LLM", "false")
+    config_mod.reset_settings_cache()
+    session_mod._engine = None
+    session_mod._SessionLocal = None
+    with market_service._market_lock:
+        market_service._market_cache.clear()
+    try:
+        session_mod.init_db()
+        test_engine = session_mod._engine
+        market_service.ensure_cache_running()
+
+        result = evolution_service.run_auto_scan_once()
+
+        assert result["ok"] is True
+        assert result["scan_run_id"] is not None
+        assert result["results"] > 0
+        assert result["predictions_created"] >= 4
+        with session_mod.session_scope() as session:
+            preds = session.query(StockPredictionORM).all()
+            assert len(preds) == result["predictions_created"]
+            assert {pred.status for pred in preds} == {"pending"}
+            assert {pred.horizon_days for pred in preds}.issuperset({3, 5, 10, 20})
+    finally:
+        if test_engine is not None:
+            test_engine.dispose()
+        session_mod._engine = old_engine
+        session_mod._SessionLocal = old_factory
+        with market_service._market_lock:
+            market_service._market_cache.clear()
+            market_service._market_cache.update(old_market_cache)
+        config_mod.reset_settings_cache()
 
 
 def test_run_validation_cycle_once_records_compact_status(monkeypatch) -> None:

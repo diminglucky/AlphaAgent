@@ -29,6 +29,7 @@ def test_evolution_settings_use_runtime_override_and_string_bool(monkeypatch) ->
             "evolution_auto_scan_enable_llm": "false",
             "evolution_auto_scan_target_horizon_days": "5",
             "evolution_auto_evolve_enabled": "false",
+            "evolution_auto_evolve_min_live_samples": "9",
             "evolution_auto_promote_min_success_rate": 0.7,
             "evolution_auto_walk_forward_min_samples": "18",
             "evolution_auto_walk_forward_min_dates": 21,
@@ -50,6 +51,7 @@ def test_evolution_settings_use_runtime_override_and_string_bool(monkeypatch) ->
     assert settings.evolution_auto_scan_enable_llm is False
     assert settings.evolution_auto_scan_target_horizon_days == 5
     assert settings.evolution_auto_evolve_enabled is False
+    assert settings.evolution_auto_evolve_min_live_samples == 9
     assert settings.evolution_auto_promote_min_success_rate == 0.7
     assert settings.evolution_auto_walk_forward_min_samples == 18
     assert settings.evolution_auto_walk_forward_min_dates == 21

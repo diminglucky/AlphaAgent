@@ -63,7 +63,7 @@ B. 防守线 — 提前规避下跌风险
   ],
   "sell_actions": [
     {"symbol": "600519.SH", "action": "REDUCE_HALF", "urgency": "medium",
-     "current_pnl": 0.047, "reason": "权重 54% 超风控上限 30%"}
+     "current_pnl": 0.047, "reason": "权重 54% 超风控上限 15%"}
   ],
   "watch_list":   [
     {"symbol": "000858.SZ", "warning": "approaching_resistance",
@@ -278,7 +278,7 @@ class ProfitMaximizerAgent(BaseAgent):
                     (i for i in industries if i["industry"] == pick.get("industry")),
                     None,
                 )
-                if same_ind and same_ind["weight"] > 0.30:
+                if same_ind and same_ind["weight"] > 0.40:
                     industry_warning = (
                         f"⚠️ {pick.get('industry')} 板块权重已 {same_ind['weight']*100:.0f}%，"
                         "建议减半仓位"

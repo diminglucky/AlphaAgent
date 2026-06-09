@@ -30,7 +30,7 @@ class WeightingScheme(str, Enum):
 @dataclass(frozen=True)
 class PortfolioConstraints:
     """Portfolio optimization constraints."""
-    max_single_stock_weight: float = 0.30
+    max_single_stock_weight: float = 0.15
     max_industry_weight: float = 0.40
     max_turnover: float = 0.50
     min_cash_ratio: float = 0.05
@@ -96,35 +96,51 @@ class PortfolioOptimizer:
         raw_weights = self._raw_weights(positive_signals, scheme, volatilities)
         if not raw_weights:
             return {}
+        if self.constraints.max_positions <= 0:
+            return {}
 
-        target_weights = dict(raw_weights)
-        
-        # Iteratively cap and renormalize until all constraints satisfied
-        max_iterations = 10
-        for _ in range(max_iterations):
-            needs_adjustment = False
-            for symbol in list(target_weights.keys()):
-                if target_weights[symbol] > self.constraints.max_single_stock_weight:
-                    target_weights[symbol] = self.constraints.max_single_stock_weight
-                    needs_adjustment = True
-            
-            if not needs_adjustment:
-                break
-            
-            # Renormalize
-            total_weight = sum(target_weights.values())
-            if total_weight > 0:
-                target_weights = {
-                    symbol: weight / total_weight
-                    for symbol, weight in target_weights.items()
-                }
-        
-        # Reserve cash
+        if len(raw_weights) > self.constraints.max_positions:
+            selected = sorted(
+                raw_weights,
+                key=lambda symbol: (raw_weights[symbol], positive_signals.get(symbol, 0.0), symbol),
+                reverse=True,
+            )[: self.constraints.max_positions]
+            raw_weights = {symbol: raw_weights[symbol] for symbol in selected}
+
         investable_ratio = 1.0 - self.constraints.min_cash_ratio
-        target_weights = {
-            symbol: weight * investable_ratio
-            for symbol, weight in target_weights.items()
-        }
+        cap = self.constraints.max_single_stock_weight
+        if investable_ratio <= 0 or cap <= 0:
+            return {}
+
+        # Water-filling allocation: capped names keep their cap while the
+        # residual budget is redistributed across uncapped names only.
+        remaining = set(raw_weights)
+        remaining_budget = investable_ratio
+        target_weights: dict[str, float] = {}
+
+        while remaining and remaining_budget > 1e-9:
+            total_raw = sum(raw_weights[symbol] for symbol in remaining)
+            if total_raw <= 0:
+                break
+
+            capped_this_round = []
+            for symbol in sorted(remaining):
+                proposed = remaining_budget * (raw_weights[symbol] / total_raw)
+                if proposed > cap:
+                    target_weights[symbol] = cap
+                    capped_this_round.append(symbol)
+
+            if not capped_this_round:
+                for symbol in sorted(remaining):
+                    target_weights[symbol] = remaining_budget * (raw_weights[symbol] / total_raw)
+                break
+
+            for symbol in capped_this_round:
+                remaining.remove(symbol)
+                remaining_budget -= cap
+
+            if remaining_budget <= 1e-9:
+                break
 
         return target_weights
 
@@ -192,6 +208,11 @@ class PortfolioOptimizer:
             List of rebalancing actions
         """
         actions = []
+
+        def _lot_quantity(value_change: float, price: float) -> int:
+            if price <= 0:
+                return 0
+            return int(abs(value_change) / price / 100) * 100
         
         # Calculate current weights
         current_weights = {}
@@ -200,8 +221,8 @@ class PortfolioOptimizer:
         
         # Process all symbols (current + target)
         all_symbols = set(current_weights.keys()) | set(target_weights.keys())
-        
-        for symbol in all_symbols:
+
+        for symbol in sorted(all_symbols):
             current_weight = current_weights.get(symbol, 0.0)
             target_weight = target_weights.get(symbol, 0.0)
             
@@ -217,16 +238,16 @@ class PortfolioOptimizer:
                 action_type = "BUY"
                 value_change = weight_diff * total_value
                 price = current_prices.get(symbol, 0.0)
-                quantity_change = int(value_change / price / 100) * 100 if price > 0 else 0
+                quantity_change = _lot_quantity(value_change, price)
                 reason = f"增加仓位至目标权重{target_weight:.2%}"
             else:
                 action_type = "SELL"
                 value_change = weight_diff * total_value
                 price = current_prices.get(symbol, 0.0)
-                quantity_change = int(value_change / price / 100) * 100 if price > 0 else 0
+                quantity_change = _lot_quantity(value_change, price)
                 reason = f"减少仓位至目标权重{target_weight:.2%}"
-            
-            if action_type != "HOLD":
+
+            if action_type != "HOLD" and quantity_change > 0:
                 actions.append(RebalanceAction(
                     symbol=symbol,
                     current_weight=current_weight,
@@ -288,6 +309,11 @@ class PortfolioOptimizer:
         
         # Check constraints and generate warnings
         warnings = []
+        positive_signal_count = sum(1 for score in signals.values() if score > 0)
+        if positive_signal_count > self.constraints.max_positions:
+            warnings.append(
+                f"候选信号数{positive_signal_count}超过最大持仓数{self.constraints.max_positions}，已保留权重最高的{self.constraints.max_positions}只"
+            )
         
         if expected_turnover > self.constraints.max_turnover:
             warnings.append(
@@ -297,11 +323,6 @@ class PortfolioOptimizer:
         if expected_cash_ratio < self.constraints.min_cash_ratio:
             warnings.append(
                 f"预期现金比例{expected_cash_ratio:.2%}低于最低要求{self.constraints.min_cash_ratio:.2%}"
-            )
-        
-        if len(target_weights) > self.constraints.max_positions:
-            warnings.append(
-                f"目标持仓数{len(target_weights)}超过限制{self.constraints.max_positions}"
             )
         
         # Check industry concentration

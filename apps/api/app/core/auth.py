@@ -42,10 +42,24 @@ def _resolve_role(api_key: str) -> Optional[UserRole]:
     return None
 
 
+def is_auth_configured() -> bool:
+    settings = get_settings()
+    return bool(settings.admin_api_key or settings.trader_api_key or settings.viewer_api_key)
+
+
 def authenticate_api_key(api_key: Optional[str], *, source: str = "X-Api-Key") -> AuthenticatedUser:
     settings = get_settings()
     if not settings.auth_enabled:
         return AuthenticatedUser(api_key="anonymous", role=UserRole.ADMIN)
+
+    if not is_auth_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "AUTH_NOT_CONFIGURED",
+                "message": "QUANT_AUTH_ENABLED=true but no QUANT_*_API_KEY is configured",
+            },
+        )
 
     if not api_key:
         raise HTTPException(

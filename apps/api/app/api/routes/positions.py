@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from apps.api.app.core.auth import get_current_user, require_trader
 from apps.api.app.db.session import get_db
 from apps.api.app.db.models import AlertORM, PositionORM
 from apps.api.app.services import alert_service, market_service
@@ -20,7 +21,7 @@ class UpsertPositionReq(BaseModel):
 
 
 @router.get("/")
-def list_positions(db: Session = Depends(get_db)):
+def list_positions(_: object = Depends(get_current_user), db: Session = Depends(get_db)):
     positions = db.query(PositionORM).all()
     if not positions:
         return []
@@ -59,7 +60,7 @@ def list_positions(db: Session = Depends(get_db)):
 
 
 @router.post("/")
-def upsert_position(req: UpsertPositionReq, db: Session = Depends(get_db)):
+def upsert_position(req: UpsertPositionReq, _: object = Depends(require_trader), db: Session = Depends(get_db)):
     """新增或更新持仓"""
     symbol = _normalize_symbol(req.symbol)
     pos = db.query(PositionORM).filter(PositionORM.symbol == symbol).first()
@@ -97,7 +98,7 @@ def upsert_position(req: UpsertPositionReq, db: Session = Depends(get_db)):
 
 
 @router.delete("/{symbol}")
-def delete_position(symbol: str, db: Session = Depends(get_db)):
+def delete_position(symbol: str, _: object = Depends(require_trader), db: Session = Depends(get_db)):
     symbol = _normalize_symbol(symbol)
     pos = db.query(PositionORM).filter(PositionORM.symbol == symbol).first()
     if not pos:

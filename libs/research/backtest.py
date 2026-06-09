@@ -18,7 +18,7 @@ class BacktestConfig:
     min_commission: float = 5.0
     
     # Position sizing
-    max_position_size: float = 0.3  # 30% max per position
+    max_position_size: float = 0.15  # 15% max per position
     max_positions: int = 10
     
     # Risk management

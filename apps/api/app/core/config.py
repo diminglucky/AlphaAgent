@@ -73,6 +73,7 @@ def get_evolution_settings() -> "Settings":
         "evolution_auto_scan_target_horizon_days": int,
         "evolution_auto_evolve_enabled": bool,
         "evolution_auto_evolve_min_samples": int,
+        "evolution_auto_evolve_min_live_samples": int,
         "evolution_auto_promote_min_success_rate": float,
         "evolution_auto_promote_min_avg_return_pct": float,
         "evolution_auto_promote_max_brier_score": float,
@@ -158,6 +159,7 @@ class Settings:
     evolution_auto_scan_target_horizon_days: int = field(default_factory=lambda: int(os.getenv("QUANT_EVOLUTION_AUTO_SCAN_TARGET_HORIZON_DAYS", "0")))
     evolution_auto_evolve_enabled: bool = field(default_factory=lambda: _bool("QUANT_EVOLUTION_AUTO_EVOLVE_ENABLED", True))
     evolution_auto_evolve_min_samples: int = field(default_factory=lambda: int(os.getenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_SAMPLES", "60")))
+    evolution_auto_evolve_min_live_samples: int = field(default_factory=lambda: int(os.getenv("QUANT_EVOLUTION_AUTO_EVOLVE_MIN_LIVE_SAMPLES", "20")))
     evolution_auto_promote_min_success_rate: float = field(default_factory=lambda: float(os.getenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_SUCCESS_RATE", "0.52")))
     evolution_auto_promote_min_avg_return_pct: float = field(default_factory=lambda: float(os.getenv("QUANT_EVOLUTION_AUTO_PROMOTE_MIN_AVG_RETURN_PCT", "0.0")))
     evolution_auto_promote_max_brier_score: float = field(default_factory=lambda: float(os.getenv("QUANT_EVOLUTION_AUTO_PROMOTE_MAX_BRIER_SCORE", "0.28")))
@@ -185,7 +187,7 @@ class Settings:
     qmt_gateway_api_key: str = field(default_factory=lambda: os.getenv("QUANT_QMT_GATEWAY_API_KEY", ""))
     trading_block_st_buy: bool = field(default_factory=lambda: _bool("QUANT_TRADING_BLOCK_ST_BUY", True))
     trading_enforce_hours: bool = field(default_factory=lambda: _bool("QUANT_TRADING_ENFORCE_HOURS", False))
-    trading_single_stock_max_weight: float = field(default_factory=lambda: float(os.getenv("QUANT_TRADING_SINGLE_STOCK_MAX_WEIGHT", "0.30")))
+    trading_single_stock_max_weight: float = field(default_factory=lambda: float(os.getenv("QUANT_TRADING_SINGLE_STOCK_MAX_WEIGHT", "0.15")))
     trading_daily_turnover_limit: float = field(default_factory=lambda: float(os.getenv("QUANT_TRADING_DAILY_TURNOVER_LIMIT", "0.50")))
 
 

@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy.orm import Session
 
+from apps.api.app.core.auth import get_current_user, require_trader
 from apps.api.app.db.session import get_db
 from apps.api.app.db.models import AlertORM
 
@@ -19,7 +20,11 @@ class CreateAlertReq(BaseModel):
 
 
 @router.get("/")
-def list_alerts(db: Session = Depends(get_db), triggered: Optional[bool] = None):
+def list_alerts(
+    _: object = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    triggered: Optional[bool] = None,
+):
     q = db.query(AlertORM)
     if triggered is not None:
         q = q.filter(AlertORM.triggered == triggered)
@@ -42,7 +47,7 @@ def list_alerts(db: Session = Depends(get_db), triggered: Optional[bool] = None)
 
 
 @router.post("/")
-def create_alert(req: CreateAlertReq, db: Session = Depends(get_db)):
+def create_alert(req: CreateAlertReq, _: object = Depends(require_trader), db: Session = Depends(get_db)):
     if req.alert_type not in ("price_above", "price_below"):
         raise HTTPException(status_code=400, detail="alert_type 只支持 price_above / price_below")
 
@@ -60,7 +65,7 @@ def create_alert(req: CreateAlertReq, db: Session = Depends(get_db)):
 
 
 @router.delete("/{alert_id}")
-def delete_alert(alert_id: int, db: Session = Depends(get_db)):
+def delete_alert(alert_id: int, _: object = Depends(require_trader), db: Session = Depends(get_db)):
     alert = db.query(AlertORM).filter(AlertORM.id == alert_id).first()
     if not alert:
         raise HTTPException(status_code=404, detail="提醒不存在")

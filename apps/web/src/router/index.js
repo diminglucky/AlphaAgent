@@ -54,7 +54,21 @@ const routes = [
   },
 ]
 
-export default createRouter({
+const router = createRouter({
   history: createWebHashHistory(),
   routes,
 })
+
+router.onError((error) => {
+  const message = String(error?.message || error || '')
+  const staleChunk = /Failed to fetch dynamically imported module|Unable to preload CSS|Importing a module script failed/i.test(message)
+  if (!staleChunk || sessionStorage.getItem('alphaagent:chunk-reload') === '1') return
+  sessionStorage.setItem('alphaagent:chunk-reload', '1')
+  window.location.reload()
+})
+
+router.afterEach(() => {
+  sessionStorage.removeItem('alphaagent:chunk-reload')
+})
+
+export default router
